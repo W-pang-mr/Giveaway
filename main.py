@@ -1,4 +1,3 @@
-
 import asyncio
 import os
 import logging
@@ -12,6 +11,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.exceptions import TelegramBadRequest
 
 logging.basicConfig(level=logging.INFO)
 
@@ -193,11 +193,9 @@ async def join_giveaway(call: types.CallbackQuery):
         await call.answer("شما قبلاً ثبت‌نام شده‌اید! ✅", show_alert=True)
         return
 
-    # افزودن کاربر جدید به لیست
     gw["participants"].append(user)
     await call.answer("🎉 با موفقیت ثبت‌نام شدید!", show_alert=True)
     
-    # به‌روزرسانی لحظه‌ای پست کانال با لیست آیدی‌ها
     await update_post_text(call.message.chat.id, msg_id)
 
 async def update_post_text(chat_id, message_id):
@@ -209,7 +207,6 @@ async def update_post_text(chat_id, message_id):
     mins, secs = divmod(remaining, 60)
     time_str = f"{mins} دقیقه و {secs} ثانیه" if mins > 0 else f"{secs} ثانیه"
     
-    # ساخت لیست اسامی/آیدی‌های کاربران شرکت‌کننده
     participants_list = gw["participants"]
     if not participants_list:
         users_str = "_هنوز کسی شرکت نکرده است._"
@@ -217,7 +214,7 @@ async def update_post_text(chat_id, message_id):
         formatted_users = []
         for idx, u in enumerate(participants_list, 1):
             name = f"@{u.username}" if u.username else f"[{u.first_name}](tg://user?id={u.id})"
-            formatted_users.append(f"{idx}\. {name}")
+            formatted_users.append(f"{idx}. {name}")
         users_str = "\n".join(formatted_users)
     
     count = len(participants_list)
@@ -236,8 +233,11 @@ async def update_post_text(chat_id, message_id):
     
     try:
         await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=updated_text, parse_mode="Markdown", reply_markup=channel_kb)
-    except Exception:
-        pass
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            logging.error(f"Telegram Edit Error: {e}")
+    except Exception as e:
+        logging.error(f"General Edit Error: {e}")
 
 async def run_giveaway_timer(chat_id, message_id):
     while message_id in active_giveaways:
@@ -286,7 +286,7 @@ async def run_giveaway_timer(chat_id, message_id):
         else:
             await update_post_text(chat_id, message_id)
             
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
 
 @dp.callback_query(F.data == "cancel_launch")
 async def cancel_launch(call: types.CallbackQuery, state: FSMContext):
