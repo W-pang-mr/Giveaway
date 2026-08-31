@@ -1,153 +1,100 @@
-import os
-import random
 import asyncio
-from datetime import datetime, timedelta
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import os
+import logging
+from flask import Flask
+from threading import Thread
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import CommandStart
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+# تنظیمات لاگ
+logging.basicConfig(level=logging.INFO)
+
+# --- وب‌سرور برای حل مشکل پورت Render ---
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "⚡ Planet Bot is online and healthy!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = Thread(target=run_flask)
+    t.daemon = True
+    t.start()
+
+# --- تنظیمات ربات ---
+TOKEN = os.environ.get("BOT_TOKEN", "8940706019:AAHEsHRP50Ryvpg8sLf2ovV7m6cBTTbXVtI")
 
 bot = Bot(token=TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+dp = Dispatcher()
 
-# ذخیره شرکت‌کنندگان در حافظه
-participants = []
+# کیبورد اصلی ربات
+main_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🚀 وضعیت ربات"), KeyboardButton(text="📋 راهنما")],
+        [KeyboardButton(text="📞 ارتباط با ما")]
+    ],
+    resize_keyboard=True
+)
 
-class GiveawayForm(StatesGroup):
-    target_channel = State()
-    description = State()
-    required_channels = State()
-    duration = State()
+# دکمه‌های شیشه‌ای (Inline)
+inline_menu = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 وب‌سایت", url="https://render.com")],
+        [InlineKeyboardButton(text="✨ حمایت از ما", callback_data="support")]
+    ]
+)
 
-# شروع ساخت قرعه‌کشی (فقط ادمین)
-@dp.message(Command("new_giveaway"))
-async def start_giveaway(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-    await message.answer("۱. آیدی کانالی که قرعه‌کشی توش قرار می‌گیره رو بفرست (مثلاً @MyChannel):")
-    await state.set_state(GiveawayForm.target_channel)
-
-@dp.message(GiveawayForm.target_channel)
-async def set_channel(message: types.Message, state: FSMContext):
-    await state.update_data(target_channel=message.text.strip())
-    await message.answer("۲. توضیحات و جوایز قرعه‌کشی رو بنویس:")
-    await state.set_state(GiveawayForm.description)
-
-@dp.message(GiveawayForm.description)
-async def set_desc(message: types.Message, state: FSMContext):
-    await state.update_data(description=message.text)
-    await message.answer("۳. آیدی کانال‌های جوین اجباری رو با فاصله بفرست (مثلاً: @chan1 @chan2):")
-    await state.set_state(GiveawayForm.required_channels)
-
-@dp.message(GiveawayForm.required_channels)
-async def set_req_channels(message: types.Message, state: FSMContext):
-    channels = message.text.strip().split()
-    await state.update_data(required_channels=channels)
-    
-    # دکمه‌های تایمر سریع
-    timer_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="⏱ ۵ دقیقه", callback_data="time_5m"),
-            InlineKeyboardButton(text="⏱ ۱۰ دقیقه", callback_data="time_10m")
-        ],
-        [
-            InlineKeyboardButton(text="⏱ ۱ ساعت", callback_data="time_1h"),
-            InlineKeyboardButton(text="⏱ ۲ ساعت", callback_data="time_2h"),
-            InlineKeyboardButton(text="⏱ ۵ ساعت", callback_data="time_5h")
-        ]
-    ])
-    
-    await message.answer("۴. زمان پایان قرعه‌کشی رو انتخاب کن:", reply_markup=timer_kb)
-    await state.set_state(GiveawayForm.duration)
-
-# تایید زمان، ارسال پست به کانال و زمان‌بندی قرعه‌کشی
-@dp.callback_query(GiveawayForm.duration, F.data.startswith("time_"))
-async def publish_giveaway(callback: types.CallbackQuery, state: FSMContext):
-    time_key = callback.data.replace("time_", "")
-    minutes_map = {"5m": 5, "10m": 10, "1h": 60, "2h": 120, "5h": 300}
-    duration_minutes = minutes_map.get(time_key, 5)
-    
-    data = await state.get_data()
-    req_channels = data['required_channels']
-    target_channel = data['target_channel']
-    
-    req_channels_str = "\n".join(req_channels)
-    post_text = (
-        f"🎉 **قرعه‌کشی جدید!**\n\n"
-        f"📝 **توضیحات و جوایز:**\n{data['description']}\n\n"
-        f"📢 **شرط شرکت (جوین در کانال‌های زیر):**\n{req_channels_str}\n\n"
-        f"⏳ **زمان باقی‌مانده:** {duration_minutes} دقیقه"
+# هندلر دستور /start
+@dp.message(CommandStart())
+async def start_handler(message: types.Message):
+    user_name = message.from_user.first_name
+    welcome_text = (
+        f"سلام {user_name} عزیز! 👋\n\n"
+        f"🌟 به **Planet Bot** خوش آمدید.\n"
+        f"ربات با موفقیت فعال شد و آماده خدمت‌رسانی است.\n\n"
+        f"از منوی زیر می‌توانید بخش مورد نظر خود را انتخاب کنید 👇"
     )
-    
-    join_btn = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎁 شرکت در قرعه‌کشی", callback_data=f"enter_{','.join(req_channels)}")]
-    ])
-    
-    try:
-        sent_msg = await bot.send_message(chat_id=target_channel, text=post_text, reply_markup=join_btn, parse_mode="Markdown")
-        await callback.message.edit_text("✅ پست قرعه‌کشی در کانال منتشر شد و تایمر فعال گردید!")
-        await state.clear()
-        
-        # اجرا تایمر در پس‌زمینه برای قرعه‌کشی خودکار
-        asyncio.create_task(run_giveaway_timer(duration_minutes * 60, target_channel, sent_msg.message_id))
-    except Exception as e:
-        await callback.message.edit_text(f"❌ خطا! مطمئن شو ربات توی کانال ادمینه:\n{e}")
+    await message.answer(welcome_text, parse_mode="Markdown", reply_markup=main_keyboard)
 
-# کلیک روی دکمه شرکت و بررسی عضویت در کانال‌ها
-@dp.callback_query(F.data.startswith("enter_"))
-async def enter_giveaway(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    req_channels = callback.data.replace("enter_", "").split(",")
-    
-    # بررسی عضویت کاربر در تک‌تک کانال‌ها
-    for ch in req_channels:
-        try:
-            member = await bot.get_chat_member(chat_id=ch.strip(), user_id=user_id)
-            if member.status in ["left", "kicked"]:
-                await callback.answer(f"❌ شما هنوز عضو کانال {ch} نشده‌اید!", show_alert=True)
-                return
-        except Exception:
-            await callback.answer(f"❌ ربات نتوانست عضویت شما را در {ch} بررسی کند. (آیا ربات در آنجا ادمین است؟)", show_alert=True)
-            return
-
-    if user_id in participants:
-        await callback.answer("شما قبلاً در این قرعه‌کشی ثبت‌نام کرده‌اید! 😉", show_alert=True)
-    else:
-        participants.append(user_id)
-        await callback.answer("✅ ثبت‌نام شما با موفقیت انجام شد!", show_alert=True)
-
-# تابع زمان‌بندی و انتخاب برنده
-async def run_giveaway_timer(seconds, channel_id, message_id):
-    await asyncio.sleep(seconds)
-    
-    if not participants:
-        await bot.send_message(chat_id=channel_id, reply_to_message_id=message_id, text="⏳ زمان قرعه‌کشی تمام شد ولی کسی شرکت نکرد! ❌")
-        return
-
-    winner_id = random.choice(participants)
-    try:
-        winner_user = await bot.get_chat(winner_id)
-        winner_name = winner_user.first_name
-        winner_mention = f"[{winner_name}](tg://user?id={winner_id})"
-    except Exception:
-        winner_mention = f"کاربر با آیدی `{winner_id}`"
-
-    await bot.send_message(
-        chat_id=channel_id,
-        reply_to_message_id=message_id,
-        text=f"🎉 **قرعه‌کشی به پایان رسید!**\n\n🏆 **برنده خوش‌شانس:** {winner_mention}\nمبارکت باشه! 🥳",
-        parse_mode="Markdown"
+# هندلر دکمه وضعیت
+@dp.message(F.text == "🚀 وضعیت ربات")
+async def status_handler(message: types.Message):
+    status_text = (
+        "🟢 **وضعیت سیستم:**\n\n"
+        "• سرور: Render (Cloud)\n"
+        "• وضعیت ربات: آنلاین ⚡\n"
+        "• سرعت پاسخ‌گویی: عالی 🚀"
     )
-    participants.clear()
+    await message.answer(status_text, parse_mode="Markdown", reply_markup=inline_menu)
+
+# هندلر دکمه راهنما
+@dp.message(F.text == "📋 راهنما")
+async def help_handler(message: types.Message):
+    help_text = (
+        "📚 **راهنمای استفاده:**\n\n"
+        "برای کار با ربات می‌توانید از دکمه‌های پایین صفحه استفاده کنید.\n"
+        "در صورت بروز هرگونه مشکل، از بخش ارتباط با ما استفاده کنید."
+    )
+    await message.answer(help_text, parse_mode="Markdown")
+
+# هندلر دکمه ارتباط با ما
+@dp.message(F.text == "📞 ارتباط با ما")
+async def contact_handler(message: types.Message):
+    await message.answer("📬 برای ارتباط با پشتیبانی می‌توانید پیام خود را همینجا ارسال کنید.")
+
+# هندلر کلیک روی دکمه شیشه‌ای حمایت
+@dp.callback_query(F.data == "support")
+async def support_callback(call: types.CallbackQuery):
+    await call.answer("ممنون از حمایت شما! ❤️", show_alert=True)
 
 async def main():
-    print("ربات قرعه‌کشی روشن شد...")
+    keep_alive()
     await dp.start_polling(bot)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())
