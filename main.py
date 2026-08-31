@@ -34,14 +34,15 @@ TOKEN = os.environ.get("BOT_TOKEN", "8940706019:AAHEsHRP50Ryvpg8sLf2ovV7m6cBTTbX
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# تعریف مراحل ساخت قرعه‌کشی (FSM)
+# دیتابیس ساده برای ثبت شرکت‌کنندگان هر قرعه‌کشی
+giveaways_db = {}
+
 class GiveawayForm(StatesGroup):
     title = State()
     time = State()
     winners = State()
     channel = State()
 
-# کیبورد اصلی
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🎉 ساخت قرعه‌کشی جدید")],
@@ -66,21 +67,18 @@ async def start_giveaway(message: types.Message, state: FSMContext):
     await state.set_state(GiveawayForm.title)
     await message.answer("✏️ **مرحله ۱:** لطفاً عنوان یا جایزه قرعه‌کشی را وارد کنید:")
 
-# ۱. دریافت عنوان
 @dp.message(GiveawayForm.title)
 async def process_title(message: types.Message, state: FSMContext):
     await state.update_data(title=message.text)
     await state.set_state(GiveawayForm.time)
-    await message.answer(f"✅ عنوان ذخیره شد: **{message.text}**\n\n⏳ **مرحله ۲:** مدت زمان را وارد کنید (مثلاً: 24 ساعت یا 30 دقیقه):")
+    await message.answer(f"✅ عنوان ذخیره شد: **{message.text}**\n\n⏳ **مرحله ۲:** مدت زمان را وارد کنید (مثلاً: 24 ساعت):")
 
-# ۲. دریافت زمان
 @dp.message(GiveawayForm.time)
 async def process_time(message: types.Message, state: FSMContext):
     await state.update_data(time=message.text)
     await state.set_state(GiveawayForm.winners)
     await message.answer(f"✅ زمان ذخیره شد: **{message.text}**\n\n👥 **مرحله ۳:** تعداد برندگان را وارد کنید (عدد):")
 
-# ۳. دریافت تعداد برندگان
 @dp.message(GiveawayForm.winners)
 async def process_winners(message: types.Message, state: FSMContext):
     if not message.text.isdigit():
@@ -90,11 +88,10 @@ async def process_winners(message: types.Message, state: FSMContext):
     await state.set_state(GiveawayForm.channel)
     await message.answer(
         f"✅ تعداد برندگان ذخیره شد: **{message.text} نفر**\n\n"
-        f"📢 **مرحله ۴:** آیدی کانال قفل جوین را بفرستید (مثال: `mychannel@`):\n"
+        f"📢 **مرحله ۴:** آیدی کانال قفل جوین را بفرستید (مثال: `@Voidchanneloffical`):\n"
         f"⚠️ *نکته:* ربات باید در کانال شما ادمین باشد!"
     )
 
-# ۴. دریافت و بررسی کانال (چک کردن ادمین بودن ربات و کاربر)
 @dp.message(GiveawayForm.channel)
 async def process_channel(message: types.Message, state: FSMContext):
     channel_id = message.text.strip()
@@ -102,23 +99,20 @@ async def process_channel(message: types.Message, state: FSMContext):
         channel_id = "@" + channel_id
 
     try:
-        # بررسی دسترسی ربات در کانال
         bot_member = await bot.get_chat_member(chat_id=channel_id, user_id=bot.id)
         if bot_member.status not in ["administrator", "creator"]:
             await message.answer(f"❌ ربات در کانال {channel_id} ادمین نیست! لطفاً ابتدا ربات را ادمین کانال کنید.")
             return
 
-        # بررسی مالیکت/ادمین بودن کاربر در کانال
         user_member = await bot.get_chat_member(chat_id=channel_id, user_id=message.from_user.id)
         if user_member.status not in ["administrator", "creator"]:
             await message.answer(f"❌ شما ادمین یا مالک کانال {channel_id} نیستید!")
             return
 
-    except Exception as e:
-        await message.answer("❌ کانال پیدا نشد یا ربات دسترسی ندارد. مطمئن شوید آیدی را درست وارد کرده‌اید و ربات در کانال عضو است.")
+    except Exception:
+        await message.answer("❌ کانال پیدا نشد یا ربات دسترسی ندارد. آیدی را چک کرده و مطمئن شوید ربات ادمین است.")
         return
 
-    # ذخیره کانال و نمایش خلاصه
     await state.update_data(channel=channel_id)
     data = await state.get_data()
     
@@ -127,7 +121,7 @@ async def process_channel(message: types.Message, state: FSMContext):
         f"📌 **عنوان:** {data['title']}\n"
         f"⏳ **زمان:** {data['time']}\n"
         f"👥 **تعداد برنده:** {data['winners']} نفر\n"
-        f"📢 **کانال اجباری:** {data['channel']}\n\n"
+        f"📢 **کانال:** {data['channel']}\n\n"
         "آیا برای انتشار در کانال تایید می‌کنید؟"
     )
     
@@ -140,11 +134,69 @@ async def process_channel(message: types.Message, state: FSMContext):
     
     await message.answer(confirm_text, parse_mode="Markdown", reply_markup=keyboard)
 
+# --- انتشار پست قرعه کشی در کانال ---
 @dp.callback_query(F.data == "confirm_launch")
 async def launch_giveaway(call: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    await call.message.edit_text(f"🎉 **قرعه‌کشی با موفقیت در کانال {data['channel']} منتشر شد!**")
+    channel_id = data['channel']
+    
+    giveaway_text = (
+        f"🎉 **قرعه‌کشی جدید!** 🎉\n\n"
+        f"🎁 **جایزه:** {data['title']}\n"
+        f"👥 **تعداد برندگان:** {data['winners']} نفر\n"
+        f"⏳ **مهلت:** {data['time']}\n\n"
+        f"👇 برای شرکت در قرعه‌کشی روی دکمه زیر کلیک کنید:"
+    )
+    
+    # دکمه شیشه‌ای برای کانال
+    channel_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎁 شرکت در قرعه‌کشی (0)", callback_data="join_giveaway")]
+        ]
+    )
+    
+    try:
+        # ارسال پیام به کانال
+        sent_msg = await bot.send_message(chat_id=channel_id, text=giveaway_text, parse_mode="Markdown", reply_markup=channel_keyboard)
+        
+        # ذخیره شناسه قرعه‌کشی
+        giveaways_db[sent_msg.message_id] = {
+            "participants": set(),
+            "channel": channel_id,
+            "title": data['title']
+        }
+        
+        await call.message.edit_text(f"✅ **قرعه‌کشی با موفقیت در کانال {channel_id} پست شد!**")
+    except Exception as e:
+        await call.message.edit_text(f"❌ خطا در ارسال پست به کانال: {e}")
+        
     await state.clear()
+
+# --- کلیک کاربر روی دکمه شرکت در قرعه کشی در کانال ---
+@dp.callback_query(F.data == "join_giveaway")
+async def join_giveaway_callback(call: types.CallbackQuery):
+    msg_id = call.message.message_id
+    user_id = call.from_user.id
+    
+    if msg_id not in giveaways_db:
+        giveaways_db[msg_id] = {"participants": set()}
+        
+    participants = giveaways_db[msg_id]["participants"]
+    
+    if user_id in participants:
+        await call.answer("شما قبلاً در این قرعه‌کشی ثبت‌نام کرده‌اید! ❌", show_alert=True)
+    else:
+        participants.add(user_id)
+        count = len(participants)
+        
+        # آپدیت تعداد افراد روی دکمه
+        new_keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"🎁 شرکت در قرعه‌کشی ({count})", callback_data="join_giveaway")]
+            ]
+        )
+        await call.message.edit_reply_markup(reply_markup=new_keyboard)
+        await call.answer("شما با موفقیت وارد قرعه‌کشی شدید! 🎉", show_alert=True)
 
 @dp.callback_query(F.data == "cancel_launch")
 async def cancel_giveaway(call: types.CallbackQuery, state: FSMContext):
