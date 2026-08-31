@@ -1,3 +1,4 @@
+
 import asyncio
 import os
 import logging
@@ -14,8 +15,8 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 
 logging.basicConfig(level=logging.INFO)
 
-# --- وب‌سرور جهت نگه داشتن پورت در Render ---
-app = Flask('')
+# --- وب‌سرور جهت زنده نگه داشتن پورت در Render ---
+app = Flask(__name__)
 
 @app.route('/')
 def home():
@@ -35,7 +36,8 @@ TOKEN = os.environ.get("BOT_TOKEN", "8940706019:AAHEsHRP50Ryvpg8sLf2ovV7m6cBTTbX
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# تعریف مراحل FSM
+active_giveaways = {}
+
 class GiveawayForm(StatesGroup):
     title = State()
     prize = State()
@@ -43,18 +45,15 @@ class GiveawayForm(StatesGroup):
     winners = State()
     channel = State()
 
-# کیبورد اصلی (فقط یک دکمه)
 main_keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="🎉 ساخت قرعه‌کشی جدید")]
-    ],
+    keyboard=[[KeyboardButton(text="🎉 ساخت قرعه‌کشی جدید")]],
     resize_keyboard=True
 )
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("سلام! به ربات **Void Giveaway** خوش آمدید.\nبرای ساخت قرعه‌کشی جدید روی دکمه زیر بزنید 👇", parse_mode="Markdown", reply_markup=main_keyboard)
+    await message.answer("سلام! به ربات **Void Giveaway** خوش آمدید.\nبرای ساخت قرعه‌کشی روی دکمه زیر بزنید 👇", parse_mode="Markdown", reply_markup=main_keyboard)
 
 @dp.message(F.text == "🎉 ساخت قرعه‌کشی جدید")
 @dp.message(F.text == "/newgiveaway")
@@ -62,14 +61,12 @@ async def start_giveaway(message: types.Message, state: FSMContext):
     await state.set_state(GiveawayForm.title)
     await message.answer("📝 **مرحله ۱:** لطفاً **عنوان قرعه‌کشی** را وارد کنید:")
 
-# ۱. دریافت عنوان
 @dp.message(GiveawayForm.title)
 async def process_title(message: types.Message, state: FSMContext):
     await state.update_data(title=message.text)
     await state.set_state(GiveawayForm.prize)
     await message.answer(f"✅ عنوان ذخیره شد: **{message.text}**\n\n🎁 **مرحله ۲:** لطفاً **نوع یا متن جایزه** را وارد کنید:")
 
-# ۲. دریافت جایزه
 @dp.message(GiveawayForm.prize)
 async def process_prize(message: types.Message, state: FSMContext):
     await state.update_data(prize=message.text)
@@ -77,8 +74,8 @@ async def process_prize(message: types.Message, state: FSMContext):
     
     time_keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⏱ ۱۰ ثانیه (تست)", callback_data="time_10"), InlineKeyboardButton(text="⏱ ۱ دقیقه", callback_data="time_60")],
-            [InlineKeyboardButton(text="⏱ ۵ دقیقه", callback_data="time_300"), InlineKeyboardButton(text="⏱ ۱ ساعت", callback_data="time_3600")]
+            [InlineKeyboardButton(text="⏱ ۱ دقیقه", callback_data="time_60"), InlineKeyboardButton(text="⏱ ۵ دقیقه", callback_data="time_300")],
+            [InlineKeyboardButton(text="⏱ ۱۰ دقیقه", callback_data="time_600"), InlineKeyboardButton(text="⏱ ۱ ساعت", callback_data="time_3600")]
         ]
     )
     await message.answer(f"✅ جایزه ذخیره شد: **{message.text}**\n\n⏳ **مرحله ۳:** مدت زمان قرعه‌کشی را انتخاب کنید:", reply_markup=time_keyboard)
@@ -88,7 +85,7 @@ async def process_time_callback(call: types.CallbackQuery, state: FSMContext):
     secs = int(call.data.split("_")[1])
     await state.update_data(time_seconds=secs)
     await state.set_state(GiveawayForm.winners)
-    await call.message.edit_text(f"✅ زمان ذخیره شد.\n\n👥 **مرحله ۴:** تعداد برندگان را وارد کنید (عدد):")
+    await call.message.edit_text("✅ زمان ذخیره شد.\n\n👥 **مرحله ۴:** تعداد برندگان را وارد کنید (عدد):")
 
 @dp.message(GiveawayForm.winners)
 async def process_winners(message: types.Message, state: FSMContext):
@@ -145,72 +142,151 @@ async def launch_giveaway(call: types.CallbackQuery, state: FSMContext):
         f"🎉 **{data['title']}** 🎉\n\n"
         f"🎁 **جایزه:** {data['prize']}\n"
         f"👥 **تعداد برندگان:** {data['winners']} نفر\n"
-        f"⏱ **زمان باقی‌مانده:** {total_seconds} ثانیه\. \n\n"
-        f"📌 *تمامی اعضای کانال به صورت خودکار در قرعه‌کشی شرکت داده می‌شوند\.*"
+        f"⏱ **زمان باقی‌مانده:** {total_seconds} ثانیه\n\n"
+        f"👥 **شرکت‌کنندگان (0):**\n"
+        f"_هنوز کسی شرکت نکرده است._\n\n"
+        f"👇 برای شرکت روی دکمه زیر کلیک کنید:"
     )
     
-    sent_msg = await bot.send_message(chat_id=channel_id, text=giveaway_text, parse_mode="Markdown")
+    channel_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🎁 شرکت در قرعه‌کشی (0)", callback_data="join_gw")]]
+    )
     
-    await call.message.edit_text(f"✅ قرعه‌کشی در {channel_id} منتشر شد!")
+    sent_msg = await bot.send_message(chat_id=channel_id, text=giveaway_text, parse_mode="Markdown", reply_markup=channel_keyboard)
+    
+    active_giveaways[sent_msg.message_id] = {
+        "channel": channel_id,
+        "title": data['title'],
+        "prize": data['prize'],
+        "winners_count": data['winners'],
+        "participants": [],
+        "end_time": end_time,
+        "ended": False
+    }
+    
+    await call.message.edit_text(f"✅ قرعه‌کشی با موفقیت در {channel_id} منتشر شد!")
     await state.clear()
     
-    # تایمر برای مدیریت زمان و اعلام برنده
-    asyncio.create_task(run_giveaway_timer(channel_id, sent_msg.message_id, data['title'], data['prize'], data['winners'], end_time))
+    asyncio.create_task(run_giveaway_timer(sent_msg.chat.id, sent_msg.message_id))
 
-async def run_giveaway_timer(channel_id, message_id, title, prize, winners_count, end_time):
-    while True:
-        remaining = (end_time - datetime.now()).total_seconds()
+@dp.callback_query(F.data == "join_gw")
+async def join_giveaway(call: types.CallbackQuery):
+    msg_id = call.message.message_id
+    user = call.from_user
+    
+    if msg_id not in active_giveaways or active_giveaways[msg_id]["ended"]:
+        await call.answer("❌ این قرعه‌کشی به پایان رسیده است!", show_alert=True)
+        return
+        
+    gw = active_giveaways[msg_id]
+    
+    try:
+        member = await bot.get_chat_member(chat_id=gw["channel"], user_id=user.id)
+        if member.status in ["left", "kicked"]:
+            await call.answer("❌ برای شرکت باید عضو کانال باشید!", show_alert=True)
+            return
+    except Exception:
+        pass
+
+    user_ids = [u.id for u in gw["participants"]]
+    if user.id in user_ids:
+        await call.answer("شما قبلاً ثبت‌نام شده‌اید! ✅", show_alert=True)
+        return
+
+    # افزودن کاربر جدید به لیست
+    gw["participants"].append(user)
+    await call.answer("🎉 با موفقیت ثبت‌نام شدید!", show_alert=True)
+    
+    # به‌روزرسانی لحظه‌ای پست کانال با لیست آیدی‌ها
+    await update_post_text(call.message.chat.id, msg_id)
+
+async def update_post_text(chat_id, message_id):
+    if message_id not in active_giveaways:
+        return
+        
+    gw = active_giveaways[message_id]
+    remaining = max(0, int((gw["end_time"] - datetime.now()).total_seconds()))
+    mins, secs = divmod(remaining, 60)
+    time_str = f"{mins} دقیقه و {secs} ثانیه" if mins > 0 else f"{secs} ثانیه"
+    
+    # ساخت لیست اسامی/آیدی‌های کاربران شرکت‌کننده
+    participants_list = gw["participants"]
+    if not participants_list:
+        users_str = "_هنوز کسی شرکت نکرده است._"
+    else:
+        formatted_users = []
+        for idx, u in enumerate(participants_list, 1):
+            name = f"@{u.username}" if u.username else f"[{u.first_name}](tg://user?id={u.id})"
+            formatted_users.append(f"{idx}\. {name}")
+        users_str = "\n".join(formatted_users)
+    
+    count = len(participants_list)
+    updated_text = (
+        f"🎉 **{gw['title']}** 🎉\n\n"
+        f"🎁 **جایزه:** {gw['prize']}\n"
+        f"👥 **تعداد برندگان:** {gw['winners_count']} نفر\n"
+        f"⏱ **زمان باقی‌مانده:** {time_str}\n\n"
+        f"👥 **شرکت‌کنندگان ({count}):**\n{users_str}\n\n"
+        f"👇 برای شرکت روی دکمه زیر کلیک کنید:"
+    )
+    
+    channel_kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=f"🎁 شرکت در قرعه‌کشی ({count})", callback_data="join_gw")]]
+    )
+    
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=updated_text, parse_mode="Markdown", reply_markup=channel_kb)
+    except Exception:
+        pass
+
+async def run_giveaway_timer(chat_id, message_id):
+    while message_id in active_giveaways:
+        gw = active_giveaways[message_id]
+        if gw["ended"]:
+            break
+            
+        remaining = (gw["end_time"] - datetime.now()).total_seconds()
         
         if remaining <= 0:
-            # زمان تمام شد -> انتخاب برنده از اعضای کانال
-            try:
-                # گرفتن تعداد اعضا و قرعه کشی بین اعضا (استفاده از ادمین‌ها و سازنده به عنوان نمونه اعضای فعال)
-                chat = await bot.get_chat(channel_id)
-                admins = await bot.get_chat_administrators(channel_id)
-                
-                # لیست شناسه کاربران کانال
-                eligible_users = [admin.user for admin in admins if not admin.user.is_bot]
-                
-                if eligible_users:
-                    chosen = random.sample(eligible_users, min(winners_count, len(eligible_users)))
-                    winners_str = []
-                    for user in chosen:
-                        if user.username:
-                            winners_str.append(f"🏆 @{user.username}")
-                        else:
-                            winners_str.append(f"🏆 [{user.first_name}](tg://user?id={user.id})")
-                    winners_text = "\n".join(winners_str)
-                else:
-                    winners_text = "برنده‌ای یافت نشد."
-
+            gw["ended"] = True
+            participants = gw["participants"]
+            winners_count = gw["winners_count"]
+            
+            if not participants:
                 final_text = (
                     f"🏁 **قرعه‌کشی به پایان رسید!** 🏁\n\n"
-                    f"📌 **عنوان:** {title}\n"
-                    f"🎁 **جایزه:** {prize}\n\n"
-                    f"✨ **برنده / برندگان خوش‌شانس:**\n{winners_text}"
+                    f"📌 **عنوان:** {gw['title']}\n"
+                    f"🎁 **جایزه:** {gw['prize']}\n\n"
+                    f"❌ هیچ شرکتی‌کننده‌ای ثبت‌نام نکرد."
                 )
+            else:
+                chosen_winners = random.sample(participants, min(winners_count, len(participants)))
+                winners_list = []
+                for user in chosen_winners:
+                    if user.username:
+                        winners_list.append(f"🏆 @{user.username}")
+                    else:
+                        winners_list.append(f"🏆 [{user.first_name}](tg://user?id={user.id})")
                 
-                await bot.edit_message_text(chat_id=channel_id, message_id=message_id, text=final_text, parse_mode="Markdown")
+                winners_str = "\n".join(winners_list)
+                final_text = (
+                    f"🏁 **قرعه‌کشی به پایان رسید!** 🏁\n\n"
+                    f"📌 **عنوان:** {gw['title']}\n"
+                    f"🎁 **جایزه:** {gw['prize']}\n\n"
+                    f"✨ **برنده / برندگان خوش‌شانس:**\n{winners_str}"
+                )
+            
+            try:
+                await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=final_text, parse_mode="Markdown", reply_markup=None)
             except Exception as e:
-                logging.error(f"Error ending giveaway: {e}")
+                logging.error(f"Error updating winner message: {e}")
+            
+            del active_giveaways[message_id]
             break
         else:
-            mins, secs = divmod(int(remaining), 60)
-            time_str = f"{mins} دقیقه و {secs} ثانیه" if mins > 0 else f"{secs} ثانیه"
+            await update_post_text(chat_id, message_id)
             
-            updated_text = (
-                f"🎉 **{title}** 🎉\n\n"
-                f"🎁 **جایزه:** {prize}\n"
-                f"👥 **تعداد برندگان:** {winners_count} نفر\n"
-                f"⏱ **زمان باقی‌مانده:** {time_str}\n\n"
-                f"📌 *تمامی اعضای کانال به صورت خودکار در قرعه‌کشی شرکت داده می‌شوند\.*"
-            )
-            try:
-                await bot.edit_message_text(chat_id=channel_id, message_id=message_id, text=updated_text, parse_mode="Markdown")
-            except Exception:
-                pass
-                
-        await asyncio.sleep(4)
+        await asyncio.sleep(3)
 
 @dp.callback_query(F.data == "cancel_launch")
 async def cancel_launch(call: types.CallbackQuery, state: FSMContext):
