@@ -3,6 +3,7 @@ import os
 import logging
 import random
 import html
+import re
 from datetime import datetime, timedelta
 from flask import Flask
 from threading import Thread
@@ -60,13 +61,13 @@ async def start_handler(message: types.Message, state: FSMContext):
 @dp.message(F.text == "/newgiveaway")
 async def start_giveaway(message: types.Message, state: FSMContext):
     await state.set_state(GiveawayForm.title)
-    await message.answer("📝 <b>مرحله ۱:</b> لطفاً <b>عنوان قرعه‌کشی</b> را وارد کنید:")
+    await message.answer("📝 <b>مرحله ۱:</b> لطفاً <b>عنوان قرعه‌کشی</b> را وارد کنید:", parse_mode="HTML")
 
 @dp.message(GiveawayForm.title)
 async def process_title(message: types.Message, state: FSMContext):
     await state.update_data(title=message.text)
     await state.set_state(GiveawayForm.prize)
-    await message.answer(f"✅ عنوان ذخیره شد: <b>{html.escape(message.text)}</b>\n\n🎁 <b>مرحله ۲:</b> لطفاً <b>نوع یا متن جایزه</b> را وارد کنید:")
+    await message.answer(f"✅ عنوان ذخیره شد: <b>{html.escape(message.text)}</b>\n\n🎁 <b>مرحله ۲:</b> لطفاً <b>نوع یا متن جایزه</b> را وارد کنید:", parse_mode="HTML")
 
 @dp.message(GiveawayForm.prize)
 async def process_prize(message: types.Message, state: FSMContext):
@@ -79,37 +80,45 @@ async def process_prize(message: types.Message, state: FSMContext):
             [InlineKeyboardButton(text="⏱ ۱۰ دقیقه", callback_data="time_600"), InlineKeyboardButton(text="⏱ ۱ ساعت", callback_data="time_3600")]
         ]
     )
-    await message.answer(f"✅ جایزه ذخیره شد: <b>{html.escape(message.text)}</b>\n\n⏳ <b>مرحله ۳:</b> مدت زمان قرعه‌کشی را انتخاب کنید:", reply_markup=time_keyboard)
+    await message.answer(f"✅ جایزه ذخیره شد: <b>{html.escape(message.text)}</b>\n\n⏳ <b>مرحله ۳:</b> مدت زمان قرعه‌کشی را انتخاب کنید:", parse_mode="HTML", reply_markup=time_keyboard)
 
 @dp.callback_query(F.data.startswith("time_"))
 async def process_time_callback(call: types.CallbackQuery, state: FSMContext):
     secs = int(call.data.split("_")[1])
     await state.update_data(time_seconds=secs)
     await state.set_state(GiveawayForm.winners)
-    await call.message.edit_text("✅ زمان ذخیره شد.\n\n👥 <b>مرحله ۴:</b> تعداد برندگان را وارد کنید (عدد):")
+    await call.message.edit_text("✅ زمان ذخیره شد.\n\n👥 <b>مرحله ۴:</b> تعداد برندگان را وارد کنید (عدد):", parse_mode="HTML")
 
 @dp.message(GiveawayForm.winners)
 async def process_winners(message: types.Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("❌ لطفاً یک عدد معتبر وارد کنید!")
+        await message.answer("❌ لطفاً یک عدد معتبر وارد کنید!", parse_mode="HTML")
         return
     await state.update_data(winners=int(message.text))
     await state.set_state(GiveawayForm.channel)
-    await message.answer("📢 <b>مرحله ۵:</b> آیدی کانال را بفرستید (مثال: <code>@Voidchanneloffical</code>):\n⚠️ ربات باید در کانال ادمین باشد.")
+    await message.answer("📢 <b>مرحله ۵:</b> آیدی کانال را بفرستید (مثال: <code>@Voidchanneloffical</code>):\n⚠️ ربات باید در کانال ادمین باشد.", parse_mode="HTML")
 
 @dp.message(GiveawayForm.channel)
 async def process_channel(message: types.Message, state: FSMContext):
-    channel_id = message.text.strip()
-    if not channel_id.startswith("@"):
-        channel_id = "@" + channel_id
+    raw_channel = message.text.strip()
+    
+    # تمیزسازی آیدی ورودی (حذف لینک و کاراکترهای اضافی)
+    if "t.me/" in raw_channel:
+        raw_channel = raw_channel.split("t.me/")[-1].replace("/", "")
+    if not raw_channel.startswith("@"):
+        channel_id = "@" + raw_channel
+    else:
+        channel_id = raw_channel
 
     try:
-        bot_member = await bot.get_chat_member(chat_id=channel_id, user_id=bot.id)
-        if bot_member.status not in ["administrator", "creator"]:
-            await message.answer("❌ ربات در این کانال ادمین نیست!")
+        chat = await bot.get_chat(channel_id)
+        member = await bot.get_chat_member(chat_id=chat.id, user_id=bot.id)
+        if member.status not in ["administrator", "creator"]:
+            await message.answer("❌ ربات هنوز در این کانال **ادمین** نیست! ابتدا ربات را ادمین کانال کنید و دوباره آیدی را بفرستید.", parse_mode="HTML")
             return
-    except Exception:
-        await message.answer("❌ کانال پیدا نشد یا ربات دسترسی ندارد.")
+    except Exception as e:
+        logging.error(f"Channel Check Error: {e}")
+        await message.answer("❌ کانال پیدا نشد یا ربات دسترسی ندارد!\nتست کنید که ربات حتماً ادمین کانال شده باشد.", parse_mode="HTML")
         return
 
     await state.update_data(channel=channel_id)
@@ -156,8 +165,12 @@ async def launch_giveaway(call: types.CallbackQuery, state: FSMContext):
         inline_keyboard=[[InlineKeyboardButton(text="🎁 شرکت در قرعه‌کشی (0)", callback_data="join_gw")]]
     )
     
-    sent_msg = await bot.send_message(chat_id=channel_id, text=giveaway_text, parse_mode="HTML", reply_markup=channel_keyboard)
-    
+    try:
+        sent_msg = await bot.send_message(chat_id=channel_id, text=giveaway_text, parse_mode="HTML", reply_markup=channel_keyboard)
+    except Exception as e:
+        await call.message.edit_text(f"❌ خطای ارسال به کانال: {e}")
+        return
+
     active_giveaways[sent_msg.message_id] = {
         "channel": channel_id,
         "title": title,
@@ -168,7 +181,7 @@ async def launch_giveaway(call: types.CallbackQuery, state: FSMContext):
         "ended": False
     }
     
-    await call.message.edit_text(f"✅ قرعه‌کشی با موفقیت در {channel_id} منتشر شد!")
+    await call.message.edit_text(f"✅ قرعه‌کشی با موفقیت در {channel_id} منتشر شد!", parse_mode="HTML")
     await state.clear()
     
     asyncio.create_task(run_giveaway_timer(sent_msg.chat.id, sent_msg.message_id))
@@ -294,13 +307,12 @@ async def run_giveaway_timer(chat_id, message_id):
         else:
             await update_post_text(chat_id, message_id)
             
-        # آپدیت زمان هر ۱۰ ثانیه
         await asyncio.sleep(10)
 
 @dp.callback_query(F.data == "cancel_launch")
 async def cancel_launch(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    await call.message.edit_text("❌ ساخت قرعه‌کشی لغو شد.")
+    await call.message.edit_text("❌ ساخت قرعه‌کشی لغو شد.", parse_mode="HTML")
 
 async def main():
     keep_alive()
