@@ -1,7 +1,3 @@
-# ==========================================
-# Void Giveaway Bot - Version 1.0.1
-# ==========================================
-
 import asyncio
 import os
 import logging
@@ -26,7 +22,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v1.0.1) is running!"
+    return "⚡ Void Giveaway Bot is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -37,7 +33,7 @@ def keep_alive():
     t.daemon = True
     t.start()
 
-TOKEN = os.environ.get("BOT_TOKEN")
+TOKEN = os.environ.get("BOT_TOKEN", "8940706019:AAHEsHRP50Ryvpg8sLf2ovV7m6cBTTbXVtI")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -45,7 +41,7 @@ dp = Dispatcher(storage=MemoryStorage())
 DATA_FILE = "giveaways.json"
 active_giveaways = {}
 
-# --- ذخیره و بازیابی داده‌ها ---
+# --- توابع ذخیره و بازیابی داده‌ها در فایل برای جلوگیری از پاک شدن موقع آپدیت ---
 def save_data():
     serializable = {}
     for msg_id, gw in active_giveaways.items():
@@ -103,31 +99,7 @@ main_keyboard = ReplyKeyboardMarkup(
 @dp.message(CommandStart())
 async def start_handler(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer(
-        "سلام! به ربات <b>Void Giveaway (v1.0.1)</b> خوش آمدید.\n\n"
-        "برای ساخت یا مدیریت قرعه‌کشی‌ها از دکمه‌های زیر استفاده کنید 👇\n\n"
-        "💡 <i>نکته: هر پیام یا پیستی که ایموجی پرمیوم داره رو فوروارد کن اینجا تا آی‌دی ایموجی رو بهت بدم!</i>",
-        parse_mode="HTML",
-        reply_markup=main_keyboard
-    )
-
-# --- استخراج آی‌دی ایموجی پرمیوم (جدید در v1.0.1) ---
-@dp.message(F.entities)
-async def extract_emoji_id(message: types.Message):
-    found = False
-    for entity in message.entities:
-        if entity.type == "custom_emoji":
-            found = True
-            emoji_id = entity.custom_emoji_id
-            html_code = f'&lt;tg-emoji id="{emoji_id}"&gt;⭐&lt;/tg-emoji&gt;'
-            await message.reply(
-                f"✨ <b>ایموجی پرمیوم پیدا شد!</b>\n\n"
-                f"🆔 <b>آی‌دی:</b> <code>{emoji_id}</code>\n"
-                f"📝 <b>کد HTML آماده برای استفاده در کد:</b>\n<code>{html_code}</code>",
-                parse_mode="HTML"
-            )
-    if not found and message.text and "t.me/addemoji/" in message.text:
-        await message.reply("لینک پک دریافت شد. برای استخراج، یک پیام که از این ایموجی‌ها استفاده کرده رو برام فوروارد کن!", parse_mode="HTML")
+    await message.answer("سلام! به ربات <b>Void Giveaway</b> خوش آمدید.\nبرای ساخت یا مدیریت قرعه‌کشی‌ها از دکمه‌های زیر استفاده کنید 👇", parse_mode="HTML", reply_markup=main_keyboard)
 
 # --- مدیریت قرعه‌کشی‌های فعال ---
 @dp.message(F.text == "📋 قرعه‌کشی‌های فعال")
@@ -367,6 +339,7 @@ async def update_post_text(chat_id, message_id):
     except Exception as e:
         logging.error(f"General Edit Error: {e}")
 
+# تابع اختصاصی پایان دادن به قرعه‌کشی (چه زمان تمام شود چه دستی)
 async def finish_giveaway(chat_id, message_id):
     if message_id not in active_giveaways or active_giveaways[message_id]["ended"]:
         return
@@ -430,7 +403,9 @@ async def cancel_launch(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("❌ ساخت قرعه‌کشی لغو شد.", parse_mode="HTML")
 
 async def main():
-    load_data()
+    load_data()  # بارگذاری مجدد قرعه‌کشی‌های قبلی پس از ری‌استارت ربات
+    
+    # راه‌اندازی مجدد تایمر برای قرعه‌کشی‌های نیمه‌کاره
     for msg_id, gw in list(active_giveaways.items()):
         if not gw["ended"]:
             asyncio.create_task(run_giveaway_timer(gw["channel"], msg_id))
