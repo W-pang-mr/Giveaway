@@ -3,7 +3,7 @@ import os
 import logging
 import random
 import html
-import re
+import json
 from datetime import datetime, timedelta
 from flask import Flask
 from threading import Thread
@@ -38,7 +38,48 @@ TOKEN = os.environ.get("BOT_TOKEN", "8940706019:AAHEsHRP50Ryvpg8sLf2ovV7m6cBTTbX
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+DATA_FILE = "giveaways.json"
 active_giveaways = {}
+
+# --- توابع ذخیره و بازیابی داده‌ها در فایل برای جلوگیری از پاک شدن موقع آپدیت ---
+def save_data():
+    serializable = {}
+    for msg_id, gw in active_giveaways.items():
+        serializable[str(msg_id)] = {
+            "channel": gw["channel"],
+            "title": gw["title"],
+            "prize": gw["prize"],
+            "winners_count": gw["winners_count"],
+            "participants": [{"id": u.id, "username": u.username, "first_name": u.first_name} for u in gw["participants"]],
+            "end_time": gw["end_time"].isoformat(),
+            "ended": gw["ended"]
+        }
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(serializable, f, ensure_ascii=False, indent=2)
+
+def load_data():
+    global active_giveaways
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for msg_id_str, gw in data.items():
+                    msg_id = int(msg_id_str)
+                    participants = [
+                        types.User(id=u["id"], is_bot=False, first_name=u["first_name"], username=u.get("username"))
+                        for u in gw["participants"]
+                    ]
+                    active_giveaways[msg_id] = {
+                        "channel": gw["channel"],
+                        "title": gw["title"],
+                        "prize": gw["prize"],
+                        "winners_count": gw["winners_count"],
+                        "participants": participants,
+                        "end_time": datetime.fromisoformat(gw["end_time"]),
+                        "ended": gw["ended"]
+                    }
+        except Exception as e:
+            logging.error(f"Error loading data: {e}")
 
 class GiveawayForm(StatesGroup):
     title = State()
@@ -48,15 +89,53 @@ class GiveawayForm(StatesGroup):
     channel = State()
 
 main_keyboard = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="🎉 ساخت قرعه‌کشی جدید")]],
+    keyboard=[
+        [KeyboardButton(text="🎉 ساخت قرعه‌کشی جدید")],
+        [KeyboardButton(text="📋 قرعه‌کشی‌های فعال")]
+    ],
     resize_keyboard=True
 )
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("سلام! به ربات <b>Void Giveaway</b> خوش آمدید.\nبرای ساخت قرعه‌کشی روی دکمه زیر بزنید 👇", parse_mode="HTML", reply_markup=main_keyboard)
+    await message.answer("سلام! به ربات <b>Void Giveaway</b> خوش آمدید.\nبرای ساخت یا مدیریت قرعه‌کشی‌ها از دکمه‌های زیر استفاده کنید 👇", parse_mode="HTML", reply_markup=main_keyboard)
 
+# --- مدیریت قرعه‌کشی‌های فعال ---
+@dp.message(F.text == "📋 قرعه‌کشی‌های فعال")
+async def show_active_giveaways(message: types.Message):
+    active_items = {k: v for k, v in active_giveaways.items() if not v["ended"]}
+    if not active_items:
+        await message.answer("❌ در حال حاضر هیچ قرعه‌کشی فعالی وجود ندارد.", parse_mode="HTML")
+        return
+
+    for msg_id, gw in active_items.items():
+        remaining = max(0, int((gw["end_time"] - datetime.now()).total_seconds()))
+        mins, secs = divmod(remaining, 60)
+        time_str = f"{mins} دقیقه و {secs} ثانیه" if mins > 0 else f"{secs} ثانیه"
+        
+        info_text = (
+            f"📌 <b>عنوان:</b> {gw['title']}\n"
+            f"🎁 <b>جایزه:</b> {gw['prize']}\n"
+            f"📢 <b>کانال:</b> {gw['channel']}\n"
+            f"👥 <b>شرکت کنندگان:</b> {len(gw['participants'])} نفر\n"
+            f"⏱ <b>زمان باقی‌مانده:</b> {time_str}\n"
+        )
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🛑 اتمام فوری قرعه‌کشی", callback_data=f"stop_gw_{msg_id}")]]
+        )
+        await message.answer(info_text, parse_mode="HTML", reply_markup=keyboard)
+
+@dp.callback_query(F.data.startswith("stop_gw_"))
+async def stop_giveaway_manual(call: types.CallbackQuery):
+    msg_id = int(call.data.split("_")[2])
+    if msg_id in active_giveaways and not active_giveaways[msg_id]["ended"]:
+        await finish_giveaway(active_giveaways[msg_id]["channel"], msg_id)
+        await call.message.edit_text("✅ قرعه‌کشی با موفقیت به پایان رسید و برندگان در کانال اعلام شدند.", parse_mode="HTML")
+    else:
+        await call.answer("❌ این قرعه‌کشی قبلاً تمام شده یا وجود ندارد.", show_alert=True)
+
+# --- فرآیند ساخت قرعه‌کشی ---
 @dp.message(F.text == "🎉 ساخت قرعه‌کشی جدید")
 @dp.message(F.text == "/newgiveaway")
 async def start_giveaway(message: types.Message, state: FSMContext):
@@ -102,7 +181,6 @@ async def process_winners(message: types.Message, state: FSMContext):
 async def process_channel(message: types.Message, state: FSMContext):
     raw_channel = message.text.strip()
     
-    # تمیزسازی آیدی ورودی (حذف لینک و کاراکترهای اضافی)
     if "t.me/" in raw_channel:
         raw_channel = raw_channel.split("t.me/")[-1].replace("/", "")
     if not raw_channel.startswith("@"):
@@ -180,6 +258,7 @@ async def launch_giveaway(call: types.CallbackQuery, state: FSMContext):
         "end_time": end_time,
         "ended": False
     }
+    save_data()
     
     await call.message.edit_text(f"✅ قرعه‌کشی با موفقیت در {channel_id} منتشر شد!", parse_mode="HTML")
     await state.clear()
@@ -211,6 +290,7 @@ async def join_giveaway(call: types.CallbackQuery):
         return
 
     gw["participants"].append(user)
+    save_data()
     await call.answer("🎉 با موفقیت ثبت‌نام شدید!", show_alert=True)
     
     await update_post_text(call.message.chat.id, msg_id)
@@ -259,6 +339,48 @@ async def update_post_text(chat_id, message_id):
     except Exception as e:
         logging.error(f"General Edit Error: {e}")
 
+# تابع اختصاصی پایان دادن به قرعه‌کشی (چه زمان تمام شود چه دستی)
+async def finish_giveaway(chat_id, message_id):
+    if message_id not in active_giveaways or active_giveaways[message_id]["ended"]:
+        return
+
+    gw = active_giveaways[message_id]
+    gw["ended"] = True
+    participants = gw["participants"]
+    winners_count = gw["winners_count"]
+    
+    if not participants:
+        final_text = (
+            f"🏁 <b>قرعه‌کشی به پایان رسید!</b> 🏁\n\n"
+            f"📌 <b>عنوان:</b> {gw['title']}\n"
+            f"🎁 <b>جایزه:</b> {gw['prize']}\n\n"
+            f"❌ هیچ شرکتی‌کننده‌ای ثبت‌نام نکرد."
+        )
+    else:
+        chosen_winners = random.sample(participants, min(winners_count, len(participants)))
+        winners_list = []
+        for user in chosen_winners:
+            if user.username:
+                winners_list.append(f"🏆 @{user.username}")
+            else:
+                first = html.escape(user.first_name)
+                winners_list.append(f'🏆 <a href="tg://user?id={user.id}">{first}</a>')
+        
+        winners_str = "\n".join(winners_list)
+        final_text = (
+            f"🏁 <b>قرعه‌کشی به پایان رسید!</b> 🏁\n\n"
+            f"📌 <b>عنوان:</b> {gw['title']}\n"
+            f"🎁 <b>جایزه:</b> {gw['prize']}\n\n"
+            f"✨ <b>برنده / برندگان خوش‌شانس:</b>\n{winners_str}"
+        )
+    
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=final_text, parse_mode="HTML", reply_markup=None)
+    except Exception as e:
+        logging.error(f"Error updating winner message: {e}")
+    
+    save_data()
+
 async def run_giveaway_timer(chat_id, message_id):
     while message_id in active_giveaways:
         gw = active_giveaways[message_id]
@@ -268,41 +390,7 @@ async def run_giveaway_timer(chat_id, message_id):
         remaining = (gw["end_time"] - datetime.now()).total_seconds()
         
         if remaining <= 0:
-            gw["ended"] = True
-            participants = gw["participants"]
-            winners_count = gw["winners_count"]
-            
-            if not participants:
-                final_text = (
-                    f"🏁 <b>قرعه‌کشی به پایان رسید!</b> 🏁\n\n"
-                    f"📌 <b>عنوان:</b> {gw['title']}\n"
-                    f"🎁 <b>جایزه:</b> {gw['prize']}\n\n"
-                    f"❌ هیچ شرکتی‌کننده‌ای ثبت‌نام نکرد."
-                )
-            else:
-                chosen_winners = random.sample(participants, min(winners_count, len(participants)))
-                winners_list = []
-                for user in chosen_winners:
-                    if user.username:
-                        winners_list.append(f"🏆 @{user.username}")
-                    else:
-                        first = html.escape(user.first_name)
-                        winners_list.append(f'🏆 <a href="tg://user?id={user.id}">{first}</a>')
-                
-                winners_str = "\n".join(winners_list)
-                final_text = (
-                    f"🏁 <b>قرعه‌کشی به پایان رسید!</b> 🏁\n\n"
-                    f"📌 <b>عنوان:</b> {gw['title']}\n"
-                    f"🎁 <b>جایزه:</b> {gw['prize']}\n\n"
-                    f"✨ <b>برنده / برندگان خوش‌شانس:</b>\n{winners_str}"
-                )
-            
-            try:
-                await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=final_text, parse_mode="HTML", reply_markup=None)
-            except Exception as e:
-                logging.error(f"Error updating winner message: {e}")
-            
-            del active_giveaways[message_id]
+            await finish_giveaway(chat_id, message_id)
             break
         else:
             await update_post_text(chat_id, message_id)
@@ -315,6 +403,13 @@ async def cancel_launch(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("❌ ساخت قرعه‌کشی لغو شد.", parse_mode="HTML")
 
 async def main():
+    load_data()  # بارگذاری مجدد قرعه‌کشی‌های قبلی پس از ری‌استارت ربات
+    
+    # راه‌اندازی مجدد تایمر برای قرعه‌کشی‌های نیمه‌کاره
+    for msg_id, gw in list(active_giveaways.items()):
+        if not gw["ended"]:
+            asyncio.create_task(run_giveaway_timer(gw["channel"], msg_id))
+
     keep_alive()
     await dp.start_polling(bot)
 
