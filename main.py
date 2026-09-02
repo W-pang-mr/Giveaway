@@ -1,6 +1,6 @@
 # ==========================================
-# Void Giveaway Bot - Version 1.8.2
-# (Fixed TON-SDK Import Compatibility for Python 3.14)
+# Void Giveaway Bot - Version 1.8.3
+# (Fixed TON-SDK Import Compatibility for Render)
 # ==========================================
 
 import asyncio
@@ -22,12 +22,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 
-# اصلاح Importهای tonsdk جهت جلوگیری از ImportError روی Render
+# اصلاح کامل و استاندارد Importهای tonsdk برای عدم ایجاد خطا
 from tonsdk.contract.wallet import WalletVersionEnum, WalletContract
-try:
-    from tonsdk.crypto._mnemonic import Mnemonic
-except ImportError:
-    from tonsdk.crypto import mnemonic_to_private_key as Mnemonic
+from tonsdk.crypto.mnemonic import mnemonic_to_wallet_key
 
 logging.basicConfig(level=logging.INFO)
 
@@ -35,7 +32,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v1.8.2) is running!"
+    return "⚡ Void Giveaway Bot (v1.8.3) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -68,7 +65,7 @@ WHEEL_SKINS = [
     {"name": "Rare Skin 🔥👑", "type": "skin", "weight": 2}
 ]
 
-# تابع ارسال تراکنش TON
+# تابع ارسال تراکنش TON به‌روزرسانی شده
 async def send_ton_payout(destination_address: str, amount_ton: float):
     if not TON_MNEMONIC:
         return False, "کلید امنیتی ولت (TON_MNEMONIC) روی رندر تنظیم نشده است!"
@@ -76,12 +73,8 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
     try:
         mnemonics = TON_MNEMONIC.strip().split()
         
-        # استخراج کلیدها با روش پشتیبانی شده در tonsdk
-        if callable(Mnemonic) and not hasattr(Mnemonic, "to_keypair"):
-            pub_k, priv_k = Mnemonic(mnemonics)
-        else:
-            mnemonic_obj = Mnemonic(mnemonics)
-            pub_k, priv_k = mnemonic_obj.to_keypair()
+        # استخراج مستقیم و تمیز کلیدهای عمومی و خصوصی
+        pub_k, priv_k = mnemonic_to_wallet_key(mnemonics)
         
         # ساخت ولت V4R2
         wallet = WalletContract(
@@ -295,7 +288,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات بزرگ Void Giveaway خوش آمدی!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v1.8.2</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v1.8.3</code> 💎\n\n"
         f"از منوی زیر می‌تونی توی گردونه شانس شرکت کنی یا انبار اسکینهات رو ببینی 👇",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
