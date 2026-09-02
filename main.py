@@ -1,6 +1,6 @@
 # ==========================================
-# Void Giveaway Bot - Version 2.0.0
-# (Powered by TonTools & Real TON Payout)
+# Void Giveaway Bot - Version 3.0.0
+# (Powered by pytoniq & TON W5 Wallet)
 # ==========================================
 
 import asyncio
@@ -20,8 +20,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 
-# کتابخانه جدید و قدرتمند TonTools
-from TonTools import TonCenterClient, Wallet
+# کتابخانه جدید pytoniq برای کار با شبکه TON و ولت W5
+from pytoniq import LiteClient, WalletV5R1
 
 logging.basicConfig(level=logging.INFO)
 
@@ -29,7 +29,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v2.0.0 - TonTools) is running!"
+    return "⚡ Void Giveaway Bot (v3.0.0 - pytoniq & W5) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -63,31 +63,41 @@ WHEEL_SKINS = [
 ]
 
 # ==========================================
-# تابع واریز واقعی شبکه TON با TonTools
+# تابع واریز واقعی شبکه TON با pytoniq و ولت W5
 # ==========================================
 async def send_ton_payout(destination_address: str, amount_ton: float):
     if not TON_MNEMONIC:
         return False, "کلید امنیتی ولت (TON_MNEMONIC) روی رندر تنظیم نشده است!"
     
+    client = None
     try:
-        # اتصال به پرووایدر شبکه TON
-        client = TonCenterClient(base_url='https://toncenter.com/api/v2/')
-        
-        # خواندن کلمات بازیابی و ساخت شیء ولت
+        # ۱. اتصال به لایت‌سرور شبکه TON
+        client = LiteClient.from_mainnet_config(ls_i=0, trust_level=2)
+        await client.connect()
+
+        # ۲. تبدیل کلمات بازیابی به لیست
         mnemonics = TON_MNEMONIC.strip().split()
-        wallet = Wallet(provider=client, mnemonics=mnemonics, version='v4r2')
-        
-        # انتقال آسنکرون TON به آدرس مقصد
-        await wallet.transfer_ton(
-            destination_address=destination_address.strip(),
-            amount=amount_ton,
-            comment="Reward from Void Giveaway Bot 🎉"
+
+        # ۳. بازسازی ولت W5R1 ادمین
+        wallet = await WalletV5R1.from_mnemonic(client, mnemonics)
+
+        # ۴. تبدیل میزان TON به نانوتن (NanoTON)
+        amount_nano = int(amount_ton * 10**9)
+
+        # ۵. ارسال تراکنش مستقیم در شبکه TON
+        await wallet.transfer(
+            destination=destination_address.strip(),
+            amount=amount_nano,
+            body="Reward from Void Giveaway Bot 🎉"
         )
-        
-        return True, "تراکنش با موفقیت انجام شد و از ولت کسر گردید! 🚀"
+
+        await client.close()
+        return True, "تراکنش با موفقیت از ولت W5 ارسال گردید! 🚀"
 
     except Exception as e:
-        logging.error(f"TonTools Payout Error: {e}")
+        logging.error(f"pytoniq W5 Payout Error: {e}")
+        if client and client.is_connected():
+            await client.close()
         return False, str(e)
 
 # ==========================================
@@ -247,7 +257,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات بزرگ Void Giveaway خوش آمدی!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v2.0.0 (TonTools)</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v3.0.0 (pytoniq - W5 Wallet)</code> 💎\n\n"
         f"از منوی زیر می‌تونی توی گردونه شانس شرکت کنی یا انبار اسکینهات رو ببینی 👇",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
@@ -423,12 +433,12 @@ async def approve_withdraw(call: types.CallbackQuery):
                 dest_addr = msg_lines[idx+1].strip()
                 break
 
-        # ارسال واقعی کریپتو توسط TonTools
+        # ارسال واقعی کریپتو توسط pytoniq از ولت W5
         success, result_msg = await send_ton_payout(dest_addr, 0.01)
         if success:
-            updated_text = call.message.text + "\n\n✅ <b>وضعیت: واریز واقعی کریپتویی با TonTools انجام شد! 💎</b>"
+            updated_text = call.message.text + "\n\n✅ <b>وضعیت: واریز واقعی از ولت W5 انجام شد! 💎</b>"
             await call.message.edit_text(updated_text, parse_mode="HTML", reply_markup=None)
-            await call.answer("✅ 0.01 TON به‌صورت واقعی از ولت کسر و ارسال شد!", show_alert=True)
+            await call.answer("✅ 0.01 TON با موفقیت از ولت W5 کسر و منتقل شد!", show_alert=True)
         else:
             await call.answer(f"❌ خطا در واریز: {result_msg}", show_alert=True)
             return
