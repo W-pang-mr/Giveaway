@@ -1,6 +1,6 @@
 # ==========================================
-# Void Giveaway Bot - Version 1.6.0
-# (Real TON Network Payout Enabled)
+# Void Giveaway Bot - Version 1.6.1
+# (Fix Toncenter Import & Real TON Payout)
 # ==========================================
 
 import asyncio
@@ -9,6 +9,7 @@ import logging
 import random
 import html
 import json
+import requests
 from datetime import datetime, timedelta
 from flask import Flask
 from threading import Thread
@@ -22,7 +23,6 @@ from aiogram.exceptions import TelegramBadRequest
 
 from tonsdk.contract.wallet import WalletVersionEnum, Wallets
 from tonsdk.utils import bytes_to_b64str
-from tonsdk.provider import ToncenterClient
 
 logging.basicConfig(level=logging.INFO)
 
@@ -30,7 +30,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v1.6.0) is running!"
+    return "⚡ Void Giveaway Bot (v1.6.1) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -63,7 +63,7 @@ WHEEL_SKINS = [
     {"name": "Rare Skin 🔥👑", "type": "skin", "weight": 2}
 ]
 
-# تابع واریز واقعی و ارسال به شبکه TON
+# تابع واریز واقعی و مستقیم به شبکه TON
 async def send_ton_payout(destination_address: str, amount_ton: float):
     if not TON_MNEMONIC:
         return False, "کلید امنیتی ولت (TON_MNEMONIC) روی رندر تنظیم نشده است!"
@@ -78,15 +78,26 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
             workchain=0
         )
         
-        # ۲. اتصال به سرور Toncenter
-        client = ToncenterClient(base_url='https://toncenter.com/api/v2/jsonRPC')
-        
-        # ۳. دریافت شماره Seqno از شبکه
-        seqno = await asyncio.to_thread(client.wallet_seqno, wallet.address.to_string(True, True, True))
-        if seqno is None:
-            seqno = 0
+        wallet_address = wallet.address.to_string(True, True, True)
 
-        # ۴. ساخت تراکنش و کسر مبلغ (تبدیل به NanoTON)
+        # ۲. دریافت Seqno از Toncenter API به صورت مستقیم
+        def get_seqno():
+            url = f"https://toncenter.com/api/v2/runGetMethod"
+            payload = {
+                "address": wallet_address,
+                "method": "seqno",
+                "stack": []
+            }
+            res = requests.post(url, json=payload, timeout=10).json()
+            if res.get("ok") and res.get("result", {}).get("exit_code") == 0:
+                stack = res["result"]["stack"]
+                if stack and len(stack) > 0:
+                    return int(stack[0][1], 16)
+            return 0
+
+        seqno = await asyncio.to_thread(get_seqno)
+
+        # ۳. ساخت تراکنش
         nano_amount = int(amount_ton * 10**9)
         query = wallet.create_transfer_message(
             to_addr=destination_address.strip(),
@@ -95,14 +106,20 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
             payload="Reward from Void Giveaway Bot 🎉"
         )
         
-        # ۵. ارسال بایت‌های تراکنش امضا شده به بلاک‌چین TON
+        # ۴. ارسال بایت‌های تراکنش امضا شده (BOC) به API شبکه TON
         boc_b64 = bytes_to_b64str(query['message'].to_boc(False))
-        res = await asyncio.to_thread(client.send_boc, boc_b64)
+
+        def send_boc():
+            url = "https://toncenter.com/api/v2/sendBoc"
+            payload = {"boc": boc_b64}
+            return requests.post(url, json=payload, timeout=10).json()
+
+        res = await asyncio.to_thread(send_boc)
         
-        if res and res.get('@type') == 'ok':
+        if res and res.get('ok'):
             return True, "تراکنش با موفقیت به شبکه TON ارسال شد و کسر گردید! 🚀"
         else:
-            return False, f"خطای شبکه TON: {res}"
+            return False, f"خطای شبکه TON: {res.get('error', res)}"
 
     except Exception as e:
         logging.error(f"TON Payout Real Send Error: {e}")
@@ -259,7 +276,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات بزرگ Void Giveaway خوش آمدی!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v1.6.0</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v1.6.1</code> 💎\n\n"
         f"از منوی زیر می‌تونی توی گردونه شانس شرکت کنی یا انبار اسکینهات رو ببینی 👇",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
