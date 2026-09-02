@@ -1,5 +1,5 @@
 # ==========================================
-# Void Giveaway Bot - Version 3.0.0
+# Void Giveaway Bot - Version 3.1.0
 # (Powered by pytoniq & TON W5 Wallet)
 # ==========================================
 
@@ -9,6 +9,7 @@ import logging
 import random
 import html
 import json
+import re
 from datetime import datetime, timedelta
 from flask import Flask
 from threading import Thread
@@ -20,16 +21,19 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 
-# کتابخانه جدید pytoniq برای کار با شبکه TON و ولت W5
+# کتابخانه pytoniq برای کار با شبکه TON و ولت W5
 from pytoniq import LiteClient, WalletV5R1
 
+# تنظیمات لاگینگ (خاموش کردن لاگ‌های اضافه LiteClient جهت خلوت ماندن کنسول)
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("pytoniq").setLevel(logging.WARNING)
+logging.getLogger("LiteClient").setLevel(logging.WARNING)
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v3.0.0 - pytoniq & W5) is running!"
+    return "⚡ Void Giveaway Bot (v3.1.0 - pytoniq & W5) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -257,7 +261,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات بزرگ Void Giveaway خوش آمدی!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v3.0.0 (pytoniq - W5 Wallet)</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v3.1.0 (pytoniq - W5 Wallet)</code> 💎\n\n"
         f"از منوی زیر می‌تونی توی گردونه شانس شرکت کنی یا انبار اسکینهات رو ببینی 👇",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
@@ -415,6 +419,9 @@ async def process_withdraw_info(message: types.Message, state: FSMContext):
         reply_markup=get_main_keyboard(user.id)
     )
 
+# ==========================================
+# تایید برداشت و واریز خودکار کریپتو
+# ==========================================
 @dp.callback_query(F.data.startswith("wd_approve_"))
 async def approve_withdraw(call: types.CallbackQuery):
     if not is_admin(call.from_user.id):
@@ -426,19 +433,23 @@ async def approve_withdraw(call: types.CallbackQuery):
     skin_name = "_".join(parts[3:])
 
     if "TON" in skin_name:
-        msg_lines = call.message.text.split("\n")
-        dest_addr = ""
-        for idx, line in enumerate(msg_lines):
-            if "مشخصات/آدرس ارسالی:" in line and idx + 1 < len(msg_lines):
-                dest_addr = msg_lines[idx+1].strip()
-                break
+        message_text = call.message.text or call.message.caption or ""
+        # استخراج هوشمند و دقیق آدرس TON (شامل EQ یا UQ)
+        match = re.search(r'(EQ[a-zA-Z0-9_-]{46}|UQ[a-zA-Z0-9_-]{46})', message_text)
+        
+        if not match:
+            await call.answer("❌ آدرس ولت معتبری در متن پیام یافت نشد!", show_alert=True)
+            return
 
-        # ارسال واقعی کریپتو توسط pytoniq از ولت W5
+        dest_addr = match.group(1)
+        await call.answer("⏳ در حال ارسال تراکنش به شبکه TON...", show_alert=False)
+
+        # ارسال واقعی کریپتو از طریق pytoniq با ولت W5
         success, result_msg = await send_ton_payout(dest_addr, 0.01)
         if success:
             updated_text = call.message.text + "\n\n✅ <b>وضعیت: واریز واقعی از ولت W5 انجام شد! 💎</b>"
             await call.message.edit_text(updated_text, parse_mode="HTML", reply_markup=None)
-            await call.answer("✅ 0.01 TON با موفقیت از ولت W5 کسر و منتقل شد!", show_alert=True)
+            await call.answer("✅ 0.01 TON با موفقیت منتقل شد!", show_alert=True)
         else:
             await call.answer(f"❌ خطا در واریز: {result_msg}", show_alert=True)
             return
