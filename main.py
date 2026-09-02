@@ -304,56 +304,11 @@ def get_admin_inline_keyboard():
     )
 
 # ==========================================
-# بررسی کلیک روی دکمه عضو شدم
+# پردازش اختصاصی منطق ثبت رفرال
 # ==========================================
-@dp.callback_query(F.data == "check_join_btn")
-async def check_join_btn_callback(call: types.CallbackQuery, state: FSMContext):
-    u_id = call.from_user.id
-    if not bot_active and not is_admin(u_id):
-        await call.answer("🛑 ربات در حال حاضر جهت به‌روزرسانی موقتاً خاموش می‌باشد.", show_alert=True)
-        return
-
-    is_subscribed = await check_user_subscription(u_id)
-    if is_subscribed:
-        await call.answer("✅ عضویت شما تایید شد!", show_alert=True)
-        await call.message.delete()
-        await call.message.answer(
-            f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-            f"📌 <b>نسخه ربات:</b> <code>v4.3.0</code> 💎\n\n"
-            f"🎁 <b>به ازای هر رفرال معتبر {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
-            f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(u_id)
-        )
-    else:
-        await call.answer("❌ شما هنوز در کانال عضو نشده‌اید!", show_alert=True)
-
-# ==========================================
-# دستور /start و سیستم آنتی-فیک رفرال + جوین اجباری
-# ==========================================
-@dp.message(CommandStart())
-async def start_handler(message: types.Message, command: CommandObject, state: FSMContext):
-    await state.clear()
-    u_id = message.from_user.id
-
-    if not bot_active and not is_admin(u_id):
-        await message.answer("🛑 <b>ربات در حال حاضر جهت به‌روزرسانی موقتاً خاموش می‌باشد.</b>", parse_mode="HTML")
-        return
-
-    # بررسی جوین اجباری
-    is_subscribed = await check_user_subscription(u_id)
-    if not is_subscribed:
-        await message.answer(
-            f"⚠️ <b>جهت استفاده از ربات و دریافت پاداش‌ها، ابتدا باید در کانال رسمی ما عضو شوید:</b>\n\n"
-            f"📢 کانال: {REQUIRED_CHANNEL}\n\n"
-            f"پس از عضویت، روی دکمه «✅ بررسی عضویت / ورود» کلیک کنید.",
-            parse_mode="HTML",
-            reply_markup=get_join_channel_keyboard()
-        )
-        return
-
-    prof = get_user_profile(u_id, message.from_user)
-    args = command.args
+async def process_referral_logic(user: types.User, args: str, state: FSMContext):
+    u_id = user.id
+    prof = get_user_profile(u_id, user)
 
     is_new_user = u_id not in all_time_users
     if is_new_user:
@@ -369,7 +324,12 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
                     ref_prof = get_user_profile(referrer_id)
                     ref_prof["balance"] = round(ref_prof["balance"] + referral_reward, 4)
                     ref_prof["referrals_count"] += 1
-                    await save_data()
+                    
+                    await users_col.update_one(
+                        {"user_id": referrer_id},
+                        {"$set": user_data[referrer_id]},
+                        upsert=True
+                    )
 
                     try:
                         await bot.send_message(
@@ -392,7 +352,6 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
                 if msg_id in active_giveaways and not active_giveaways[msg_id]["ended"]:
                     gw = active_giveaways[msg_id]
-                    user = message.from_user
 
                     if user.id not in gw["participants"]:
                         gw["participants"][user.id] = {
@@ -406,6 +365,12 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
                             ref_prof = get_user_profile(referrer_id)
                             ref_prof["balance"] = round(ref_prof["balance"] + referral_reward, 4)
                             ref_prof["referrals_count"] += 1
+                            
+                            await users_col.update_one(
+                                {"user_id": referrer_id},
+                                {"$set": user_data[referrer_id]},
+                                upsert=True
+                            )
                             try:
                                 await bot.send_message(
                                     referrer_id,
@@ -416,18 +381,74 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
                             except Exception:
                                 pass
 
-                        await save_data()
                         await update_post_text(gw["channel"], msg_id)
-                        await message.answer(
-                            f"👑 با موفقیت وارد قرعه‌کشی <b>{gw['title']}</b> شدی!",
-                            parse_mode="HTML",
-                            reply_markup=get_main_keyboard(u_id)
-                        )
-                        return
             except Exception as e:
                 logging.error(f"GW Referral Start Error: {e}")
 
     await save_data()
+
+# ==========================================
+# بررسی کلیک روی دکمه عضو شدم
+# ==========================================
+@dp.callback_query(F.data == "check_join_btn")
+async def check_join_btn_callback(call: types.CallbackQuery, state: FSMContext):
+    u_id = call.from_user.id
+    if not bot_active and not is_admin(u_id):
+        await call.answer("🛑 ربات در حال حاضر جهت به‌روزرسانی موقتاً خاموش می‌باشد.", show_alert=True)
+        return
+
+    is_subscribed = await check_user_subscription(u_id)
+    if is_subscribed:
+        await call.answer("✅ عضویت شما تایید شد!", show_alert=True)
+        
+        state_data = await state.get_data()
+        pending_args = state_data.get("pending_ref_args", None)
+
+        await process_referral_logic(call.from_user, pending_args, state)
+        await state.clear()
+
+        await call.message.delete()
+        await call.message.answer(
+            f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
+            f"📌 <b>نسخه ربات:</b> <code>v4.3.0</code> 💎\n\n"
+            f"🎁 <b>به ازای هر رفرال معتبر {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
+            f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(u_id)
+        )
+    else:
+        await call.answer("❌ شما هنوز در کانال عضو نشده‌اید!", show_alert=True)
+
+# ==========================================
+# دستور /start و سیستم آنتی-فیک رفرال + جوین اجباری
+# ==========================================
+@dp.message(CommandStart())
+async def start_handler(message: types.Message, command: CommandObject, state: FSMContext):
+    u_id = message.from_user.id
+
+    if not bot_active and not is_admin(u_id):
+        await message.answer("🛑 <b>ربات در حال حاضر جهت به‌روزرسانی موقتاً خاموش می‌باشد.</b>", parse_mode="HTML")
+        return
+
+    args = command.args
+    if args:
+        await state.update_data(pending_ref_args=args)
+
+    # بررسی جوین اجباری
+    is_subscribed = await check_user_subscription(u_id)
+    if not is_subscribed:
+        await message.answer(
+            f"⚠️ <b>جهت استفاده از ربات و دریافت پاداش‌ها، ابتدا باید در کانال رسمی ما عضو شوید:</b>\n\n"
+            f"📢 کانال: {REQUIRED_CHANNEL}\n\n"
+            f"پس از عضویت، روی دکمه «✅ بررسی عضویت / ورود» کلیک کنید.",
+            parse_mode="HTML",
+            reply_markup=get_join_channel_keyboard()
+        )
+        return
+
+    await process_referral_logic(message.from_user, args, state)
+    await state.clear()
+
     await message.answer(
         f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
         f"📌 <b>نسخه ربات:</b> <code>v4.3.0 (Forced Join & System Switch)</code> 💎\n\n"
