@@ -1,6 +1,6 @@
 # ==========================================
 # Void Giveaway Bot - Version 4.3.0
-# (Referral Only, Forced Join Channel, Bot On/Off Switch)
+# (Referral Only, Forced Join Channel, Bot On/Off Switch + MongoDB Integrated)
 # ==========================================
 
 import asyncio
@@ -8,7 +8,6 @@ import os
 import logging
 import random
 import html
-import json
 import re
 from datetime import datetime, timedelta
 from flask import Flask
@@ -21,6 +20,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 
+import motor.motor_asyncio
 from pytoniq import LiteClient, WalletV5R1
 
 logging.basicConfig(level=logging.INFO)
@@ -48,10 +48,18 @@ WITHDRAW_CHANNEL = "@voidwithraw"
 REQUIRED_CHANNEL = "@Voidchanneloffical"  # کانال جوین اجباری
 TON_MNEMONIC = os.environ.get("TON_MNEMONIC")
 
+# تنظیمات اتصال به MongoDB
+MONGO_URI = os.environ.get("MONGO_URI", "")
+mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+db = mongo_client['void_giveaway_db']
+
+users_col = db['users']
+giveaways_col = db['giveaways']
+settings_col = db['settings']
+
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-DATA_FILE = "giveaways.json"
 active_giveaways = {}
 user_data = {}
 all_time_users = set()  # برای جلوگیری از باگ رفرال فیک
@@ -119,95 +127,103 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
         return False, str(e)
 
 # ==========================================
-# مدیریت ذخیره و بازیابی داده‌ها
+# مدیریت ذخیره و بازیابی داده‌ها (MongoDB Async)
 # ==========================================
-def save_data():
-    serializable_gw = {}
-    for msg_id, gw in active_giveaways.items():
-        serializable_gw[str(msg_id)] = {
-            "channel": gw["channel"],
-            "title": gw["title"],
-            "prize": gw["prize"],
-            "winners_count": gw["winners_count"],
-            "participants": {
+async def save_data():
+    try:
+        # ۱. ذخیره قرعه‌کشی‌ها
+        for msg_id, gw in active_giveaways.items():
+            participants_data = {
                 str(u_id): {
                     "username": info["username"],
                     "first_name": info["first_name"],
                     "referrals": info["referrals"]
                 } for u_id, info in gw["participants"].items()
-            },
-            "end_time": gw["end_time"].isoformat(),
-            "ended": gw["ended"]
-        }
-    
-    serializable_users = {}
-    for u_id, info in user_data.items():
-        serializable_users[str(u_id)] = {
-            "balance": info.get("balance", 0.0),
-            "referrals_count": info.get("referrals_count", 0),
-            "referred_by": info.get("referred_by", None),
-            "username": info.get("username", ""),
-            "first_name": info.get("first_name", "User")
-        }
+            }
+            gw_doc = {
+                "msg_id": msg_id,
+                "channel": gw["channel"],
+                "title": gw["title"],
+                "prize": gw["prize"],
+                "winners_count": gw["winners_count"],
+                "participants": participants_data,
+                "end_time": gw["end_time"].isoformat(),
+                "ended": gw["ended"]
+            }
+            await giveaways_col.update_one({"msg_id": msg_id}, {"$set": gw_doc}, upsert=True)
 
-    full_data = {
-        "giveaways": serializable_gw,
-        "users": serializable_users,
-        "all_time_users": list(all_time_users),
-        "bot_active": bot_active,
-        "min_withdraw_amount": min_withdraw_amount,
-        "max_withdraw_amount": max_withdraw_amount,
-        "referral_reward": referral_reward,
-        "ton_gas_fee": ton_gas_fee
-    }
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(full_data, f, ensure_ascii=False, indent=2)
+        # ۲. ذخیره کاربران
+        for u_id, info in user_data.items():
+            user_doc = {
+                "user_id": u_id,
+                "balance": info.get("balance", 0.0),
+                "referrals_count": info.get("referrals_count", 0),
+                "referred_by": info.get("referred_by", None),
+                "username": info.get("username", ""),
+                "first_name": info.get("first_name", "User")
+            }
+            await users_col.update_one({"user_id": u_id}, {"$set": user_doc}, upsert=True)
 
-def load_data():
+        # ۳. ذخیره تنظیمات ربات
+        settings_doc = {
+            "setting_id": "global_config",
+            "all_time_users": list(all_time_users),
+            "bot_active": bot_active,
+            "min_withdraw_amount": min_withdraw_amount,
+            "max_withdraw_amount": max_withdraw_amount,
+            "referral_reward": referral_reward,
+            "ton_gas_fee": ton_gas_fee
+        }
+        await settings_col.update_one({"setting_id": "global_config"}, {"$set": settings_doc}, upsert=True)
+
+    except Exception as e:
+        logging.error(f"Error saving data to MongoDB: {e}")
+
+async def load_data():
     global active_giveaways, user_data, all_time_users, bot_active, min_withdraw_amount, max_withdraw_amount, referral_reward, ton_gas_fee
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                full_data = json.load(f)
-                gw_data = full_data.get("giveaways", {})
-                for msg_id_str, gw in gw_data.items():
-                    msg_id = int(msg_id_str)
-                    participants = {}
-                    for u_id_str, info in gw["participants"].items():
-                        participants[int(u_id_str)] = {
-                            "username": info.get("username"),
-                            "first_name": info.get("first_name", "User"),
-                            "referrals": info.get("referrals", 0)
-                        }
-                    active_giveaways[msg_id] = {
-                        "channel": gw["channel"],
-                        "title": gw["title"],
-                        "prize": gw["prize"],
-                        "winners_count": gw["winners_count"],
-                        "participants": participants,
-                        "end_time": datetime.fromisoformat(gw["end_time"]),
-                        "ended": gw["ended"]
-                    }
-                
-                u_data = full_data.get("users", {})
-                for u_id_str, info in u_data.items():
-                    u_id = int(u_id_str)
-                    user_data[u_id] = {
-                        "balance": round(info.get("balance", 0.0), 4),
-                        "referrals_count": info.get("referrals_count", 0),
-                        "referred_by": info.get("referred_by", None),
-                        "username": info.get("username", ""),
-                        "first_name": info.get("first_name", "User")
-                    }
-                
-                all_time_users = set(full_data.get("all_time_users", []))
-                bot_active = full_data.get("bot_active", True)
-                min_withdraw_amount = full_data.get("min_withdraw_amount", 0.1)
-                max_withdraw_amount = full_data.get("max_withdraw_amount", 10.0)
-                referral_reward = full_data.get("referral_reward", 0.048)
-                ton_gas_fee = full_data.get("ton_gas_fee", 0.005)
-        except Exception as e:
-            logging.error(f"Error loading data: {e}")
+    try:
+        # ۱. بازیابی تنظیمات
+        settings_doc = await settings_col.find_one({"setting_id": "global_config"})
+        if settings_doc:
+            all_time_users = set(settings_doc.get("all_time_users", []))
+            bot_active = settings_doc.get("bot_active", True)
+            min_withdraw_amount = settings_doc.get("min_withdraw_amount", 0.1)
+            max_withdraw_amount = settings_doc.get("max_withdraw_amount", 10.0)
+            referral_reward = settings_doc.get("referral_reward", 0.048)
+            ton_gas_fee = settings_doc.get("ton_gas_fee", 0.005)
+
+        # ۲. بازیابی کاربران
+        async for user_doc in users_col.find():
+            u_id = int(user_doc["user_id"])
+            user_data[u_id] = {
+                "balance": round(user_doc.get("balance", 0.0), 4),
+                "referrals_count": user_doc.get("referrals_count", 0),
+                "referred_by": user_doc.get("referred_by", None),
+                "username": user_doc.get("username", ""),
+                "first_name": user_doc.get("first_name", "User")
+            }
+
+        # ۳. بازیابی قرعه‌کشی‌ها
+        async for gw_doc in giveaways_col.find():
+            msg_id = int(gw_doc["msg_id"])
+            participants = {}
+            for u_id_str, info in gw_doc.get("participants", {}).items():
+                participants[int(u_id_str)] = {
+                    "username": info.get("username"),
+                    "first_name": info.get("first_name", "User"),
+                    "referrals": info.get("referrals", 0)
+                }
+            active_giveaways[msg_id] = {
+                "channel": gw_doc["channel"],
+                "title": gw_doc["title"],
+                "prize": gw_doc["prize"],
+                "winners_count": gw_doc["winners_count"],
+                "participants": participants,
+                "end_time": datetime.fromisoformat(gw_doc["end_time"]),
+                "ended": gw_doc["ended"]
+            }
+    except Exception as e:
+        logging.error(f"Error loading data from MongoDB: {e}")
 
 # ==========================================
 # FSM States
@@ -353,7 +369,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
                     ref_prof = get_user_profile(referrer_id)
                     ref_prof["balance"] = round(ref_prof["balance"] + referral_reward, 4)
                     ref_prof["referrals_count"] += 1
-                    save_data()
+                    await save_data()
 
                     try:
                         await bot.send_message(
@@ -400,7 +416,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
                             except Exception:
                                 pass
 
-                        save_data()
+                        await save_data()
                         await update_post_text(gw["channel"], msg_id)
                         await message.answer(
                             f"👑 با موفقیت وارد قرعه‌کشی <b>{gw['title']}</b> شدی!",
@@ -411,7 +427,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
             except Exception as e:
                 logging.error(f"GW Referral Start Error: {e}")
 
-    save_data()
+    await save_data()
     await message.answer(
         f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
         f"📌 <b>نسخه ربات:</b> <code>v4.3.0 (Forced Join & System Switch)</code> 💎\n\n"
@@ -553,7 +569,7 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
         return
 
     prof["balance"] = round(prof["balance"] - deduct_from_balance, 4)
-    save_data()
+    await save_data()
 
     user_mention = f"@{user.username}" if user.username else f'<a href="tg://user?id={user.id}">{html.escape(user.first_name)}</a>'
     
@@ -583,7 +599,7 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
     except Exception as e:
         logging.error(f"Withdraw channel send error: {e}")
         prof["balance"] = round(prof["balance"] + deduct_from_balance, 4)
-        save_data()
+        await save_data()
         await message.answer("❌ خطایی در ارسال درخواست به کانال پشتیبانی رخ داد.")
         await state.clear()
         return
@@ -650,7 +666,7 @@ async def reject_withdraw(call: types.CallbackQuery):
 
     prof = get_user_profile(target_user_id)
     prof["balance"] = round(prof["balance"] + deduct_from_balance, 4)
-    save_data()
+    await save_data()
 
     updated_text = call.message.text + "\n\n❌ <b>وضعیت: رد شد (مبلغ به کیف‌پول کاربر بازگشت داده شد)</b>"
     await call.message.edit_text(updated_text, parse_mode="HTML", reply_markup=None)
@@ -781,7 +797,7 @@ async def toggle_bot_callback(call: types.CallbackQuery):
         return
     
     bot_active = not bot_active
-    save_data()
+    await save_data()
     status_msg = "🛑 ربات خاموش شد." if not bot_active else "✅ ربات روشن شد."
     await call.answer(status_msg, show_alert=True)
     await open_admin_panel(call.message)
@@ -859,7 +875,7 @@ async def process_set_min_wd(message: types.Message, state: FSMContext):
     try:
         amount = float(message.text.strip())
         min_withdraw_amount = amount
-        save_data()
+        await save_data()
         await state.clear()
         await message.answer(f"✅ حداقل کف برداشت به <code>{min_withdraw_amount} TON</code> تغییر یافت!", parse_mode="HTML")
     except ValueError:
@@ -880,7 +896,7 @@ async def process_set_max_wd(message: types.Message, state: FSMContext):
     try:
         amount = float(message.text.strip())
         max_withdraw_amount = amount
-        save_data()
+        await save_data()
         await state.clear()
         await message.answer(f"✅ حداکثر سقف برداشت به <code>{max_withdraw_amount} TON</code> تغییر یافت!", parse_mode="HTML")
     except ValueError:
@@ -901,7 +917,7 @@ async def process_set_ref_reward(message: types.Message, state: FSMContext):
     try:
         amount = float(message.text.strip())
         referral_reward = amount
-        save_data()
+        await save_data()
         await state.clear()
         await message.answer(f"✅ پاداش هر رفرال با موفقیت به <code>{referral_reward} TON</code> تغییر یافت!", parse_mode="HTML")
     except ValueError:
@@ -922,7 +938,7 @@ async def process_set_gas_fee(message: types.Message, state: FSMContext):
     try:
         amount = float(message.text.strip())
         ton_gas_fee = amount
-        save_data()
+        await save_data()
         await state.clear()
         await message.answer(f"✅ گس‌فی شبکه TON به <code>{ton_gas_fee} TON</code> تغییر یافت!", parse_mode="HTML")
     except ValueError:
@@ -959,7 +975,7 @@ async def process_edit_balance_amount(message: types.Message, state: FSMContext)
     
     prof = get_user_profile(target_id)
     prof["balance"] = round(prof["balance"] + amount, 4)
-    save_data()
+    await save_data()
     await state.clear()
 
     await message.answer(
@@ -1162,7 +1178,7 @@ async def launch_giveaway(call: types.CallbackQuery, state: FSMContext):
         "end_time": end_time,
         "ended": False
     }
-    save_data()
+    await save_data()
     await call.message.edit_text(f"💥 قرعه‌کشی منتشر شد!", parse_mode="HTML")
     await state.clear()
     asyncio.create_task(run_giveaway_timer(sent_msg.chat.id, sent_msg.message_id))
@@ -1199,7 +1215,7 @@ async def join_giveaway(call: types.CallbackQuery):
         "first_name": user.first_name,
         "referrals": 0
     }
-    save_data()
+    await save_data()
     await call.answer("🎉 با موفقیت ثبت‌نام شدید!", show_alert=True)
     await update_post_text(call.message.chat.id, msg_id)
 
@@ -1328,7 +1344,7 @@ async def finish_giveaway(chat_id, message_id):
     except Exception as e:
         logging.error(f"Error updating winner message: {e}")
     
-    save_data()
+    await save_data()
 
 async def run_giveaway_timer(chat_id, message_id):
     while message_id in active_giveaways:
@@ -1352,7 +1368,7 @@ async def cancel_launch(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("❌ لغو شد.", parse_mode="HTML")
 
 async def main():
-    load_data()
+    await load_data()
     for msg_id, gw in list(active_giveaways.items()):
         if not gw["ended"]:
             asyncio.create_task(run_giveaway_timer(gw["channel"], msg_id))
