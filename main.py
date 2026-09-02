@@ -1,6 +1,6 @@
 # ==========================================
-# Void Giveaway Bot - Version 1.7.6
-# (Final Fix for Tonsdk Address Extraction)
+# Void Giveaway Bot - Version 1.7.7
+# (Final Stable Fix for Tonsdk & Bot Flow)
 # ==========================================
 
 import asyncio
@@ -10,6 +10,7 @@ import random
 import html
 import json
 import requests
+import base64
 from datetime import datetime, timedelta
 from flask import Flask
 from threading import Thread
@@ -22,7 +23,6 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 from aiogram.exceptions import TelegramBadRequest
 
 from tonsdk.contract.wallet import WalletVersionEnum, Wallets
-from tonsdk.utils import bytes_to_b64str
 
 logging.basicConfig(level=logging.INFO)
 
@@ -30,7 +30,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v1.7.6) is running!"
+    return "⚡ Void Giveaway Bot (v1.7.7) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -63,7 +63,11 @@ WHEEL_SKINS = [
     {"name": "Rare Skin 🔥👑", "type": "skin", "weight": 2}
 ]
 
-# تابع کاملاً بازنویسی‌شده برای استخراج بی‌نقص ولت و آدرس
+def bytes_to_b64str(b: bytes) -> str:
+    """تبدیل ایمن بایت‌ها به رشته Base64"""
+    return base64.b64encode(b).decode("utf-8")
+
+# تابع کاملاً بازنویسی‌شده و ایمن برای استخراج ولت، سریالایز و ارسال تراکنش TON
 async def send_ton_payout(destination_address: str, amount_ton: float):
     if not TON_MNEMONIC:
         return False, "کلید امنیتی ولت (TON_MNEMONIC) روی رندر تنظیم نشده است!"
@@ -132,14 +136,30 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
 
         # ساخت پیام انتقال TON
         nano_amount = int(amount_ton * 10**9)
-        query = wallet.create_transfer_message(
+        transfer_query = wallet.create_transfer_message(
             to_addr=destination_address.strip(),
             amount=nano_amount,
             seqno=seqno,
             payload="Reward from Void Giveaway Bot 🎉"
         )
         
-        boc_b64 = bytes_to_b64str(query['message'].to_boc(False))
+        # استخراج ایمن و تبدیل پیام به ساختار BoC سازگار با لایت‌سرویس
+        message_obj = None
+        if isinstance(transfer_query, dict):
+            message_obj = transfer_query.get('message')
+        elif hasattr(transfer_query, "message"):
+            message_obj = transfer_query.message
+        else:
+            message_obj = transfer_query
+
+        if hasattr(message_obj, "to_boc"):
+            boc_data = message_obj.to_boc(False)
+            if isinstance(boc_data, bytes):
+                boc_b64 = bytes_to_b64str(boc_data)
+            else:
+                boc_b64 = bytes_to_b64str(bytes(boc_data))
+        else:
+            return False, "ساختار پیام خروجی tonsdk قابل تبدیل به boc نیست."
 
         def send_boc():
             url = "https://toncenter.com/api/v2/sendBoc"
@@ -309,7 +329,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات بزرگ Void Giveaway خوش آمدی!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v1.7.6</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v1.7.7</code> 💎\n\n"
         f"از منوی زیر می‌تونی توی گردونه شانس شرکت کنی یا انبار اسکینهات رو ببینی 👇",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
