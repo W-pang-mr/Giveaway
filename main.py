@@ -1,5 +1,5 @@
 # ==========================================
-# Void Giveaway Bot - Version 4.1.0
+# Void Giveaway Bot - Version 4.1.1
 # (Referral Only, Custom Gas Fee & Ref Reward Settings, Anti-Fake Ref, Advanced Admin)
 # ==========================================
 
@@ -31,7 +31,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v4.1.0) is running!"
+    return "⚡ Void Giveaway Bot (v4.1.1) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -74,7 +74,7 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
         mnemonics = TON_MNEMONIC.strip().split()
         wallet = await WalletV5R1.from_mnemonic(client, mnemonics, network_global_id=-239)
 
-        # کسر یا محاسبه گس‌فی متناسب با تنظیمات
+        # تبدیل مبلغ نهایی ارسالی به نانوتون (NanoTON)
         amount_nano = int(amount_ton * 10**9)
 
         await wallet.transfer(
@@ -84,7 +84,7 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
         )
 
         await client.close()
-        return True, f"تراکنش با موفقیت انجام شد! (گس‌فی محاسبه شده: {ton_gas_fee} TON) 🚀"
+        return True, f"تراکنش با موفقیت انجام شد! (مبلغ واریزی: {amount_ton:.4f} TON) 🚀"
 
     except Exception as e:
         logging.error(f"pytoniq W5 Payout Error: {e}")
@@ -328,7 +328,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
     save_data()
     await message.answer(
         f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v4.1.0 (TON Direct Reward)</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v4.1.1 (Auto Gas Deduction)</code> 💎\n\n"
         f"🎁 <b>به ازای هر رفرال معتبر {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
         f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
         parse_mode="HTML",
@@ -349,6 +349,7 @@ async def show_wallet(message: types.Message):
         f"💰 <b>موجودی کل:</b> <code>{prof['balance']:.4f} TON</code>\n"
         f"👥 <b>تعداد کل رفرال‌ها:</b> <code>{prof['referrals_count']}</code> نفر\n"
         f"🔹 <b>درآمد هر رفرال:</b> <code>{referral_reward} TON</code>\n"
+        f"⛽️ <b>گس‌فی شبکه:</b> <code>{ton_gas_fee} TON</code>\n"
         f"🔻 <b>حداقل کف برداشت:</b> <code>{min_withdraw_amount} TON</code>\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
@@ -375,33 +376,59 @@ async def start_withdraw_callback(call: types.CallbackQuery, state: FSMContext):
 
     await state.set_state(WithdrawForm.amount)
     await call.message.answer(
-        f"💰 <b>موجودی قابل برداشت شما:</b> <code>{prof['balance']:.4f} TON</code>\n\n"
-        f"لطفاً مقداری که قصد برداشت دارید را به عدد وارد کنید (مثال: 0.1):",
+        f"💰 <b>موجودی قابل برداشت شما:</b> <code>{prof['balance']:.4f} TON</code>\n"
+        f"⛽️ <b>گس‌فی شبکه:</b> <code>{ton_gas_fee} TON</code>\n\n"
+        f"لطفاً مقداری که قصد برداشت دارید را به عدد وارد کنید (مثال: {prof['balance']:.4f}):",
         parse_mode="HTML"
     )
 
+# --- اصلاحیه اصلی: محاسبه دقیق گس‌فی و کسر از موجودی ---
 @dp.message(WithdrawForm.amount)
 async def process_withdraw_amount(message: types.Message, state: FSMContext):
     u_id = message.from_user.id
     prof = get_user_profile(u_id)
     
     try:
-        amount = float(message.text.strip())
+        req_amount = float(message.text.strip())
     except ValueError:
         await message.answer("⚠️ لطفاً یک عدد معتبر وارد کنید!")
         return
 
-    if amount < min_withdraw_amount:
+    if req_amount < min_withdraw_amount:
         await message.answer(f"⚠️ حداقل مقدار برداشت <code>{min_withdraw_amount} TON</code> می‌باشد!")
         return
 
-    if amount > prof["balance"]:
+    if req_amount > prof["balance"]:
         await message.answer("⚠️ مقدار درخواستی بیشتر از موجودی ولت شما است!")
         return
 
-    await state.update_data(withdraw_amount=amount)
+    # منطق جدید محاسباتی:
+    # ۱. اگر کاربر کسر گس‌فی از باقیمانده حسابش ممکن نباشه (مثلاً کل موجودی رو زده باشه)
+    # گس‌فی از اصل مبلغ درخواستی کسر میشه.
+    if (prof["balance"] - req_amount) < ton_gas_fee:
+        amount_to_send = req_amount - ton_gas_fee
+        deduct_from_balance = prof["balance"]  # کل موجودی صفر میشه
+    else:
+        # ۲. اگر بعد از برداشت، موجودی کافی برای پرداخت گس‌فی باقی بمونه
+        amount_to_send = req_amount
+        deduct_from_balance = req_amount + ton_gas_fee
+
+    if amount_to_send <= 0:
+        await message.answer(f"❌ مبلغ درخواستی پس از کسر گس‌فی ({ton_gas_fee} TON) نامعتبر است!")
+        return
+
+    await state.update_data(
+        requested_amount=req_amount,
+        amount_to_send=round(amount_to_send, 4),
+        deduct_from_balance=round(deduct_from_balance, 4)
+    )
     await state.set_state(WithdrawForm.wallet_address)
+    
     await message.answer(
+        f"📊 <b>جزئیات تراکنش شما:</b>\n"
+        f"🔹 <b>مبلغ درخواستی:</b> <code>{req_amount:.4f} TON</code>\n"
+        f"⛽️ <b>گس‌فی کسر شده:</b> <code>{ton_gas_fee} TON</code>\n"
+        f"🚀 <b>خالص دریافتی شما:</b> <code>{amount_to_send:.4f} TON</code>\n\n"
         f"📝 لطفاً <b>آدرس ولت TON (مانند EQ... یا UQ...)</b> خود را جهت واریز بفرستید:",
         parse_mode="HTML"
     )
@@ -410,16 +437,20 @@ async def process_withdraw_amount(message: types.Message, state: FSMContext):
 async def process_withdraw_address(message: types.Message, state: FSMContext):
     wallet_addr = message.text.strip()
     data = await state.get_data()
-    amount = data.get("withdraw_amount")
+    
+    amount_to_send = data.get("amount_to_send")
+    deduct_from_balance = data.get("deduct_from_balance")
+    
     user = message.from_user
     prof = get_user_profile(user.id)
 
-    if amount > prof["balance"]:
+    if deduct_from_balance > prof["balance"]:
         await message.answer("❌ خطا: موجودی حساب شما تغییر کرده است.")
         await state.clear()
         return
 
-    prof["balance"] = round(prof["balance"] - amount, 4)
+    # کسر دقیق کل مبلغ (اصل + گس‌فی) از حساب کاربر در ربات
+    prof["balance"] = round(prof["balance"] - deduct_from_balance, 4)
     save_data()
 
     user_mention = f"@{user.username}" if user.username else f'<a href="tg://user?id={user.id}">{html.escape(user.first_name)}</a>'
@@ -428,8 +459,9 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
         f"🔔 <b>درخواست برداشت جدید TON!</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"👤 <b>کاربر:</b> {user_mention} (ID: <code>{user.id}</code>)\n"
-        f"💎 <b>مبلغ برداشت:</b> <code>{amount} TON</code>\n"
-        f"⛽️ <b>گس‌فی شبکه:</b> <code>{ton_gas_fee} TON</code>\n\n"
+        f"💎 <b>خالص واریزی به ولت:</b> <code>{amount_to_send} TON</code>\n"
+        f"⛽️ <b>گس‌فی شبکه:</b> <code>{ton_gas_fee} TON</code>\n"
+        f"💰 <b>کل کسر شده از حساب:</b> <code>{deduct_from_balance} TON</code>\n\n"
         f"📝 <b>آدرس ولت:</b>\n<code>{html.escape(wallet_addr)}</code>\n\n"
         f"⏰ <b>زمان ثبت:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
         f"━━━━━━━━━━━━━━━━━━"
@@ -438,8 +470,8 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
     admin_action_kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ واریز اتوماتیک TON", callback_data=f"wd_approve_{user.id}_{amount}"),
-                InlineKeyboardButton(text="❌ رد و بازگشت به ولت", callback_data=f"wd_reject_{user.id}_{amount}")
+                InlineKeyboardButton(text="✅ واریز اتوماتیک TON", callback_data=f"wd_approve_{user.id}_{amount_to_send}_{deduct_from_balance}"),
+                InlineKeyboardButton(text="❌ رد و بازگشت به ولت", callback_data=f"wd_reject_{user.id}_{deduct_from_balance}")
             ]
         ]
     )
@@ -448,7 +480,8 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
         await bot.send_message(chat_id=WITHDRAW_CHANNEL, text=withdraw_text, parse_mode="HTML", reply_markup=admin_action_kb)
     except Exception as e:
         logging.error(f"Withdraw channel send error: {e}")
-        prof["balance"] = round(prof["balance"] + amount, 4)
+        # بازگشت وجه در صورت خطا
+        prof["balance"] = round(prof["balance"] + deduct_from_balance, 4)
         save_data()
         await message.answer("❌ خطایی در ارسال درخواست به کانال پشتیبانی رخ داد.")
         await state.clear()
@@ -456,7 +489,8 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
 
     await state.clear()
     await message.answer(
-        f"✅ <b>درخواست برداشت {amount} TON با موفقیت ثبت شد!</b>\n\n"
+        f"✅ <b>درخواست برداشت با موفقیت ثبت شد!</b>\n\n"
+        f"🚀 <b>مبلغ خالص واریزی:</b> <code>{amount_to_send} TON</code>\n"
         f"اطلاعات به کانال پشتیبانی ارسال شد و به زودی پردازش می‌گردد 🔥",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(user.id)
@@ -474,7 +508,7 @@ async def approve_withdraw(call: types.CallbackQuery):
 
     parts = call.data.split("_")
     target_user_id = int(parts[2])
-    ton_amount = float(parts[3])
+    amount_to_send = float(parts[3])
 
     message_text = call.message.text or call.message.caption or ""
     match = re.search(r'(EQ[a-zA-Z0-9_-]{46}|UQ[a-zA-Z0-9_-]{46})', message_text)
@@ -486,15 +520,15 @@ async def approve_withdraw(call: types.CallbackQuery):
     dest_addr = match.group(1)
     await call.answer("⏳ در حال ارسال تراکنش به شبکه TON...", show_alert=False)
 
-    success, result_msg = await send_ton_payout(dest_addr, ton_amount)
+    success, result_msg = await send_ton_payout(dest_addr, amount_to_send)
     if success:
-        updated_text = call.message.text + f"\n\n✅ <b>وضعیت: واریز {ton_amount} TON با موفقیت انجام شد! 💎</b>"
+        updated_text = call.message.text + f"\n\n✅ <b>وضعیت: واریز {amount_to_send} TON با موفقیت انجام شد! 💎</b>"
         await call.message.edit_text(updated_text, parse_mode="HTML", reply_markup=None)
-        await call.answer(f"✅ {ton_amount} TON با موفقیت منتقل شد!", show_alert=True)
+        await call.answer(f"✅ {amount_to_send} TON با موفقیت منتقل شد!", show_alert=True)
         try:
             await bot.send_message(
                 target_user_id,
-                f"🎉 <b>درخواست برداشت شما تایید و واریز شد!</b>\n\n🎁 مقدار <b>{ton_amount} TON</b> به ولت شما منتقل گردید.",
+                f"🎉 <b>درخواست برداشت شما تایید و واریز شد!</b>\n\n🎁 مقدار <b>{amount_to_send} TON</b> به ولت شما منتقل گردید.",
                 parse_mode="HTML"
             )
         except Exception:
@@ -511,10 +545,10 @@ async def reject_withdraw(call: types.CallbackQuery):
 
     parts = call.data.split("_")
     target_user_id = int(parts[2])
-    ton_amount = float(parts[3])
+    deduct_from_balance = float(parts[3])
 
     prof = get_user_profile(target_user_id)
-    prof["balance"] = round(prof["balance"] + ton_amount, 4)
+    prof["balance"] = round(prof["balance"] + deduct_from_balance, 4)
     save_data()
 
     updated_text = call.message.text + "\n\n❌ <b>وضعیت: رد شد (مبلغ به کیف‌پول کاربر بازگشت داده شد)</b>"
@@ -524,7 +558,7 @@ async def reject_withdraw(call: types.CallbackQuery):
     try:
         await bot.send_message(
             target_user_id,
-            f"❌ <b>درخواست برداشت {ton_amount} TON رد شد!</b>\n\nمبلغ مجدداً به موجودی کیف‌پول شما در ربات بازگشت داده شد.",
+            f"❌ <b>درخواست برداشت رد شد!</b>\n\nمبلغ <code>{deduct_from_balance} TON</code> مجدداً به موجودی کیف‌پول شما در ربات بازگشت داده شد.",
             parse_mode="HTML"
         )
     except Exception:
@@ -590,7 +624,7 @@ async def open_admin_panel(message: types.Message):
     total_balance = sum(u.get("balance", 0.0) for u in user_data.values())
     
     admin_text = (
-        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.1.0)</b>\n"
+        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.1.1)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🤖 <b>وضعیت ربات:</b> {'روشن ✅' if bot_active else 'خاموش/تعمیرات 🛑'}\n"
         f"👥 <b>کاربران فعال فعلی:</b> <code>{total_users}</code> نفر\n"
@@ -647,7 +681,7 @@ async def process_set_min_wd(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("⚠️ لطفاً عدد معتبر وارد کنید!")
 
-# --- تنظیم جدید: پاداش هر رفرال ---
+# --- تنظیم پاداش هر رفرال ---
 @dp.callback_query(F.data == "admin_set_ref_reward")
 async def start_set_ref_reward(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
@@ -668,7 +702,7 @@ async def process_set_ref_reward(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("⚠️ لطفاً عدد معتبر وارد کنید!")
 
-# --- تنظیم جدید: گس‌فی شبکه TON ---
+# --- تنظیم گس‌فی شبکه TON ---
 @dp.callback_query(F.data == "admin_set_gas_fee")
 async def start_set_gas_fee(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
