@@ -1,6 +1,6 @@
 # ==========================================
-# Void Giveaway Bot - Version 1.6.2
-# (Fix Toncenter Direct Payout Error)
+# Void Giveaway Bot - Version 1.6.3
+# (Fixed Toncenter & Address List Error)
 # ==========================================
 
 import asyncio
@@ -30,7 +30,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v1.6.2) is running!"
+    return "⚡ Void Giveaway Bot (v1.6.3) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -63,7 +63,7 @@ WHEEL_SKINS = [
     {"name": "Rare Skin 🔥👑", "type": "skin", "weight": 2}
 ]
 
-# تابع واریز واقعی و مستقیم به شبکه TON بدون خطای api_key
+# تابع واریز واقعی و اصلاح شده برای جلوگیری از خطای لیست
 async def send_ton_payout(destination_address: str, amount_ton: float):
     if not TON_MNEMONIC:
         return False, "کلید امنیتی ولت (TON_MNEMONIC) روی رندر تنظیم نشده است!"
@@ -78,7 +78,11 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
             workchain=0
         )
         
-        wallet_address = wallet.address.to_string(True, True, True)
+        # اصلاح قطعی خطای لیست برای آدرس ولت
+        if isinstance(wallet.address, list):
+            wallet_address = wallet.address[0].to_string(True, True, True)
+        else:
+            wallet_address = wallet.address.to_string(True, True, True)
 
         # ۲. دریافت Seqno از طریق درخواست مستقیم HTTP به Toncenter
         def get_seqno():
@@ -278,7 +282,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات بزرگ Void Giveaway خوش آمدی!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v1.6.2</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v1.6.3</code> 💎\n\n"
         f"از منوی زیر می‌تونی توی گردونه شانس شرکت کنی یا انبار اسکینهات رو ببینی 👇",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
@@ -454,7 +458,6 @@ async def approve_withdraw(call: types.CallbackQuery):
                 dest_addr = msg_lines[idx+1].strip()
                 break
 
-        # واریز واقعی مبلغ بدون ارور
         success, result_msg = await send_ton_payout(dest_addr, 0.01)
         if success:
             updated_text = call.message.text + "\n\n✅ <b>وضعیت: واریز خودکار کریپتویی انجام شد! 💎</b>"
