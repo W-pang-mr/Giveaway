@@ -1,6 +1,6 @@
 # ==========================================
-# Void Giveaway Bot - Version 4.0.0
-# (Referral Only 0.048 TON, Wallet System, Anti-Fake Ref, Advanced Admin)
+# Void Giveaway Bot - Version 4.1.0
+# (Referral Only, Custom Gas Fee & Ref Reward Settings, Anti-Fake Ref, Advanced Admin)
 # ==========================================
 
 import asyncio
@@ -31,7 +31,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v4.0.0) is running!"
+    return "⚡ Void Giveaway Bot (v4.1.0) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -47,8 +47,6 @@ ADMIN_IDS = [6879499219]
 WITHDRAW_CHANNEL = "@voidwithraw"
 TON_MNEMONIC = os.environ.get("TON_MNEMONIC")
 
-REFERRAL_REWARD = 0.048  # پاداش هر رفرال به تونکوین
-
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -58,6 +56,8 @@ user_data = {}
 all_time_users = set()  # برای جلوگیری از باگ رفرال فیک (ذخیره دائمی user_id)
 bot_active = True        # وضعیت روشن/خاموش بودن ربات
 min_withdraw_amount = 0.1  # حداقل کفی برداشت TON
+referral_reward = 0.048    # پاداش هر رفرال (قابل تنظیم از ادمین)
+ton_gas_fee = 0.005        # مقدار گس‌فی شبکه TON (قابل تنظیم از ادمین)
 
 # ==========================================
 # ارسال پاداش شبکه TON
@@ -74,6 +74,7 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
         mnemonics = TON_MNEMONIC.strip().split()
         wallet = await WalletV5R1.from_mnemonic(client, mnemonics, network_global_id=-239)
 
+        # کسر یا محاسبه گس‌فی متناسب با تنظیمات
         amount_nano = int(amount_ton * 10**9)
 
         await wallet.transfer(
@@ -83,7 +84,7 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
         )
 
         await client.close()
-        return True, "تراکنش با موفقیت از ولت W5 ارسال گردید! 🚀"
+        return True, f"تراکنش با موفقیت انجام شد! (گس‌فی محاسبه شده: {ton_gas_fee} TON) 🚀"
 
     except Exception as e:
         logging.error(f"pytoniq W5 Payout Error: {e}")
@@ -125,13 +126,15 @@ def save_data():
         "users": serializable_users,
         "all_time_users": list(all_time_users),
         "bot_active": bot_active,
-        "min_withdraw_amount": min_withdraw_amount
+        "min_withdraw_amount": min_withdraw_amount,
+        "referral_reward": referral_reward,
+        "ton_gas_fee": ton_gas_fee
     }
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(full_data, f, ensure_ascii=False, indent=2)
 
 def load_data():
-    global active_giveaways, user_data, all_time_users, bot_active, min_withdraw_amount
+    global active_giveaways, user_data, all_time_users, bot_active, min_withdraw_amount, referral_reward, ton_gas_fee
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -167,6 +170,8 @@ def load_data():
                 all_time_users = set(full_data.get("all_time_users", []))
                 bot_active = full_data.get("bot_active", True)
                 min_withdraw_amount = full_data.get("min_withdraw_amount", 0.1)
+                referral_reward = full_data.get("referral_reward", 0.048)
+                ton_gas_fee = full_data.get("ton_gas_fee", 0.005)
         except Exception as e:
             logging.error(f"Error loading data: {e}")
 
@@ -194,8 +199,14 @@ class AdminManageUserForm(StatesGroup):
 class AdminSetMinWithdrawForm(StatesGroup):
     amount = State()
 
+class AdminSetRefRewardForm(StatesGroup):
+    amount = State()
+
+class AdminSetGasFeeForm(StatesGroup):
+    amount = State()
+
 # ==========================================
-# میدل‌ور/بررسی وضعیت فعال بودن ربات
+# توابع كمكی و کیبوردها
 # ==========================================
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -222,7 +233,8 @@ def get_admin_inline_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🎁 ایجاد قرعه‌کشی جدید", callback_data="admin_new_gw"), InlineKeyboardButton(text="📊 لیست قرعه‌کشی‌ها", callback_data="admin_list_gw")],
-            [InlineKeyboardButton(text="➕/➖ تغییر موجودی کاربر", callback_data="admin_edit_balance"), InlineKeyboardButton(text="⚙️ تنظیم حداقل برداشت", callback_data="admin_set_min_wd")],
+            [InlineKeyboardButton(text="➕/➖ تغییر موجودی کاربر", callback_data="admin_edit_balance"), InlineKeyboardButton(text="⚙️ حداقل برداشت", callback_data="admin_set_min_wd")],
+            [InlineKeyboardButton(text="💎 تنظیم پاداش رفرال", callback_data="admin_set_ref_reward"), InlineKeyboardButton(text="⛽️ تنظیم گس‌فی شبکه", callback_data="admin_set_gas_fee")],
             [InlineKeyboardButton(text=status_btn, callback_data="admin_toggle_bot"), InlineKeyboardButton(text="📢 همه‌فرستی (Broadcast)", callback_data="admin_broadcast")],
             [InlineKeyboardButton(text="🔄 بروزرسانی آمار", callback_data="admin_stats")]
         ]
@@ -243,19 +255,18 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
     prof = get_user_profile(u_id)
     args = command.args
 
-    # سیستم جدید جلوگیری از رفرال فیک (بلاک/حذف اکانت)
     is_new_user = u_id not in all_time_users
     if is_new_user:
         all_time_users.add(u_id)
 
     if args and is_new_user:
-        # ۱. رفرال مستقیم ربات (کسب ۰.۰۴۸ TON)
+        # ۱. رفرال مستقیم ربات
         if args.startswith("ref_"):
             try:
                 referrer_id = int(args.replace("ref_", ""))
                 if referrer_id != u_id and referrer_id in user_data:
                     ref_prof = get_user_profile(referrer_id)
-                    ref_prof["balance"] = round(ref_prof["balance"] + REFERRAL_REWARD, 4)
+                    ref_prof["balance"] = round(ref_prof["balance"] + referral_reward, 4)
                     ref_prof["referrals_count"] += 1
                     save_data()
 
@@ -263,7 +274,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
                         await bot.send_message(
                             referrer_id,
                             f"🎉 <b>یک کاربر جدید با لینک شما وارد ربات شد!</b>\n"
-                            f"💎 <b>+{REFERRAL_REWARD} TON</b> مستقیماً به ولت شما اضافه شد!",
+                            f"💎 <b>+{referral_reward} TON</b> مستقیماً به ولت شما اضافه شد!",
                             parse_mode="HTML"
                         )
                     except Exception:
@@ -290,15 +301,14 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
                         }
                         if referrer_id in gw["participants"] and referrer_id != user.id:
                             gw["participants"][referrer_id]["referrals"] += 1
-                            # پرداخت پاداش تونکوین برای رفرال قرعه‌کشی نیز اعمال می‌شود
                             ref_prof = get_user_profile(referrer_id)
-                            ref_prof["balance"] = round(ref_prof["balance"] + REFERRAL_REWARD, 4)
+                            ref_prof["balance"] = round(ref_prof["balance"] + referral_reward, 4)
                             ref_prof["referrals_count"] += 1
                             try:
                                 await bot.send_message(
                                     referrer_id,
                                     f"🔥 <b>یک نفر با لینکت وارد قرعه‌کشی {gw['title']} شد!</b>\n"
-                                    f"🎉 <b>+۱ شانس اضافه</b> + <b>+{REFERRAL_REWARD} TON</b> به ولت شما اضافه شد!",
+                                    f"🎉 <b>+۱ شانس اضافه</b> + <b>+{referral_reward} TON</b> به ولت شما اضافه شد!",
                                     parse_mode="HTML"
                                 )
                             except Exception:
@@ -318,8 +328,8 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
     save_data()
     await message.answer(
         f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v4.0.0 (TON Direct Reward)</code> 💎\n\n"
-        f"🎁 <b>به ازای هر رفرال معتبر {REFERRAL_REWARD} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v4.1.0 (TON Direct Reward)</code> 💎\n\n"
+        f"🎁 <b>به ازای هر رفرال معتبر {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
         f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
@@ -338,7 +348,7 @@ async def show_wallet(message: types.Message):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"💰 <b>موجودی کل:</b> <code>{prof['balance']:.4f} TON</code>\n"
         f"👥 <b>تعداد کل رفرال‌ها:</b> <code>{prof['referrals_count']}</code> نفر\n"
-        f"🔹 <b>درآمد هر رفرال:</b> <code>{REFERRAL_REWARD} TON</code>\n"
+        f"🔹 <b>درآمد هر رفرال:</b> <code>{referral_reward} TON</code>\n"
         f"🔻 <b>حداقل کف برداشت:</b> <code>{min_withdraw_amount} TON</code>\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
@@ -409,7 +419,6 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    # کسر موقت از موجودی برای بررسی ادمین
     prof["balance"] = round(prof["balance"] - amount, 4)
     save_data()
 
@@ -419,7 +428,8 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
         f"🔔 <b>درخواست برداشت جدید TON!</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"👤 <b>کاربر:</b> {user_mention} (ID: <code>{user.id}</code>)\n"
-        f"💎 <b>مبلغ برداشت:</b> <code>{amount} TON</code>\n\n"
+        f"💎 <b>مبلغ برداشت:</b> <code>{amount} TON</code>\n"
+        f"⛽️ <b>گس‌فی شبکه:</b> <code>{ton_gas_fee} TON</code>\n\n"
         f"📝 <b>آدرس ولت:</b>\n<code>{html.escape(wallet_addr)}</code>\n\n"
         f"⏰ <b>زمان ثبت:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
         f"━━━━━━━━━━━━━━━━━━"
@@ -503,7 +513,6 @@ async def reject_withdraw(call: types.CallbackQuery):
     target_user_id = int(parts[2])
     ton_amount = float(parts[3])
 
-    # بازگشت مبلغ به ولت کاربر
     prof = get_user_profile(target_user_id)
     prof["balance"] = round(prof["balance"] + ton_amount, 4)
     save_data()
@@ -535,7 +544,7 @@ async def send_referral_link_menu(message: types.Message):
     text = (
         f"🚀 <b>لینک دعوت اختصاصی شما:</b>\n\n"
         f"🔗 <code>{general_ref_link}</code>\n\n"
-        f"💎 <b>پاداش دعوت:</b> به ازای هر کاربر جدید <b>{REFERRAL_REWARD} TON</b>\n"
+        f"💎 <b>پاداش دعوت:</b> به ازای هر کاربر جدید <b>{referral_reward} TON</b>\n"
         f"👥 <b>مجموع دعوت‌های معتبر شما:</b> {prof['referrals_count']} نفر\n\n"
         f"📌 لینک را برای دوستان خود بفرستید تا بلافاصله تونکوین کسب کنید!"
     )
@@ -560,7 +569,7 @@ async def show_profile(message: types.Message):
 async def show_help(message: types.Message):
     text = (
         f"ℹ️ <b>راهنمای ربات Void Giveaway:</b>\n\n"
-        f"1️⃣ با دعوت هر کاربر جدید از طریق لینک رفرال خود <b>{REFERRAL_REWARD} TON</b> پاداش دریافت می‌کنید.\n"
+        f"1️⃣ با دعوت هر کاربر جدید از طریق لینک رفرال خود <b>{referral_reward} TON</b> پاداش دریافت می‌کنید.\n"
         f"2️⃣ پاداش‌ها مستقیماً وارد «کیف‌پول من» می‌شوند.\n"
         f"3️⃣ پس از رسیدن به حداقل کف برداشت (<code>{min_withdraw_amount} TON</code>) می‌توانید درخواست واریز ثبت کنید.\n"
         f"4️⃣ همچنین می‌توانید در قرعه‌کشی‌های کانال شرکت کنید."
@@ -581,12 +590,14 @@ async def open_admin_panel(message: types.Message):
     total_balance = sum(u.get("balance", 0.0) for u in user_data.values())
     
     admin_text = (
-        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.0.0)</b>\n"
+        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.1.0)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🤖 <b>وضعیت ربات:</b> {'روشن ✅' if bot_active else 'خاموش/تعمیرات 🛑'}\n"
         f"👥 <b>کاربران فعال فعلی:</b> <code>{total_users}</code> نفر\n"
-        f"📜 <b>کل کاربران تاریخی (ثبت شده):</b> <code>{total_all_time}</code> نفر\n"
+        f"📜 <b>کل کاربران تاریخی:</b> <code>{total_all_time}</code> نفر\n"
         f"💎 <b>مجموع موجودی ولت کاربران:</b> <code>{total_balance:.4f} TON</code>\n"
+        f"🎁 <b>پاداش هر رفرال:</b> <code>{referral_reward} TON</code>\n"
+        f"⛽️ <b>گس‌فی شبکه TON:</b> <code>{ton_gas_fee} TON</code>\n"
         f"🔻 <b>حداقل کف برداشت فعلی:</b> <code>{min_withdraw_amount} TON</code>\n"
         f"🔥 <b>قرعه‌کشی‌های فعال:</b> <code>{active_gw}</code> عدد\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -615,6 +626,7 @@ async def show_stats_callback(call: types.CallbackQuery):
         return
     await open_admin_panel(call.message)
 
+# --- تنظیم حداقل برداشت ---
 @dp.callback_query(F.data == "admin_set_min_wd")
 async def start_set_min_wd(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
@@ -635,6 +647,49 @@ async def process_set_min_wd(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("⚠️ لطفاً عدد معتبر وارد کنید!")
 
+# --- تنظیم جدید: پاداش هر رفرال ---
+@dp.callback_query(F.data == "admin_set_ref_reward")
+async def start_set_ref_reward(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminSetRefRewardForm.amount)
+    await call.message.edit_text(f"💎 <b>مقدار پاداش جدید برای هر رفرال به TON را وارد کنید (فعلی: {referral_reward} TON):</b>", parse_mode="HTML")
+
+@dp.message(AdminSetRefRewardForm.amount)
+async def process_set_ref_reward(message: types.Message, state: FSMContext):
+    global referral_reward
+    try:
+        amount = float(message.text.strip())
+        referral_reward = amount
+        save_data()
+        await state.clear()
+        await message.answer(f"✅ پاداش هر رفرال با موفقیت به <code>{referral_reward} TON</code> تغییر یافت!", parse_mode="HTML")
+    except ValueError:
+        await message.answer("⚠️ لطفاً عدد معتبر وارد کنید!")
+
+# --- تنظیم جدید: گس‌فی شبکه TON ---
+@dp.callback_query(F.data == "admin_set_gas_fee")
+async def start_set_gas_fee(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminSetGasFeeForm.amount)
+    await call.message.edit_text(f"⛽️ <b>مقدار گس‌فی شبکه TON را به عدد وارد کنید (فعلی: {ton_gas_fee} TON):</b>", parse_mode="HTML")
+
+@dp.message(AdminSetGasFeeForm.amount)
+async def process_set_gas_fee(message: types.Message, state: FSMContext):
+    global ton_gas_fee
+    try:
+        amount = float(message.text.strip())
+        ton_gas_fee = amount
+        save_data()
+        await state.clear()
+        await message.answer(f"✅ گس‌فی شبکه TON به <code>{ton_gas_fee} TON</code> تغییر یافت!", parse_mode="HTML")
+    except ValueError:
+        await message.answer("⚠️ لطفاً عدد معتبر وارد کنید!")
+
+# --- تغییر موجودی کاربر ---
 @dp.callback_query(F.data == "admin_edit_balance")
 async def start_edit_balance(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
@@ -673,6 +728,7 @@ async def process_edit_balance_amount(message: types.Message, state: FSMContext)
         parse_mode="HTML"
     )
 
+# --- همه‌فرستی ---
 @dp.callback_query(F.data == "admin_broadcast")
 async def start_broadcast(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
@@ -925,7 +981,7 @@ async def get_referral_link(call: types.CallbackQuery):
                 f"👑 <b>لینک اختصاصی دعوت شما:</b>\n"
                 f"📌 <b>قرعه‌کشی:</b> {gw['title']}\n\n"
                 f"🔗 <code>{ref_link}</code>\n\n"
-                f"✨ با دعوت هر کاربر: <b>+۱ شانس اضافه</b> در قرعه‌کشی + <b>{REFERRAL_REWARD} TON</b> هدیه دریافت می‌کنید!"
+                f"✨ با دعوت هر کاربر: <b>+۱ شانس اضافه</b> در قرعه‌کشی + <b>{referral_reward} TON</b> هدیه دریافت می‌کنید!"
             ),
             parse_mode="HTML"
         )
