@@ -1,6 +1,6 @@
 # ==========================================
-# Void Giveaway Bot - Version 1.8.1
-# (Fixed TON-SDK Native Implementation & Render Ready)
+# Void Giveaway Bot - Version 1.8.2
+# (Fixed TON-SDK Import Compatibility for Python 3.14)
 # ==========================================
 
 import asyncio
@@ -22,9 +22,12 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 
-# وارد کردن متدهای استاندار tonsdk (حذف کامل پکیج ton)
+# اصلاح Importهای tonsdk جهت جلوگیری از ImportError روی Render
 from tonsdk.contract.wallet import WalletVersionEnum, WalletContract
-from tonsdk.crypto import Mnemonic
+try:
+    from tonsdk.crypto._mnemonic import Mnemonic
+except ImportError:
+    from tonsdk.crypto import mnemonic_to_private_key as Mnemonic
 
 logging.basicConfig(level=logging.INFO)
 
@@ -32,7 +35,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v1.8.1 - Native TON SDK) is running!"
+    return "⚡ Void Giveaway Bot (v1.8.2) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -65,7 +68,7 @@ WHEEL_SKINS = [
     {"name": "Rare Skin 🔥👑", "type": "skin", "weight": 2}
 ]
 
-# تابع ارسال تراکنش TON ویژه ولت‌های W5 / V4 با استفاده از tonsdk
+# تابع ارسال تراکنش TON
 async def send_ton_payout(destination_address: str, amount_ton: float):
     if not TON_MNEMONIC:
         return False, "کلید امنیتی ولت (TON_MNEMONIC) روی رندر تنظیم نشده است!"
@@ -73,11 +76,14 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
     try:
         mnemonics = TON_MNEMONIC.strip().split()
         
-        # ۱. استخراج کلیدها و ساخت ولت استاندارد V4R2 / W5 با tonsdk
-        mnemonic_obj = Mnemonic(mnemonics)
-        pub_k, priv_k = mnemonic_obj.to_keypair()
+        # استخراج کلیدها با روش پشتیبانی شده در tonsdk
+        if callable(Mnemonic) and not hasattr(Mnemonic, "to_keypair"):
+            pub_k, priv_k = Mnemonic(mnemonics)
+        else:
+            mnemonic_obj = Mnemonic(mnemonics)
+            pub_k, priv_k = mnemonic_obj.to_keypair()
         
-        # ساخت ولت V4R2 (در صورت نیاز به W5 متد مطابق آخرین اپدیت tonsdk اعمال می‌شود)
+        # ساخت ولت V4R2
         wallet = WalletContract(
             public_key=pub_k,
             private_key=priv_k,
@@ -85,7 +91,7 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
         )
         wallet_address = wallet.address.to_string(is_user_friendly=True, is_bounceable=False)
 
-        # ۲. دریافت Seqno از طریق Toncenter
+        # دریافت Seqno از طریق Toncenter
         def get_seqno():
             url = "https://toncenter.com/api/v2/runGetMethod"
             payload = {
@@ -108,7 +114,7 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
 
         seqno = await asyncio.to_thread(get_seqno)
 
-        # ۳. ساخت و امضای تراکنش
+        # ساخت و امضای تراکنش
         nano_amount = int(amount_ton * 10**9)
         query = wallet.create_transfer_message(
             to_addr=destination_address.strip(),
@@ -120,7 +126,7 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
         boc_bytes = query['message'].to_boc(False)
         boc_b64 = base64.b64encode(boc_bytes).decode("utf-8")
 
-        # ۴. ارسال به شبکه TON
+        # ارسال به شبکه TON
         def send_boc():
             url = "https://toncenter.com/api/v2/sendBoc"
             payload = {"boc": boc_b64}
@@ -289,7 +295,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات بزرگ Void Giveaway خوش آمدی!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v1.8.1 (Native TON SDK)</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v1.8.2</code> 💎\n\n"
         f"از منوی زیر می‌تونی توی گردونه شانس شرکت کنی یا انبار اسکینهات رو ببینی 👇",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
