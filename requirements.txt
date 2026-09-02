@@ -1,3 +1,3 @@
 aiogram==3.31.0
 flask==3.1.3
-TonTools==2.1.2
+git+https://github.com/psylopunk/TonTools.git
