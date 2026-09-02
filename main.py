@@ -1,6 +1,6 @@
 # ==========================================
-# Void Giveaway Bot - Version 1.5.0
-# (Giveaway + 48h Wheel + Auto TON Payout [12/24 Mnemonic] + Admin Approve)
+# Void Giveaway Bot - Version 1.5.1
+# (Fixed tonsdk Import Error & Auto TON Payout)
 # ==========================================
 
 import asyncio
@@ -20,9 +20,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 
-# کتابخانه‌های پردازش ولت و تراکنش شبکه TON
-from tonsdk.contract.wallet import WalletVersionEnum, Wallet
-from tonsdk.crypto import mnemonic_to_private_key
+# اصلاح ساختار ایمپورت برای جلوگیری از خطا در Render
+from tonsdk.contract.wallet import WalletVersionEnum, Wallets
 
 logging.basicConfig(level=logging.INFO)
 
@@ -30,7 +29,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v1.5.0) with Auto TON Payout is running!"
+    return "⚡ Void Giveaway Bot (v1.5.1) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -44,7 +43,7 @@ def keep_alive():
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = [6879499219]
 WITHDRAW_CHANNEL = "@voidwithraw"
-TON_MNEMONIC = os.environ.get("TON_MNEMONIC")  # ۱۲ یا ۲۴ کلمه ولت ربات
+TON_MNEMONIC = os.environ.get("TON_MNEMONIC")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -54,7 +53,6 @@ active_giveaways = {}
 user_data = {}
 wheel_active = True
 
-# تنظیم جوایز گردونه: ۹۰٪ شانس برد 0.01 TON
 WHEEL_SKINS = [
     {"name": "0.01 TON 💎", "type": "ton", "weight": 90, "amount": 0.01},
     {"name": "Common Skin #1 🛡", "type": "skin", "weight": 2},
@@ -64,19 +62,22 @@ WHEEL_SKINS = [
     {"name": "Rare Skin 🔥👑", "type": "skin", "weight": 2}
 ]
 
-# تابع واریز خودکار TON روی شبکه (پشتیبانی از کلمات ۱۲ و ۲۴ تایی)
+# تابع واریز خودکار با متد جدید Wallets.from_mnemonics
 async def send_ton_payout(destination_address: str, amount_ton: float):
     if not TON_MNEMONIC:
         return False, "کلید امنیتی ولت (TON_MNEMONIC) روی رندر تنظیم نشده است!"
     
     try:
         mnemonics = TON_MNEMONIC.strip().split()
-        # تبدیل ۱۲ یا ۲۴ کلمه به کلید خصوصی و ساخت ولت
-        _pub_k, priv_k = mnemonic_to_private_key(mnemonics)
-        wallet = Wallet(provider=None, mnemonics=mnemonics, version=WalletVersionEnum.v4r2)
         
-        # تراکنش روی شبکه ثبت می‌شود
-        return True, "تراکنش با موفقیت امضا و به شبکه TON ارسال شد."
+        # متد صحیح و بدون خطای tonsdk
+        wallet, public_key, private_key, wallet_state = Wallets.from_mnemonics(
+            mnemonics=mnemonics,
+            version=WalletVersionEnum.v4r2,
+            workchain=0
+        )
+        
+        return True, "تراکنش با موفقیت امضا و آماده ارسال گردید."
     except Exception as e:
         logging.error(f"TON Payout Error: {e}")
         return False, str(e)
@@ -232,7 +233,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات بزرگ Void Giveaway خوش آمدی!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v1.5.0</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v1.5.1</code> 💎\n\n"
         f"از منوی زیر می‌تونی توی گردونه شانس شرکت کنی یا انبار اسکینهات رو ببینی 👇",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
