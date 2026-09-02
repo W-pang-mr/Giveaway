@@ -1,6 +1,6 @@
 # ==========================================
-# Void Giveaway Bot - Version 1.7.7
-# (Final Stable Fix for Tonsdk & Bot Flow)
+# Void Giveaway Bot - Version 1.8.0
+# (Final Stable Fix for Wallet V5 & TON Payouts)
 # ==========================================
 
 import asyncio
@@ -22,7 +22,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 
-from tonsdk.contract.wallet import WalletVersionEnum, Wallets
+# وارد کردن متدهای کیف پول W5
+from ton.wallet import WalletV5R1
+from ton.utils import TonMnemonic
 
 logging.basicConfig(level=logging.INFO)
 
@@ -30,7 +32,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v1.7.7) is running!"
+    return "⚡ Void Giveaway Bot (v1.8.0 - W5 Supported) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -67,7 +69,7 @@ def bytes_to_b64str(b: bytes) -> str:
     """تبدیل ایمن بایت‌ها به رشته Base64"""
     return base64.b64encode(b).decode("utf-8")
 
-# تابع کاملاً بازنویسی‌شده و ایمن برای استخراج ولت، سریالایز و ارسال تراکنش TON
+# تابع ارسال تراکنش TON ویژه کیف پول‌های W5 (Wallet V5)
 async def send_ton_payout(destination_address: str, amount_ton: float):
     if not TON_MNEMONIC:
         return False, "کلید امنیتی ولت (TON_MNEMONIC) روی رندر تنظیم نشده است!"
@@ -75,43 +77,12 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
     try:
         mnemonics = TON_MNEMONIC.strip().split()
         
-        # استخراج ایمن از طریق Wallets
-        res = Wallets.from_mnemonics(
-            mnemonics=mnemonics,
-            version=WalletVersionEnum.v4r2,
-            workchain=0
-        )
-        
-        # بررسی دقیق ساختار خروجی متد
-        wallet = None
-        if isinstance(res, (list, tuple)):
-            for item in res:
-                if hasattr(item, "create_transfer_message") or hasattr(item, "address"):
-                    wallet = item
-                    break
-            if not wallet and len(res) > 0:
-                wallet = res[0]
-        else:
-            wallet = res
+        # ۱. استخراج کلید خصوصی و ساخت ولت W5
+        _, _, secret_key = TonMnemonic.mnemonic_to_seed(mnemonics)
+        wallet = WalletV5R1.from_secret_key(secret_key)
+        wallet_address = wallet.address.to_string(True, True, True)
 
-        if not wallet:
-            return False, "آبجکت ولت از منمونیک‌ها ساخته نشد."
-
-        # استخراج مستقیم آدرس ولت به صورت رشته استاندارد
-        wallet_address = None
-        if hasattr(wallet, "address"):
-            raw_addr = wallet.address
-            if isinstance(raw_addr, (list, tuple)):
-                raw_addr = raw_addr[0]
-            if hasattr(raw_addr, "to_string"):
-                wallet_address = raw_addr.to_string(True, True, True)
-            else:
-                wallet_address = str(raw_addr)
-        
-        if not wallet_address or not wallet_address.startswith(("EQ", "UQ")):
-            return False, f"آدرس استخراج شده معتبر نیست: {wallet_address}"
-
-        # دریافت Seqno از طریق Toncenter
+        # ۲. دریافت Seqno از طریق Toncenter
         def get_seqno():
             url = "https://toncenter.com/api/v2/runGetMethod"
             payload = {
@@ -134,33 +105,18 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
 
         seqno = await asyncio.to_thread(get_seqno)
 
-        # ساخت پیام انتقال TON
+        # ۳. ساخت پیام انتقال TON در W5
         nano_amount = int(amount_ton * 10**9)
-        transfer_query = wallet.create_transfer_message(
+        query = wallet.create_transfer_message(
             to_addr=destination_address.strip(),
             amount=nano_amount,
             seqno=seqno,
             payload="Reward from Void Giveaway Bot 🎉"
         )
         
-        # استخراج ایمن و تبدیل پیام به ساختار BoC سازگار با لایت‌سرویس
-        message_obj = None
-        if isinstance(transfer_query, dict):
-            message_obj = transfer_query.get('message')
-        elif hasattr(transfer_query, "message"):
-            message_obj = transfer_query.message
-        else:
-            message_obj = transfer_query
+        boc_b64 = bytes_to_b64str(query.to_boc(False))
 
-        if hasattr(message_obj, "to_boc"):
-            boc_data = message_obj.to_boc(False)
-            if isinstance(boc_data, bytes):
-                boc_b64 = bytes_to_b64str(boc_data)
-            else:
-                boc_b64 = bytes_to_b64str(bytes(boc_data))
-        else:
-            return False, "ساختار پیام خروجی tonsdk قابل تبدیل به boc نیست."
-
+        # ۴. ارسال BoC به شبکه
         def send_boc():
             url = "https://toncenter.com/api/v2/sendBoc"
             payload = {"boc": boc_b64}
@@ -175,7 +131,7 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
             return False, f"خطای Toncenter: {error_desc}"
 
     except Exception as e:
-        logging.error(f"TON Payout Real Send Error: {e}")
+        logging.error(f"TON W5 Payout Real Send Error: {e}")
         return False, str(e)
 
 def save_data():
@@ -329,7 +285,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات بزرگ Void Giveaway خوش آمدی!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v1.7.7</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v1.8.0 (W5 Supported)</code> 💎\n\n"
         f"از منوی زیر می‌تونی توی گردونه شانس شرکت کنی یا انبار اسکینهات رو ببینی 👇",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
@@ -507,9 +463,9 @@ async def approve_withdraw(call: types.CallbackQuery):
 
         success, result_msg = await send_ton_payout(dest_addr, 0.01)
         if success:
-            updated_text = call.message.text + "\n\n✅ <b>وضعیت: واریز خودکار کریپتویی انجام شد! 💎</b>"
+            updated_text = call.message.text + "\n\n✅ <b>وضعیت: واریز خودکار کریپتویی (W5) انجام شد! 💎</b>"
             await call.message.edit_text(updated_text, parse_mode="HTML", reply_markup=None)
-            await call.answer("✅ 0.01 TON به آدرس کاربر ارسال شد!", show_alert=True)
+            await call.answer("✅ 0.01 TON با موفقیت ارسال شد!", show_alert=True)
         else:
             await call.answer(f"❌ خطا: {result_msg}", show_alert=True)
             return
