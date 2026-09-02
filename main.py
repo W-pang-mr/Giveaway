@@ -1,6 +1,6 @@
 # ==========================================
-# Void Giveaway Bot - Version 1.7.5
-# (Ultimate Fix for Tonsdk Wallet List Error)
+# Void Giveaway Bot - Version 1.7.6
+# (Final Fix for Tonsdk Address Extraction)
 # ==========================================
 
 import asyncio
@@ -30,7 +30,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v1.7.5) is running!"
+    return "⚡ Void Giveaway Bot (v1.7.6) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -63,7 +63,7 @@ WHEEL_SKINS = [
     {"name": "Rare Skin 🔥👑", "type": "skin", "weight": 2}
 ]
 
-# تابع اصلاح‌شده و ایمن انتقال TON با رفع قطعی خطای لیست
+# تابع کاملاً بازنویسی‌شده برای استخراج بی‌نقص ولت و آدرس
 async def send_ton_payout(destination_address: str, amount_ton: float):
     if not TON_MNEMONIC:
         return False, "کلید امنیتی ولت (TON_MNEMONIC) روی رندر تنظیم نشده است!"
@@ -71,24 +71,30 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
     try:
         mnemonics = TON_MNEMONIC.strip().split()
         
-        # ۱. استخراج ایمن ولت از خروجی احتمالی لیست یا شیء تکی
-        res_wallet = Wallets.from_mnemonics(
+        # استخراج ایمن از طریق Wallets
+        res = Wallets.from_mnemonics(
             mnemonics=mnemonics,
             version=WalletVersionEnum.v4r2,
             workchain=0
         )
         
-        # اگر خروجی به شکل لیست یا تاپل بود، اولین عناصر رو جدا می‌کنیم
-        if isinstance(res_wallet, (list, tuple)):
-            wallet = res_wallet[0]
-            public_key = res_wallet[1] if len(res_wallet) > 1 else None
-            private_key = res_wallet[2] if len(res_wallet) > 2 else None
+        # بررسی دقیق ساختار خروجی متد
+        wallet = None
+        if isinstance(res, (list, tuple)):
+            for item in res:
+                if hasattr(item, "create_transfer_message") or hasattr(item, "address"):
+                    wallet = item
+                    break
+            if not wallet and len(res) > 0:
+                wallet = res[0]
         else:
-            wallet = res_wallet
-            public_key = getattr(wallet, 'public_key', None)
-            private_key = getattr(wallet, 'private_key', None)
+            wallet = res
 
-        # استخراج آدرس ولت به صورت متن استاندارد
+        if not wallet:
+            return False, "آبجکت ولت از منمونیک‌ها ساخته نشد."
+
+        # استخراج مستقیم آدرس ولت به صورت رشته استاندارد
+        wallet_address = None
         if hasattr(wallet, "address"):
             raw_addr = wallet.address
             if isinstance(raw_addr, (list, tuple)):
@@ -97,10 +103,11 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
                 wallet_address = raw_addr.to_string(True, True, True)
             else:
                 wallet_address = str(raw_addr)
-        else:
-            return False, "خطا در استخراج آدرس از آبجکت ولت tonsdk"
+        
+        if not wallet_address or not wallet_address.startswith(("EQ", "UQ")):
+            return False, f"آدرس استخراج شده معتبر نیست: {wallet_address}"
 
-        # ۲. دریافت Seqno از طریق Toncenter
+        # دریافت Seqno از طریق Toncenter
         def get_seqno():
             url = "https://toncenter.com/api/v2/runGetMethod"
             payload = {
@@ -109,9 +116,9 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
                 "stack": []
             }
             try:
-                res = requests.post(url, json=payload, timeout=10).json()
-                if res.get("ok") and res.get("result", {}).get("exit_code") == 0:
-                    stack = res["result"]["stack"]
+                resp = requests.post(url, json=payload, timeout=10).json()
+                if resp.get("ok") and resp.get("result", {}).get("exit_code") == 0:
+                    stack = resp["result"]["stack"]
                     if stack and len(stack) > 0:
                         val = stack[0][1]
                         if isinstance(val, str) and val.startswith("0x"):
@@ -123,7 +130,7 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
 
         seqno = await asyncio.to_thread(get_seqno)
 
-        # ۳. ساخت پیام انتقال TON
+        # ساخت پیام انتقال TON
         nano_amount = int(amount_ton * 10**9)
         query = wallet.create_transfer_message(
             to_addr=destination_address.strip(),
@@ -132,21 +139,19 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
             payload="Reward from Void Giveaway Bot 🎉"
         )
         
-        # ۴. تبدیل به باینری BOC
         boc_b64 = bytes_to_b64str(query['message'].to_boc(False))
 
-        # ۵. ارسال نهایی به شبکه
         def send_boc():
             url = "https://toncenter.com/api/v2/sendBoc"
             payload = {"boc": boc_b64}
             return requests.post(url, json=payload, timeout=10).json()
 
-        res = await asyncio.to_thread(send_boc)
+        res_boc = await asyncio.to_thread(send_boc)
         
-        if res and res.get('ok'):
+        if res_boc and res_boc.get('ok'):
             return True, "تراکنش با موفقیت به شبکه TON ارسال شد! 🚀"
         else:
-            error_desc = res.get('error', res)
+            error_desc = res_boc.get('error', res_boc)
             return False, f"خطای Toncenter: {error_desc}"
 
     except Exception as e:
@@ -304,7 +309,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات بزرگ Void Giveaway خوش آمدی!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v1.7.5</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v1.7.6</code> 💎\n\n"
         f"از منوی زیر می‌تونی توی گردونه شانس شرکت کنی یا انبار اسکینهات رو ببینی 👇",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
