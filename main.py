@@ -431,16 +431,14 @@ async def process_withdraw_amount(message: types.Message, state: FSMContext):
         await message.answer("⚠️ مقدار درخواستی بیشتر از موجودی ولت شما است!")
         return
 
-    # محاسبه گس‌فی
-    if (prof["balance"] - req_amount) < ton_gas_fee:
-        amount_to_send = req_amount - ton_gas_fee
-        deduct_from_balance = prof["balance"]
-    else:
-        amount_to_send = req_amount
-        deduct_from_balance = req_amount + ton_gas_fee
+    # ==========================================
+    # 📌 اصلاح منطق کسر گس‌فی از مبلغ برداشت
+    # ==========================================
+    deduct_from_balance = req_amount                    # دقیقا همان مبلغ درخواستی از موجودی حساب کم می‌شود
+    amount_to_send = req_amount - ton_gas_fee          # گس‌فی از مبلغ برداشت کسر شده و مابقی واریز می‌شود
 
     if amount_to_send <= 0:
-        await message.answer(f"❌ مبلغ درخواستی پس از کسر گس‌فی ({ton_gas_fee} TON) نامعتبر است!")
+        await message.answer(f"❌ مبلغ درخواستی شما باید بیشتر از کارمزد شبکه ({ton_gas_fee} TON) باشد!")
         return
 
     await state.update_data(
@@ -454,7 +452,8 @@ async def process_withdraw_amount(message: types.Message, state: FSMContext):
         f"📊 <b>جزئیات تراکنش شما:</b>\n"
         f"🔹 <b>مبلغ درخواستی:</b> <code>{req_amount:.4f} TON</code>\n"
         f"⛽️ <b>گس‌فی کسر شده:</b> <code>{ton_gas_fee} TON</code>\n"
-        f"🚀 <b>خالص دریافتی شما:</b> <code>{amount_to_send:.4f} TON</code>\n\n"
+        f"🚀 <b>خالص دریافتی به ولت شما:</b> <code>{amount_to_send:.4f} TON</code>\n"
+        f"💰 <b>مبلغ کسر شده از موجودی:</b> <code>{deduct_from_balance:.4f} TON</code>\n\n"
         f"📝 لطفاً <b>آدرس ولت TON (مانند EQ... یا UQ...)</b> خود را جهت واریز بفرستید:",
         parse_mode="HTML"
     )
