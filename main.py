@@ -1,6 +1,6 @@
 # ==========================================
-# Void Giveaway Bot - Version 1.3.0
-# (Giveaway + 48h Wheel + Inventory + Withdraw Channel + Admin Wheel Toggle)
+# Void Giveaway Bot - Version 1.4.0
+# (Giveaway + 48h Wheel + Inventory + Admin Withdraw Approve/Reject)
 # ==========================================
 
 import asyncio
@@ -26,7 +26,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v1.3.0) is running!"
+    return "⚡ Void Giveaway Bot (v1.4.0) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -99,7 +99,6 @@ def load_data():
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 full_data = json.load(f)
                 
-                # بازیابی قرعه‌کشی‌ها
                 gw_data = full_data.get("giveaways", {})
                 for msg_id_str, gw in gw_data.items():
                     msg_id = int(msg_id_str)
@@ -120,7 +119,6 @@ def load_data():
                         "ended": gw["ended"]
                     }
                 
-                # بازیابی کاربران و انبار
                 u_data = full_data.get("users", {})
                 for u_id_str, info in u_data.items():
                     u_id = int(u_id_str)
@@ -213,7 +211,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات بزرگ Void Giveaway خوش آمدی!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v1.3.0</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v1.4.0</code> 💎\n\n"
         f"از منوی زیر می‌تونی توی گردونه شانس شرکت کنی یا انبار اسکینهات رو ببینی 👇",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
@@ -256,10 +254,8 @@ async def spin_wheel_start(message: types.Message, state: FSMContext):
             )
             return
 
-    # چرخاندن گردونه
     prof["last_wheel"] = now
     
-    # انتخاب اسکین بر اساس شانس
     skins = [s["name"] for s in WHEEL_SKINS]
     weights = [s["weight"] for s in WHEEL_SKINS]
     won_skin = random.choices(skins, weights=weights, k=1)[0]
@@ -331,32 +327,39 @@ async def process_withdraw_info(message: types.Message, state: FSMContext):
     data = await state.get_data()
     skin = data.get("withdraw_skin")
     inv_index = data.get("from_inventory_index")
-    u_id = message.from_user.id
     user = message.from_user
 
-    # ارسال فرم برداشت به کانال برداشت
     user_mention = f"@{user.username}" if user.username else f'<a href="tg://user?id={user.id}">{html.escape(user.first_name)}</a>'
     
     withdraw_text = (
         f"🔔 <b>درخواست برداشت اسکین جدید!</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"👤 <b>کاربر:</b> {user_mention} (ID: <code>{user.id}</code>)\n"
-        f"🎁 <b>اسکین درخواست شده:</b> {skin}\n"
-        f"📝 <b>مشخصات ارسالی کاربر:</b>\n<code>{html.escape(user_input)}</code>\n"
+        f"🎁 <b>اسکین درخواست شده:</b> {skin}\n\n"
+        f"📝 <b>مشخصات ارسالی کاربر:</b>\n<code>{html.escape(user_input)}</code>\n\n"
         f"⏰ <b>زمان ثبت:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
     
+    # اضافه شدن دکمه‌های تایید و رد ادمین
+    admin_action_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ واریز شد (تایید)", callback_data=f"wd_approve_{user.id}_{html.escape(skin)}"),
+                InlineKeyboardButton(text="❌ رد شد (فیک)", callback_data=f"wd_reject_{user.id}_{html.escape(skin)}")
+            ]
+        ]
+    )
+    
     try:
-        await bot.send_message(chat_id=WITHDRAW_CHANNEL, text=withdraw_text, parse_mode="HTML")
+        await bot.send_message(chat_id=WITHDRAW_CHANNEL, text=withdraw_text, parse_mode="HTML", reply_markup=admin_action_kb)
     except Exception as e:
         logging.error(f"Withdraw channel send error: {e}")
-        await message.answer("❌ خطایی در ارسال درخواست به کانال ادمین رخ داد. مطمئن شوید ربات ادمین کانال برداشت است.")
+        await message.answer("❌ خطایی در ارسال درخواست به کانال ادمین رخ داد.")
         return
 
-    # اگر از انبار بوده، حذفش کنیم
     if inv_index is not None:
-        prof = get_user_profile(u_id)
+        prof = get_user_profile(user.id)
         if 0 <= inv_index < len(prof["inventory"]):
             prof["inventory"].pop(inv_index)
             save_data()
@@ -364,10 +367,57 @@ async def process_withdraw_info(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
         f"✅ <b>درخواست برداشت اسکین {skin} با موفقیت ثبت شد!</b>\n\n"
-        f"اطلاعات به کانال پشتیبانی ارسال شد و به زودی تحویل داده می‌شود 🔥",
+        f"اطلاعات به کانال پشتیبانی ارسال شد و پس از بررسی تحویل داده می‌شود 🔥",
         parse_mode="HTML",
-        reply_markup=get_main_keyboard(u_id)
+        reply_markup=get_main_keyboard(user.id)
     )
+
+# --- اکشن‌های ادمین برای تایید/رد برداشت ---
+@dp.callback_query(F.data.startswith("wd_approve_"))
+async def approve_withdraw(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("🛑 شما ادمین نیستید!", show_alert=True)
+        return
+
+    parts = call.data.split("_")
+    target_user_id = int(parts[2])
+    skin_name = "_".join(parts[3:])
+
+    updated_text = call.message.text + "\n\n✅ <b>وضعیت: واریز شد (تایید شد)</b>"
+    await call.message.edit_text(updated_text, parse_mode="HTML", reply_markup=None)
+    await call.answer("✅ برداشت تایید شد.", show_alert=True)
+
+    try:
+        await bot.send_message(
+            target_user_id,
+            f"🎉 <b>درخواست برداشت شما تایید شد!</b>\n\n🎁 اسکین <b>{skin_name}</b> با موفقیت به حساب شما منتقل شد. مبارکت باشه! 🔥",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+@dp.callback_query(F.data.startswith("wd_reject_"))
+async def reject_withdraw(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("🛑 شما ادمین نیستید!", show_alert=True)
+        return
+
+    parts = call.data.split("_")
+    target_user_id = int(parts[2])
+    skin_name = "_".join(parts[3:])
+
+    updated_text = call.message.text + "\n\n❌ <b>وضعیت: رد شد (اطلاعات فیک/نادرست)</b>"
+    await call.message.edit_text(updated_text, parse_mode="HTML", reply_markup=None)
+    await call.answer("❌ درخواست رد شد.", show_alert=True)
+
+    try:
+        await bot.send_message(
+            target_user_id,
+            f"❌ <b>درخواست برداشت اسکین {skin_name} رد شد!</b>\n\nعلت: اطلاعات ارسالی نادرست یا فیک تشخیص داده شد.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
 
 # --- بخش انبار (Inventory) ---
 @dp.message(F.text == "🎒 انبار من (Inventory)")
@@ -428,7 +478,7 @@ async def show_profile(message: types.Message):
     )
     await message.answer(text, parse_mode="HTML")
 
-# --- مدیریت قرعه‌کشی‌ها (کد قبلی) ---
+# --- مدیریت قرعه‌کشی‌ها ---
 @dp.message(F.text.in_(["📊 لیست قرعه‌کشی‌ها ⚡️", "📊 لیست قرعه‌کشی‌های داغ ⚡️", "📋 قرعه‌کشی‌های فعال"]))
 async def show_active_giveaways(message: types.Message):
     if not is_admin(message.from_user.id):
@@ -526,7 +576,7 @@ async def process_channel(message: types.Message, state: FSMContext):
         if member.status not in ["administrator", "creator"]:
             await message.answer("❌ ربات در این کانال ادمین نیست!", parse_mode="HTML")
             return
-    except Exception as e:
+    except Exception:
         await message.answer("❌ کانال پیدا نشد یا ربات دسترسی ندارد!", parse_mode="HTML")
         return
 
