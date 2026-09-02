@@ -1,5 +1,6 @@
 # ==========================================
-# Void Giveaway Bot - Version 1.2.0 (Admin Locked + Referral)
+# Void Giveaway Bot - Version 1.3.0
+# (Giveaway + 48h Wheel + Inventory + Withdraw Channel + Admin Wheel Toggle)
 # ==========================================
 
 import asyncio
@@ -21,12 +22,11 @@ from aiogram.exceptions import TelegramBadRequest
 
 logging.basicConfig(level=logging.INFO)
 
-# --- وب‌سرور جهت زنده نگه داشتن پورت در Render ---
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v1.2.0) is running!"
+    return "⚡ Void Giveaway Bot (v1.3.0) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -38,21 +38,30 @@ def keep_alive():
     t.start()
 
 TOKEN = os.environ.get("BOT_TOKEN")
-
-# 🔒 لیست آیدی‌های عددی ادمین‌های مجاز
 ADMIN_IDS = [6879499219]
+WITHDRAW_CHANNEL = "@voidwithraw"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 DATA_FILE = "giveaways.json"
 active_giveaways = {}
+user_data = {}
+wheel_active = True
 
-# --- ذخیره و بازیابی داده‌ها ---
+# لیست اسکین‌ها
+WHEEL_SKINS = [
+    {"name": "Common Skin #1 🛡", "type": "common", "weight": 23},
+    {"name": "Common Skin #2 ⚔️", "type": "common", "weight": 23},
+    {"name": "Common Skin #3 🔫", "type": "common", "weight": 23},
+    {"name": "Common Skin #4 🏹", "type": "common", "weight": 23},
+    {"name": "Rare Skin 🔥👑", "type": "rare", "weight": 8}
+]
+
 def save_data():
-    serializable = {}
+    serializable_gw = {}
     for msg_id, gw in active_giveaways.items():
-        serializable[str(msg_id)] = {
+        serializable_gw[str(msg_id)] = {
             "channel": gw["channel"],
             "title": gw["title"],
             "prize": gw["prize"],
@@ -67,16 +76,32 @@ def save_data():
             "end_time": gw["end_time"].isoformat(),
             "ended": gw["ended"]
         }
+    
+    serializable_users = {}
+    for u_id, info in user_data.items():
+        serializable_users[str(u_id)] = {
+            "inventory": info.get("inventory", []),
+            "last_wheel": info.get("last_wheel").isoformat() if info.get("last_wheel") else None
+        }
+
+    full_data = {
+        "giveaways": serializable_gw,
+        "users": serializable_users,
+        "wheel_active": wheel_active
+    }
     with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(serializable, f, ensure_ascii=False, indent=2)
+        json.dump(full_data, f, ensure_ascii=False, indent=2)
 
 def load_data():
-    global active_giveaways
+    global active_giveaways, user_data, wheel_active
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                for msg_id_str, gw in data.items():
+                full_data = json.load(f)
+                
+                # بازیابی قرعه‌کشی‌ها
+                gw_data = full_data.get("giveaways", {})
+                for msg_id_str, gw in gw_data.items():
                     msg_id = int(msg_id_str)
                     participants = {}
                     for u_id_str, info in gw["participants"].items():
@@ -94,6 +119,18 @@ def load_data():
                         "end_time": datetime.fromisoformat(gw["end_time"]),
                         "ended": gw["ended"]
                     }
+                
+                # بازیابی کاربران و انبار
+                u_data = full_data.get("users", {})
+                for u_id_str, info in u_data.items():
+                    u_id = int(u_id_str)
+                    last_w = datetime.fromisoformat(info["last_wheel"]) if info.get("last_wheel") else None
+                    user_data[u_id] = {
+                        "inventory": info.get("inventory", []),
+                        "last_wheel": last_w
+                    }
+                
+                wheel_active = full_data.get("wheel_active", True)
         except Exception as e:
             logging.error(f"Error loading data: {e}")
 
@@ -104,24 +141,35 @@ class GiveawayForm(StatesGroup):
     winners = State()
     channel = State()
 
-main_keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="🎁 استارت قرعه‌کشی جدید 🚀")],
-        [KeyboardButton(text="📊 لیست قرعه‌کشی‌های داغ ⚡️")]
-    ],
-    resize_keyboard=True
-)
+class WithdrawForm(StatesGroup):
+    username_info = State()
 
-# بررسی ادمین بودن کاربر
+def get_main_keyboard(user_id: int):
+    kb = [
+        [KeyboardButton(text="🎡 گردونه شانس (۴۸ ساعته) ⚡️")],
+        [KeyboardButton(text="🎒 انبار من (Inventory)"), KeyboardButton(text="👤 پروفایل من")]
+    ]
+    if is_admin(user_id):
+        kb.insert(0, [KeyboardButton(text="🎁 استارت قرعه‌کشی جدید 🚀"), KeyboardButton(text="📊 لیست قرعه‌کشی‌ها ⚡️")])
+        wheel_status_btn = "🛑 متوقف کردن گردونه" if wheel_active else "✅ فعال‌سازی گردونه"
+        kb.append([KeyboardButton(text=wheel_status_btn)])
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+def get_user_profile(user_id: int):
+    if user_id not in user_data:
+        user_data[user_id] = {"inventory": [], "last_wheel": None}
+    return user_data[user_id]
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message, command: CommandObject, state: FSMContext):
     await state.clear()
+    u_id = message.from_user.id
+    get_user_profile(u_id)
     args = command.args
 
-    # لینک رفرال ورود به ربات (gw_MSGID_ref_USERID)
     if args and args.startswith("gw_"):
         try:
             parts = args.split("_ref_")
@@ -135,7 +183,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
                 try:
                     member = await bot.get_chat_member(chat_id=gw["channel"], user_id=user.id)
                     if member.status in ["left", "kicked"]:
-                        await message.answer(f"⚠️ <b>رفیق برای ثبت زیرمجموعه:</b>\nاول باید جوین کانال {gw['channel']} بشی، بعد دوباره روی لینک بزنی! ⚡️", parse_mode="HTML")
+                        await message.answer(f"⚠️ برای ورود باید عضو کانال {gw['channel']} باشید!", parse_mode="HTML")
                         return
                 except Exception:
                     pass
@@ -149,47 +197,246 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
                     if referrer_id in gw["participants"] and referrer_id != user.id:
                         gw["participants"][referrer_id]["referrals"] += 1
                         try:
-                            await bot.send_message(referrer_id, f"🔥 <b>دمت گرم! یک نفر با لینکت وارد شد!</b>\n🎉 قرعه‌کشی: <b>{gw['title']}</b>\n⚡️ 💥 <b>+۱ شانس اضافه</b> برات ثبت شد!", parse_mode="HTML")
+                            await bot.send_message(referrer_id, f"🔥 <b>یک نفر با لینکت وارد شد!</b>\n🎉 <b>+۱ شانس اضافه</b> برای قرعه‌کشی {gw['title']} ثبت شد!", parse_mode="HTML")
                         except Exception:
                             pass
 
                     save_data()
                     await update_post_text(gw["channel"], msg_id)
-                    await message.answer(f"👑 <b>بمب!</b> با موفقیت از طریق لینک دعوت وارد قرعه‌کشی بزرگ <b>{gw['title']}</b> شدی! 🎁✨", parse_mode="HTML")
+                    await message.answer(f"👑 با موفقیت وارد قرعه‌کشی <b>{gw['title']}</b> شدی!", parse_mode="HTML", reply_markup=get_main_keyboard(u_id))
                     return
                 else:
-                    await message.answer("💎 💎 قبلاً توی این قرعه‌کشی ثبت‌نام کردی رفیق! منتظر اعلام برنده باش ⚡️", parse_mode="HTML")
+                    await message.answer("💎 قبلاً ثبت‌نام کردی رفیق!", reply_markup=get_main_keyboard(u_id))
                     return
         except Exception as e:
             logging.error(f"Referral Start Error: {e}")
 
-    if is_admin(message.from_user.id):
-        await message.answer(
-            "👑 <b>سلام سلطان! به پنل فرماندهی Void Giveaway خوش آمدی!</b> 🔥\n"
-            "📌 <b>نسخه ربات:</b> <code>v1.2.0</code> ⚡️\n\n"
-            "امروز قراره چه بمبی بترکونیم؟ از دکمه‌های زیر انتخاب کن 👇",
-            parse_mode="HTML",
-            reply_markup=main_keyboard
-        )
-    else:
-        await message.answer(
-            "⚡️ <b>به ربات بزرگ قرعه‌کشی Void Giveaway خوش آمدی!</b> ✨\n"
-            "📌 <b>نسخه ربات:</b> <code>v1.2.0</code> 💎\n\n"
-            "🔥 اینجا مرکز جوایز خفن، اسکین‌ها و کریپتوئه! منتظر قرعه‌کشی‌های بعدی کانال باش 🎁",
-            parse_mode="HTML"
-        )
+    await message.answer(
+        f"⚡️ <b>به ربات بزرگ Void Giveaway خوش آمدی!</b>\n"
+        f"📌 <b>نسخه ربات:</b> <code>v1.3.0</code> 💎\n\n"
+        f"از منوی زیر می‌تونی توی گردونه شانس شرکت کنی یا انبار اسکینهات رو ببینی 👇",
+        parse_mode="HTML",
+        reply_markup=get_main_keyboard(u_id)
+    )
 
-# --- مدیریت قرعه‌کشی‌های فعال (فقط ادمین) ---
-@dp.message(F.text == "📊 لیست قرعه‌کشی‌های داغ ⚡️")
-@dp.message(F.text == "📋 قرعه‌کشی‌های فعال")
+# --- مدیریت گردونه شانس (توسط ادمین) ---
+@dp.message(F.text.in_(["🛑 متوقف کردن گردونه", "✅ فعال‌سازی گردونه"]))
+async def toggle_wheel(message: types.Message):
+    global wheel_active
+    if not is_admin(message.from_user.id):
+        return
+    
+    wheel_active = not wheel_active
+    save_data()
+    status_msg = "🛑 گردونه شانس با موفقیت متوقف شد." if not wheel_active else "✅ گردونه شانس با موفقیت فعال شد."
+    await message.answer(status_msg, reply_markup=get_main_keyboard(message.from_user.id))
+
+# --- بخش گردونه شانس ۴۸ ساعته ---
+@dp.message(F.text == "🎡 گردونه شانس (۴۸ ساعته) ⚡️")
+async def spin_wheel_start(message: types.Message, state: FSMContext):
+    await state.clear()
+    u_id = message.from_user.id
+    prof = get_user_profile(u_id)
+
+    if not wheel_active:
+        await message.answer("🛑 <b>گردونه شانس در حال حاضر توسط ادمین متوقف شده است.</b>", parse_mode="HTML")
+        return
+
+    now = datetime.now()
+    if prof["last_wheel"]:
+        next_spin = prof["last_wheel"] + timedelta(hours=48)
+        if now < next_spin:
+            diff = next_spin - now
+            hours, remainder = divmod(int(diff.total_seconds()), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            await message.answer(
+                f"⏳ <b>هنوز زمان چرخاندن مجدد نرسیده رفیق!</b>\n\n"
+                f"⏱ <b>زمان باقی‌مانده:</b> {hours} ساعت و {minutes} دقیقه",
+                parse_mode="HTML"
+            )
+            return
+
+    # چرخاندن گردونه
+    prof["last_wheel"] = now
+    
+    # انتخاب اسکین بر اساس شانس
+    skins = [s["name"] for s in WHEEL_SKINS]
+    weights = [s["weight"] for s in WHEEL_SKINS]
+    won_skin = random.choices(skins, weights=weights, k=1)[0]
+    
+    await message.answer("🎡 <b>در حال چرخاندن گردونه شانس...</b> 🎰", parse_mode="HTML")
+    await asyncio.sleep(2)
+
+    await state.update_data(pending_skin=won_skin)
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📤 برداشت فوری", callback_data="claim_now")],
+            [InlineKeyboardButton(text="🎒 ذخیره در انبار (Inventory)", callback_data="claim_store")]
+        ]
+    )
+    
+    await message.answer(
+        f"🎉 <b>تبریک! شما برنده اسکین زیر شدید:</b>\n\n"
+        f"🎁 <b>{won_skin}</b>\n\n"
+        f"حالا می‌خوای چکار کنی؟ انتخاب کن 👇",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+    save_data()
+
+# --- ذخیره در انبار ---
+@dp.callback_query(F.data == "claim_store")
+async def claim_store_handler(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    skin = data.get("pending_skin")
+    u_id = call.from_user.id
+    
+    if not skin:
+        await call.answer("❌ خطایی رخ داد یا این درخواست منقضی شده.", show_alert=True)
+        return
+        
+    prof = get_user_profile(u_id)
+    prof["inventory"].append(skin)
+    save_data()
+    await state.clear()
+    
+    await call.message.edit_text(
+        f"✅ <b>اسکین {skin} با موفقیت در انبار (Inventory) ذخیره شد!</b>\n"
+        f"هر زمان خواستی می‌تونی از منوی انبار درخواست برداشت بدی 🔥",
+        parse_mode="HTML"
+    )
+
+# --- برداشت فوری یا برداشت از انبار ---
+@dp.callback_query(F.data == "claim_now")
+async def claim_now_handler(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    skin = data.get("pending_skin")
+    if not skin:
+        await call.answer("❌ خطایی رخ داد.", show_alert=True)
+        return
+        
+    await state.set_state(WithdrawForm.username_info)
+    await state.update_data(withdraw_skin=skin, from_inventory_index=None)
+    
+    await call.message.edit_text(
+        f"📤 <b>درخواست برداشت اسکین:</b> {skin}\n\n"
+        f"لطفاً <b>آیدی تلگرام / یوزرنیم گیم یا اطلاعات لازم جهت تحویل</b> رو بفرست:",
+        parse_mode="HTML"
+    )
+
+@dp.message(WithdrawForm.username_info)
+async def process_withdraw_info(message: types.Message, state: FSMContext):
+    user_input = message.text.strip()
+    data = await state.get_data()
+    skin = data.get("withdraw_skin")
+    inv_index = data.get("from_inventory_index")
+    u_id = message.from_user.id
+    user = message.from_user
+
+    # ارسال فرم برداشت به کانال برداشت
+    user_mention = f"@{user.username}" if user.username else f'<a href="tg://user?id={user.id}">{html.escape(user.first_name)}</a>'
+    
+    withdraw_text = (
+        f"🔔 <b>درخواست برداشت اسکین جدید!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>کاربر:</b> {user_mention} (ID: <code>{user.id}</code>)\n"
+        f"🎁 <b>اسکین درخواست شده:</b> {skin}\n"
+        f"📝 <b>مشخصات ارسالی کاربر:</b>\n<code>{html.escape(user_input)}</code>\n"
+        f"⏰ <b>زمان ثبت:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        f"━━━━━━━━━━━━━━━━━━"
+    )
+    
+    try:
+        await bot.send_message(chat_id=WITHDRAW_CHANNEL, text=withdraw_text, parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Withdraw channel send error: {e}")
+        await message.answer("❌ خطایی در ارسال درخواست به کانال ادمین رخ داد. مطمئن شوید ربات ادمین کانال برداشت است.")
+        return
+
+    # اگر از انبار بوده، حذفش کنیم
+    if inv_index is not None:
+        prof = get_user_profile(u_id)
+        if 0 <= inv_index < len(prof["inventory"]):
+            prof["inventory"].pop(inv_index)
+            save_data()
+
+    await state.clear()
+    await message.answer(
+        f"✅ <b>درخواست برداشت اسکین {skin} با موفقیت ثبت شد!</b>\n\n"
+        f"اطلاعات به کانال پشتیبانی ارسال شد و به زودی تحویل داده می‌شود 🔥",
+        parse_mode="HTML",
+        reply_markup=get_main_keyboard(u_id)
+    )
+
+# --- بخش انبار (Inventory) ---
+@dp.message(F.text == "🎒 انبار من (Inventory)")
+async def show_inventory(message: types.Message):
+    u_id = message.from_user.id
+    prof = get_user_profile(u_id)
+    inv = prof["inventory"]
+
+    if not inv:
+        await message.answer("🎒 <b>انبار شما خالی است!</b>\nبا چرخاندن گردونه شانس می‌تونی اسکین برنده بشی و اینجا ذخیره کنی 🔥", parse_mode="HTML")
+        return
+
+    text = "🎒 <b>اسکین‌های ذخیره شده در انبار شما:</b>\nبرای برداشت هر اسکین روی دکمه مربوط به آن کلیک کنید:\n\n"
+    kb_list = []
+    for idx, item in enumerate(inv):
+        text += f"<b>{idx+1}.</b> {item}\n"
+        kb_list.append([InlineKeyboardButton(text=f"📤 برداشت {item}", callback_data=f"withdraw_inv_{idx}")])
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=kb_list)
+    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+
+@dp.callback_query(F.data.startswith("withdraw_inv_"))
+async def withdraw_from_inv(call: types.CallbackQuery, state: FSMContext):
+    idx = int(call.data.split("_")[2])
+    u_id = call.from_user.id
+    prof = get_user_profile(u_id)
+    
+    if idx >= len(prof["inventory"]):
+        await call.answer("❌ این اسکین یافت نشد.", show_alert=True)
+        return
+        
+    skin = prof["inventory"][idx]
+    await state.set_state(WithdrawForm.username_info)
+    await state.update_data(withdraw_skin=skin, from_inventory_index=idx)
+    
+    await call.message.edit_text(
+        f"📤 <b>درخواست برداشت از انبار:</b> {skin}\n\n"
+        f"لطفاً <b>آیدی تلگرام / یوزرنیم گیم یا مشخصات لازم جهت تحویل</b> رو بفرست:",
+        parse_mode="HTML"
+    )
+
+# --- پروفایل من ---
+@dp.message(F.text == "👤 پروفایل من")
+async def show_profile(message: types.Message):
+    u_id = message.from_user.id
+    prof = get_user_profile(u_id)
+    inv_count = len(prof["inventory"])
+    
+    last_w = prof["last_wheel"].strftime("%Y-%m-%d %H:%M") if prof["last_wheel"] else "تا کنون استفاده نشده"
+    
+    text = (
+        f"👤 <b>پروفایل کاربری شما:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 <b>آیدی عددی:</b> <code>{u_id}</code>\n"
+        f"🎒 <b>تعداد اسکین‌های موجود در انبار:</b> {inv_count} عدد\n"
+        f"⏱ <b>آخرین بار چرخاندن گردونه:</b> {last_w}\n"
+        f"━━━━━━━━━━━━━━━━━━"
+    )
+    await message.answer(text, parse_mode="HTML")
+
+# --- مدیریت قرعه‌کشی‌ها (کد قبلی) ---
+@dp.message(F.text.in_(["📊 لیست قرعه‌کشی‌ها ⚡️", "📊 لیست قرعه‌کشی‌های داغ ⚡️", "📋 قرعه‌کشی‌های فعال"]))
 async def show_active_giveaways(message: types.Message):
     if not is_admin(message.from_user.id):
-        await message.answer("⛔️ دسترسی محدود! فقط ادمین‌های اصلی مجاز هستند.")
         return
 
     active_items = {k: v for k, v in active_giveaways.items() if not v["ended"]}
     if not active_items:
-        await message.answer("📊 <b>در حال حاضر هیچ قرعه‌کشی فعالی روی هوا نیست!</b>", parse_mode="HTML")
+        await message.answer("📊 <b>در حال حاضر هیچ قرعه‌کشی فعالی وجود ندارد.</b>", parse_mode="HTML")
         return
 
     for msg_id, gw in active_items.items():
@@ -202,7 +449,7 @@ async def show_active_giveaways(message: types.Message):
             f"📌 <b>عنوان:</b> {gw['title']}\n"
             f"🎁 <b>جایزه:</b> {gw['prize']}\n"
             f"📢 <b>کانال:</b> {gw['channel']}\n"
-            f"👥 <b>ارتش شرکت‌کنندگان:</b> {len(gw['participants'])} نفر\n"
+            f"👥 <b>شرکت‌کنندگان:</b> {len(gw['participants'])} نفر\n"
             f"⏱ <b>تایمر معکوس:</b> {time_str} ⏳\n"
         )
         keyboard = InlineKeyboardMarkup(
@@ -219,27 +466,23 @@ async def stop_giveaway_manual(call: types.CallbackQuery):
     msg_id = int(call.data.split("_")[2])
     if msg_id in active_giveaways and not active_giveaways[msg_id]["ended"]:
         await finish_giveaway(active_giveaways[msg_id]["channel"], msg_id)
-        await call.message.edit_text("💥 <b>بمب منفجر شد!</b> قرعه‌کشی به اتمام رسید و برندگان توی کانال اعلام شدند 🏆", parse_mode="HTML")
+        await call.message.edit_text("💥 قرعه‌کشی به اتمام رسید و برندگان اعلام شدند.", parse_mode="HTML")
     else:
-        await call.answer("⚠️ این قرعه‌کشی قبلاً تمام شده یا وجود ندارد.", show_alert=True)
+        await call.answer("⚠️ این قرعه‌کشی قبلاً تمام شده است.", show_alert=True)
 
-# --- فرآیند ساخت قرعه‌کشی (فقط ادمین) ---
-@dp.message(F.text == "🎁 استارت قرعه‌کشی جدید 🚀")
-@dp.message(F.text == "🎉 ساخت قرعه‌کشی جدید")
-@dp.message(F.text == "/newgiveaway")
+@dp.message(F.text.in_(["🎁 استارت قرعه‌کشی جدید 🚀", "🎉 ساخت قرعه‌کشی جدید", "/newgiveaway"]))
 async def start_giveaway(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
-        await message.answer("⛔️ دسترسی محدود! فقط ادمین‌های اصلی مجاز هستند.")
         return
 
     await state.set_state(GiveawayForm.title)
-    await message.answer("📌 <b>مرحله ۱ از ۵:</b>\nلطفاً یک <b>عنوان پرانرژی و جذاب</b> برای قرعه‌کشی وارد کن 🔥:", parse_mode="HTML")
+    await message.answer("📌 <b>عنوان قرعه‌کشی را وارد کنید:</b>", parse_mode="HTML")
 
 @dp.message(GiveawayForm.title)
 async def process_title(message: types.Message, state: FSMContext):
     await state.update_data(title=message.text)
     await state.set_state(GiveawayForm.prize)
-    await message.answer(f"✅ عنوان ثبت شد: <b>{html.escape(message.text)}</b>\n\n🎁 <b>مرحله ۲ از ۵:</b>\nحالا دقیقاً بگید <b>جایزه خفن</b> این قرعه‌کشی چیه؟ 💎", parse_mode="HTML")
+    await message.answer(f"✅ عنوان: <b>{html.escape(message.text)}</b>\n\n🎁 <b>نوع جایزه را وارد کنید:</b>", parse_mode="HTML")
 
 @dp.message(GiveawayForm.prize)
 async def process_prize(message: types.Message, state: FSMContext):
@@ -248,27 +491,27 @@ async def process_prize(message: types.Message, state: FSMContext):
     
     time_keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⏱ ۱ دقیقه (تست)", callback_data="time_60"), InlineKeyboardButton(text="⏱ ۵ دقیقه", callback_data="time_300")],
-            [InlineKeyboardButton(text="⏱ ۱۰ دقیقه", callback_data="time_600"), InlineKeyboardButton(text="⏱ ۱ ساعت ⚡️", callback_data="time_3600")]
+            [InlineKeyboardButton(text="⏱ ۱ دقیقه", callback_data="time_60"), InlineKeyboardButton(text="⏱ ۵ دقیقه", callback_data="time_300")],
+            [InlineKeyboardButton(text="⏱ ۱۰ دقیقه", callback_data="time_600"), InlineKeyboardButton(text="⏱ ۱ ساعت", callback_data="time_3600")]
         ]
     )
-    await message.answer(f"✅ جایزه ثبت شد: <b>{html.escape(message.text)}</b>\n\n⏳ <b>مرحله ۳ از ۵:</b>\nمدت زمان هیجان چقدر باشه؟ انتخاب کن 👇", parse_mode="HTML", reply_markup=time_keyboard)
+    await message.answer(f"✅ جایزه: <b>{html.escape(message.text)}</b>\n\n⏳ <b>مدت زمان را انتخاب کنید:</b>", parse_mode="HTML", reply_markup=time_keyboard)
 
 @dp.callback_query(F.data.startswith("time_"))
 async def process_time_callback(call: types.CallbackQuery, state: FSMContext):
     secs = int(call.data.split("_")[1])
     await state.update_data(time_seconds=secs)
     await state.set_state(GiveawayForm.winners)
-    await call.message.edit_text("✅ زمانبندی ثبت شد.\n\n👑 <b>مرحله ۴ از ۵:</b>\nقراره چند نفر <b>برنده خوش‌شانس</b> داشته باشیم؟ (عدد بفرست):", parse_mode="HTML")
+    await call.message.edit_text("👥 <b>تعداد برندگان را وارد کنید (عدد):</b>", parse_mode="HTML")
 
 @dp.message(GiveawayForm.winners)
 async def process_winners(message: types.Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("⚠️ لطفاً فقط عدد انگلیسی وارد کن رفیق!", parse_mode="HTML")
+        await message.answer("⚠️ لطفاً عدد وارد کنید!", parse_mode="HTML")
         return
     await state.update_data(winners=int(message.text))
     await state.set_state(GiveawayForm.channel)
-    await message.answer("📢 <b>مرحله ۵ از ۵ (نهایی):</b>\nآیدی کانالی که قراره این بمب توش بترکه رو بفرست (مثال: <code>@Voidchanneloffical</code>):\n⚠️ <i>حواست باشه ربات توی کانال ادمین باشه!</i>", parse_mode="HTML")
+    await message.answer("📢 <b>آیدی کانال را بفرستید (مثال: @Voidchanneloffical):</b>", parse_mode="HTML")
 
 @dp.message(GiveawayForm.channel)
 async def process_channel(message: types.Message, state: FSMContext):
@@ -281,32 +524,28 @@ async def process_channel(message: types.Message, state: FSMContext):
         chat = await bot.get_chat(channel_id)
         member = await bot.get_chat_member(chat_id=chat.id, user_id=bot.id)
         if member.status not in ["administrator", "creator"]:
-            await message.answer("❌ ربات هنوز توی این کانال **ادمین** نشده! اول ادمینش کن، بعد دوباره آیدی رو بفرست.", parse_mode="HTML")
+            await message.answer("❌ ربات در این کانال ادمین نیست!", parse_mode="HTML")
             return
     except Exception as e:
-        logging.error(f"Channel Check Error: {e}")
-        await message.answer("❌ کانال پیدا نشد یا ربات دسترسی نداره!\nتست کن که ربات حتماً ادمین کانال باشه.", parse_mode="HTML")
+        await message.answer("❌ کانال پیدا نشد یا ربات دسترسی ندارد!", parse_mode="HTML")
         return
 
     await state.update_data(channel=channel_id)
     data = await state.get_data()
     
     confirm_text = (
-        "🚀 <b>پیش‌نمایش و تایید نهایی قرعه‌کشی:</b>\n"
-        "━━━━━ CONFIG ━━━━━\n"
+        "🚀 <b>تایید نهایی انتشار قرعه‌کشی:</b>\n\n"
         f"📌 <b>عنوان:</b> {html.escape(data['title'])}\n"
         f"🎁 <b>جایزه:</b> {html.escape(data['prize'])}\n"
         f"⏳ <b>زمان:</b> {data['time_seconds']} ثانیه\n"
-        f"🏆 <b>تعداد برندگان:</b> {data['winners']} نفر\n"
-        f"📢 <b>کانال مقصد:</b> {data['channel']}\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        "همه چی ردیفه بفرستم روی هوا؟ 🔥"
+        f"🏆 <b>تعداد برنده:</b> {data['winners']} نفر\n"
+        f"📢 <b>کانال:</b> {data['channel']}\n"
     )
     
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🚀 انتشار و شلیک به کانال 🔥", callback_data="confirm_launch")],
-            [InlineKeyboardButton(text="❌ کنسل کردن", callback_data="cancel_launch")]
+            [InlineKeyboardButton(text="🚀 انتشار در کانال", callback_data="confirm_launch")],
+            [InlineKeyboardButton(text="❌ لغو", callback_data="cancel_launch")]
         ]
     )
     await message.answer(confirm_text, parse_mode="HTML", reply_markup=keyboard)
@@ -325,17 +564,17 @@ async def launch_giveaway(call: types.CallbackQuery, state: FSMContext):
         f"🔥 <b>{title}</b> 🔥\n"
         f"✨ ─── GIVEAWAY ─── ✨\n\n"
         f"🎁 <b>جایزه ویژه:</b> {prize}\n"
-        f"🏆 <b>تعداد برندگان خوش‌شانس:</b> {data['winners']} نفر\n"
-        f"⏱ <b>تایمر معکوس:</b> {total_seconds} ثانیه ⏳\n\n"
-        f"👥 <b>ارتش شرکت‌کنندگان (0):</b>\n"
-        f"<i>هنوز هیچ مبارزی وارد میدان نشده!</i> 🚀\n\n"
-        f"👇 <b>همین الان شانس خودت رو امتحان کن یا با دعوت بقیه شانست رو چند برابر کن!</b>"
+        f"🏆 <b>تعداد برندگان:</b> {data['winners']} نفر\n"
+        f"⏱ <b>زمان باقی‌مانده:</b> {total_seconds} ثانیه ⏳\n\n"
+        f"👥 <b>شرکت‌کنندگان (0):</b>\n"
+        f"<i>هنوز کسی شرکت نکرده است.</i> 🚀\n\n"
+        f"👇 جهت شرکت یا دریافت لینک دعوت از دکمه‌های زیر استفاده کنید:"
     )
     
     channel_keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🎁 ورود به قرعه‌کشی (0) ⚡️", callback_data="join_gw")],
-            [InlineKeyboardButton(text="🔗 دریافت لینک دعوت (شانس 💥)", callback_data="get_ref")]
+            [InlineKeyboardButton(text="🎁 شرکت در قرعه‌کشی (0) ⚡️", callback_data="join_gw")],
+            [InlineKeyboardButton(text="🔗 لینک دعوت (افزایش شانس 💥)", callback_data="get_ref")]
         ]
     )
     
@@ -356,7 +595,7 @@ async def launch_giveaway(call: types.CallbackQuery, state: FSMContext):
     }
     save_data()
     
-    await call.message.edit_text(f"💥 <b>بمب با موفقیت توی {channel_id} شلیک شد!</b> 🚀", parse_mode="HTML")
+    await call.message.edit_text(f"💥 قرعه‌کشی با موفقیت در {channel_id} منتشر شد!", parse_mode="HTML")
     await state.clear()
     
     asyncio.create_task(run_giveaway_timer(sent_msg.chat.id, sent_msg.message_id))
@@ -367,7 +606,7 @@ async def join_giveaway(call: types.CallbackQuery):
     user = call.from_user
     
     if msg_id not in active_giveaways or active_giveaways[msg_id]["ended"]:
-        await call.answer("🛑 مهلت شرکت در این قرعه‌کشی تمام شده!", show_alert=True)
+        await call.answer("🛑 مهلت قرعه‌کشی تمام شده است!", show_alert=True)
         return
         
     gw = active_giveaways[msg_id]
@@ -375,13 +614,13 @@ async def join_giveaway(call: types.CallbackQuery):
     try:
         member = await bot.get_chat_member(chat_id=gw["channel"], user_id=user.id)
         if member.status in ["left", "kicked"]:
-            await call.answer("❌ اول باید جوین کانال بشی رفیق!", show_alert=True)
+            await call.answer("❌ ابتدا باید عضو کانال شوید!", show_alert=True)
             return
     except Exception:
         pass
 
     if user.id in gw["participants"]:
-        await call.answer("💎 شانس تو قبلاً ثبت شده رفیق! منتظر قرعه‌کشی باش.", show_alert=True)
+        await call.answer("💎 شما قبلاً ثبت‌نام کرده‌اید!", show_alert=True)
         return
 
     gw["participants"][user.id] = {
@@ -390,8 +629,7 @@ async def join_giveaway(call: types.CallbackQuery):
         "referrals": 0
     }
     save_data()
-    await call.answer("🎉 ایول! با موفقیت توی قرعه‌کشی ثبت‌نام شدی 🔥", show_alert=True)
-    
+    await call.answer("🎉 با موفقیت ثبت‌نام شدید!", show_alert=True)
     await update_post_text(call.message.chat.id, msg_id)
 
 @dp.callback_query(F.data == "get_ref")
@@ -400,7 +638,7 @@ async def get_referral_link(call: types.CallbackQuery):
     user = call.from_user
 
     if msg_id not in active_giveaways or active_giveaways[msg_id]["ended"]:
-        await call.answer("🛑 این قرعه‌کشی تمام شده است!", show_alert=True)
+        await call.answer("🛑 قرعه‌کشی تمام شده است!", show_alert=True)
         return
 
     bot_info = await bot.get_me()
@@ -413,17 +651,17 @@ async def get_referral_link(call: types.CallbackQuery):
         await bot.send_message(
             chat_id=user.id,
             text=(
-                f"👑 <b>لینک اختصاصی افزایش شانس شما:</b>\n"
+                f"👑 <b>لینک اختصاصی دعوت شما:</b>\n"
                 f"📌 <b>قرعه‌کشی:</b> {gw['title']}\n\n"
                 f"🔗 <code>{ref_link}</code>\n\n"
-                f"📊 <b>زیرمجموعه‌های تا الان:</b> {user_ref_count} نفر 🔥\n"
-                f"✨ این لینک رو برا رفقات بفرست؛ هر نفر جوین بشه <b>+۱ شانس اختصاصی</b> می‌گیری!"
+                f"📊 <b>تعداد دعوت‌ها:</b> {user_ref_count} نفر\n"
+                f"✨ هر نفر که با این لینک عضو شود، ۱ شانس اضافه دریافت می‌کنید!"
             ),
             parse_mode="HTML"
         )
-        await call.answer("📩 لینک اختصاصی به پیوی ارسال شد!", show_alert=True)
+        await call.answer("📩 لینک دعوت به پیوی ارسال شد!", show_alert=True)
     except Exception:
-        await call.answer("⚠️ اول باید ربات رو توی پیوی استارت کنی تا لینک برات ارسال بشه!", show_alert=True)
+        await call.answer("⚠️ ابتدا ربات را در پیوی استارت کنید!", show_alert=True)
 
 async def update_post_text(chat_id, message_id):
     if message_id not in active_giveaways:
@@ -436,7 +674,7 @@ async def update_post_text(chat_id, message_id):
     
     participants_dict = gw["participants"]
     if not participants_dict:
-        users_str = "<i>هنوز هیچ مبارزی وارد میدان نشده!</i> 🚀"
+        users_str = "<i>هنوز کسی شرکت نکرده است.</i> 🚀"
     else:
         formatted_users = []
         for idx, (u_id, u_info) in enumerate(participants_dict.items(), 1):
@@ -456,16 +694,16 @@ async def update_post_text(chat_id, message_id):
         f"🔥 <b>{gw['title']}</b> 🔥\n"
         f"✨ ─── GIVEAWAY ─── ✨\n\n"
         f"🎁 <b>جایزه ویژه:</b> {gw['prize']}\n"
-        f"🏆 <b>تعداد برندگان خوش‌شانس:</b> {gw['winners_count']} نفر\n"
-        f"⏱ <b>تایمر معکوس:</b> {time_str} ⏳\n\n"
-        f"👥 <b>ارتش شرکت‌کنندگان ({count}):</b>\n{users_str}\n\n"
-        f"👇 <b>همین الان شانس خودت رو امتحان کن یا با دعوت بقیه شانست رو چند برابر کن!</b>"
+        f"🏆 <b>تعداد برندگان:</b> {gw['winners_count']} نفر\n"
+        f"⏱ <b>زمان باقی‌مانده:</b> {time_str} ⏳\n\n"
+        f"👥 <b>شرکت‌کنندگان ({count}):</b>\n{users_str}\n\n"
+        f"👇 جهت شرکت یا دریافت لینک دعوت از دکمه‌های زیر استفاده کنید:"
     )
     
     channel_kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=f"🎁 ورود به قرعه‌کشی ({count}) ⚡️", callback_data="join_gw")],
-            [InlineKeyboardButton(text="🔗 دریافت لینک دعوت (شانس 💥)", callback_data="get_ref")]
+            [InlineKeyboardButton(text=f"🎁 شرکت در قرعه‌کشی ({count}) ⚡️", callback_data="join_gw")],
+            [InlineKeyboardButton(text="🔗 لینک دعوت (افزایش شانس 💥)", callback_data="get_ref")]
         ]
     )
     
@@ -487,7 +725,7 @@ async def finish_giveaway(chat_id, message_id):
     
     if not participants:
         final_text = (
-            f"🏁 <b>قرعه‌کشی به پایان رسید!</b> 🏁\n\n"
+            f"🏁 <b>قرعه‌کشی به پایان رسید!</b>\n\n"
             f"📌 <b>عنوان:</b> {gw['title']}\n"
             f"🎁 <b>جایزه:</b> {gw['prize']}\n\n"
             f"❌ متاسفانه هیچ شرکتی‌کننده‌ای ثبت‌نام نکرد."
@@ -514,12 +752,10 @@ async def finish_giveaway(chat_id, message_id):
         
         winners_str = "\n".join(winners_list)
         final_text = (
-            f"👑 <b>قرعه‌کشی به پایان رسید و بمب انفجار جوایز رخ داد!</b> 👑\n"
-            f"✨ ──────────────── ✨\n\n"
+            f"👑 <b>قرعه‌کشی به پایان رسید!</b> 👑\n\n"
             f"📌 <b>عنوان:</b> {gw['title']}\n"
             f"🎁 <b>جایزه:</b> {gw['prize']}\n\n"
-            f"🎉 <b>برنده / برندگان خوش‌شانس و الماس این دوره:</b>\n{winners_str}\n\n"
-            f"🔥 <i>مبارکتون باشه! منتظر قرعه‌کشی‌های خفن بعدی باشید...</i> ✨"
+            f"🎉 <b>برندگان خوش‌شانس:</b>\n{winners_str}\n"
         )
     
     try:
