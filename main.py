@@ -1,6 +1,6 @@
 # ==========================================
-# Void Giveaway Bot - Version 1.8.3
-# (Fixed TON-SDK Import Compatibility for Render)
+# Void Giveaway Bot - Version 1.6.1
+# (Fix Toncenter Import & Real TON Payout)
 # ==========================================
 
 import asyncio
@@ -10,7 +10,6 @@ import random
 import html
 import json
 import requests
-import base64
 from datetime import datetime, timedelta
 from flask import Flask
 from threading import Thread
@@ -22,9 +21,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 
-# اصلاح کامل و استاندارد Importهای tonsdk برای عدم ایجاد خطا
-from tonsdk.contract.wallet import WalletVersionEnum, WalletContract
-from tonsdk.crypto.mnemonic import mnemonic_to_wallet_key
+from tonsdk.contract.wallet import WalletVersionEnum, Wallets
+from tonsdk.utils import bytes_to_b64str
 
 logging.basicConfig(level=logging.INFO)
 
@@ -32,7 +30,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v1.8.3) is running!"
+    return "⚡ Void Giveaway Bot (v1.6.1) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -65,7 +63,7 @@ WHEEL_SKINS = [
     {"name": "Rare Skin 🔥👑", "type": "skin", "weight": 2}
 ]
 
-# تابع ارسال تراکنش TON به‌روزرسانی شده
+# تابع واریز واقعی و مستقیم به شبکه TON
 async def send_ton_payout(destination_address: str, amount_ton: float):
     if not TON_MNEMONIC:
         return False, "کلید امنیتی ولت (TON_MNEMONIC) روی رندر تنظیم نشده است!"
@@ -73,41 +71,33 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
     try:
         mnemonics = TON_MNEMONIC.strip().split()
         
-        # استخراج مستقیم و تمیز کلیدهای عمومی و خصوصی
-        pub_k, priv_k = mnemonic_to_wallet_key(mnemonics)
-        
-        # ساخت ولت V4R2
-        wallet = WalletContract(
-            public_key=pub_k,
-            private_key=priv_k,
-            version=WalletVersionEnum.v4r2
+        # ۱. ساخت ولت
+        wallet, public_key, private_key, wallet_state = Wallets.from_mnemonics(
+            mnemonics=mnemonics,
+            version=WalletVersionEnum.v4r2,
+            workchain=0
         )
-        wallet_address = wallet.address.to_string(is_user_friendly=True, is_bounceable=False)
+        
+        wallet_address = wallet.address.to_string(True, True, True)
 
-        # دریافت Seqno از طریق Toncenter
+        # ۲. دریافت Seqno از Toncenter API به صورت مستقیم
         def get_seqno():
-            url = "https://toncenter.com/api/v2/runGetMethod"
+            url = f"https://toncenter.com/api/v2/runGetMethod"
             payload = {
                 "address": wallet_address,
                 "method": "seqno",
                 "stack": []
             }
-            try:
-                resp = requests.post(url, json=payload, timeout=10).json()
-                if resp.get("ok") and resp.get("result", {}).get("exit_code") == 0:
-                    stack = resp["result"]["stack"]
-                    if stack and len(stack) > 0:
-                        val = stack[0][1]
-                        if isinstance(val, str) and val.startswith("0x"):
-                            return int(val, 16)
-                        return int(val)
-            except Exception as ex:
-                logging.error(f"Toncenter seqno request error: {ex}")
+            res = requests.post(url, json=payload, timeout=10).json()
+            if res.get("ok") and res.get("result", {}).get("exit_code") == 0:
+                stack = res["result"]["stack"]
+                if stack and len(stack) > 0:
+                    return int(stack[0][1], 16)
             return 0
 
         seqno = await asyncio.to_thread(get_seqno)
 
-        # ساخت و امضای تراکنش
+        # ۳. ساخت تراکنش
         nano_amount = int(amount_ton * 10**9)
         query = wallet.create_transfer_message(
             to_addr=destination_address.strip(),
@@ -116,22 +106,20 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
             payload="Reward from Void Giveaway Bot 🎉"
         )
         
-        boc_bytes = query['message'].to_boc(False)
-        boc_b64 = base64.b64encode(boc_bytes).decode("utf-8")
+        # ۴. ارسال بایت‌های تراکنش امضا شده (BOC) به API شبکه TON
+        boc_b64 = bytes_to_b64str(query['message'].to_boc(False))
 
-        # ارسال به شبکه TON
         def send_boc():
             url = "https://toncenter.com/api/v2/sendBoc"
             payload = {"boc": boc_b64}
             return requests.post(url, json=payload, timeout=10).json()
 
-        res_boc = await asyncio.to_thread(send_boc)
+        res = await asyncio.to_thread(send_boc)
         
-        if res_boc and res_boc.get('ok'):
-            return True, "تراکنش با موفقیت به شبکه TON ارسال شد! 🚀"
+        if res and res.get('ok'):
+            return True, "تراکنش با موفقیت به شبکه TON ارسال شد و کسر گردید! 🚀"
         else:
-            error_desc = res_boc.get('error', res_boc)
-            return False, f"خطای Toncenter: {error_desc}"
+            return False, f"خطای شبکه TON: {res.get('error', res)}"
 
     except Exception as e:
         logging.error(f"TON Payout Real Send Error: {e}")
@@ -288,7 +276,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات بزرگ Void Giveaway خوش آمدی!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v1.8.3</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v1.6.1</code> 💎\n\n"
         f"از منوی زیر می‌تونی توی گردونه شانس شرکت کنی یا انبار اسکینهات رو ببینی 👇",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
@@ -464,18 +452,19 @@ async def approve_withdraw(call: types.CallbackQuery):
                 dest_addr = msg_lines[idx+1].strip()
                 break
 
+        # واریز واقعی مبلغ
         success, result_msg = await send_ton_payout(dest_addr, 0.01)
         if success:
-            updated_text = call.message.text + "\n\n✅ <b>وضعیت: واریز خودکار کریپتویی انجام شد! 💎</b>"
+            updated_text = call.message.text + "\n\n✅ <b>وضعیت: واریز واقعی کریپتویی در شبکه TON انجام شد! 💎</b>"
             await call.message.edit_text(updated_text, parse_mode="HTML", reply_markup=None)
-            await call.answer("✅ 0.01 TON با موفقیت ارسال شد!", show_alert=True)
+            await call.answer("✅ 0.01 TON به‌صورت واقعی از ولت کسر و ارسال شد!", show_alert=True)
         else:
-            await call.answer(f"❌ خطا: {result_msg}", show_alert=True)
+            await call.answer(f"❌ خطا در واریز شبکه: {result_msg}", show_alert=True)
             return
     else:
         updated_text = call.message.text + "\n\n✅ <b>وضعیت: واریز شد (تایید شد)</b>"
         await call.message.edit_text(updated_text, parse_mode="HTML", reply_markup=None)
-        await call.answer("✅ برداشت تایید شد.", show_alert=True)
+        await call.answer("✅ برداشت اسکین تایید شد.", show_alert=True)
 
     try:
         await bot.send_message(
