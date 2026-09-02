@@ -1,6 +1,6 @@
 # ==========================================
-# Void Giveaway Bot - Version 1.7.3
-# (Fixed Toncenter & Address List Error)
+# Void Giveaway Bot - Version 1.7.4
+# (Fixed Wallet Address List Attribute & Payout)
 # ==========================================
 
 import asyncio
@@ -30,7 +30,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v1.7.3) is running!"
+    return "⚡ Void Giveaway Bot (v1.7.4) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -63,7 +63,7 @@ WHEEL_SKINS = [
     {"name": "Rare Skin 🔥👑", "type": "skin", "weight": 2}
 ]
 
-# تابع واریز واقعی و اصلاح شده برای جلوگیری از خطای لیست و بهبود ارتباط با Toncenter
+# تابع واریز واقعی TON با اصلاح کامل ساختار آدرس و امن کردن استخراج
 async def send_ton_payout(destination_address: str, amount_ton: float):
     if not TON_MNEMONIC:
         return False, "کلید امنیتی ولت (TON_MNEMONIC) روی رندر تنظیم نشده است!"
@@ -78,13 +78,17 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
             workchain=0
         )
         
-        # اصلاح قطعی خطای لیست برای آدرس ولت
-        if isinstance(wallet.address, list):
-            wallet_address = wallet.address[0].to_string(True, True, True)
+        # اصلاح دقیق و ایمن برای استخراج آدرس ولت به صورت استرینگ
+        raw_addr = wallet.address
+        if isinstance(raw_addr, list):
+            raw_addr = raw_addr[0]
+            
+        if hasattr(raw_addr, "to_string"):
+            wallet_address = raw_addr.to_string(True, True, True)
         else:
-            wallet_address = wallet.address.to_string(True, True, True)
+            wallet_address = str(raw_addr)
 
-        # ۲. دریافت Seqno با استفاده از متد عمومی تر یا HTTP V2
+        # ۲. دریافت Seqno با استفاده از متد عمومی‌تر Toncenter
         def get_seqno():
             url = "https://toncenter.com/api/v2/runGetMethod"
             payload = {
@@ -97,7 +101,6 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
                 if res.get("ok") and res.get("result", {}).get("exit_code") == 0:
                     stack = res["result"]["stack"]
                     if stack and len(stack) > 0:
-                        # استک ممکن است به صورت هگز یا عدد برگردد
                         val = stack[0][1]
                         if isinstance(val, str) and val.startswith("0x"):
                             return int(val, 16)
@@ -289,7 +292,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات بزرگ Void Giveaway خوش آمدی!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v1.7.3</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v1.7.4</code> 💎\n\n"
         f"از منوی زیر می‌تونی توی گردونه شانس شرکت کنی یا انبار اسکینهات رو ببینی 👇",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
