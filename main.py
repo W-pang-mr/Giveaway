@@ -1,6 +1,6 @@
 # ==========================================
-# Void Giveaway Bot - Version 4.1.1
-# (Referral Only, Custom Gas Fee & Ref Reward Settings, Anti-Fake Ref, Advanced Admin)
+# Void Giveaway Bot - Version 4.2.0
+# (Referral Only, Custom Gas Fee, Min/Max Withdraw, User/Referral Manager, Anti-Fake Ref)
 # ==========================================
 
 import asyncio
@@ -31,7 +31,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v4.1.1) is running!"
+    return "⚡ Void Giveaway Bot (v4.2.0) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -53,11 +53,12 @@ dp = Dispatcher(storage=MemoryStorage())
 DATA_FILE = "giveaways.json"
 active_giveaways = {}
 user_data = {}
-all_time_users = set()  # برای جلوگیری از باگ رفرال فیک (ذخیره دائمی user_id)
+all_time_users = set()  # برای جلوگیری از باگ رفرال فیک
 bot_active = True        # وضعیت روشن/خاموش بودن ربات
 min_withdraw_amount = 0.1  # حداقل کفی برداشت TON
-referral_reward = 0.048    # پاداش هر رفرال (قابل تنظیم از ادمین)
-ton_gas_fee = 0.005        # مقدار گس‌فی شبکه TON (قابل تنظیم از ادمین)
+max_withdraw_amount = 10.0 # حداکثر سقف برداشت TON
+referral_reward = 0.048    # پاداش هر رفرال
+ton_gas_fee = 0.005        # مقدار گس‌فی شبکه TON
 
 # ==========================================
 # ارسال پاداش شبکه TON
@@ -74,7 +75,6 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
         mnemonics = TON_MNEMONIC.strip().split()
         wallet = await WalletV5R1.from_mnemonic(client, mnemonics, network_global_id=-239)
 
-        # تبدیل مبلغ نهایی ارسالی به نانوتون (NanoTON)
         amount_nano = int(amount_ton * 10**9)
 
         await wallet.transfer(
@@ -118,7 +118,10 @@ def save_data():
     for u_id, info in user_data.items():
         serializable_users[str(u_id)] = {
             "balance": info.get("balance", 0.0),
-            "referrals_count": info.get("referrals_count", 0)
+            "referrals_count": info.get("referrals_count", 0),
+            "referred_by": info.get("referred_by", None),
+            "username": info.get("username", ""),
+            "first_name": info.get("first_name", "User")
         }
 
     full_data = {
@@ -127,6 +130,7 @@ def save_data():
         "all_time_users": list(all_time_users),
         "bot_active": bot_active,
         "min_withdraw_amount": min_withdraw_amount,
+        "max_withdraw_amount": max_withdraw_amount,
         "referral_reward": referral_reward,
         "ton_gas_fee": ton_gas_fee
     }
@@ -134,7 +138,7 @@ def save_data():
         json.dump(full_data, f, ensure_ascii=False, indent=2)
 
 def load_data():
-    global active_giveaways, user_data, all_time_users, bot_active, min_withdraw_amount, referral_reward, ton_gas_fee
+    global active_giveaways, user_data, all_time_users, bot_active, min_withdraw_amount, max_withdraw_amount, referral_reward, ton_gas_fee
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -164,12 +168,16 @@ def load_data():
                     u_id = int(u_id_str)
                     user_data[u_id] = {
                         "balance": round(info.get("balance", 0.0), 4),
-                        "referrals_count": info.get("referrals_count", 0)
+                        "referrals_count": info.get("referrals_count", 0),
+                        "referred_by": info.get("referred_by", None),
+                        "username": info.get("username", ""),
+                        "first_name": info.get("first_name", "User")
                     }
                 
                 all_time_users = set(full_data.get("all_time_users", []))
                 bot_active = full_data.get("bot_active", True)
                 min_withdraw_amount = full_data.get("min_withdraw_amount", 0.1)
+                max_withdraw_amount = full_data.get("max_withdraw_amount", 10.0)
                 referral_reward = full_data.get("referral_reward", 0.048)
                 ton_gas_fee = full_data.get("ton_gas_fee", 0.005)
         except Exception as e:
@@ -196,7 +204,13 @@ class AdminManageUserForm(StatesGroup):
     user_id = State()
     amount = State()
 
+class AdminSearchUserForm(StatesGroup):
+    user_id = State()
+
 class AdminSetMinWithdrawForm(StatesGroup):
+    amount = State()
+
+class AdminSetMaxWithdrawForm(StatesGroup):
     amount = State()
 
 class AdminSetRefRewardForm(StatesGroup):
@@ -211,12 +225,18 @@ class AdminSetGasFeeForm(StatesGroup):
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-def get_user_profile(user_id: int):
+def get_user_profile(user_id: int, user_obj: types.User = None):
     if user_id not in user_data:
         user_data[user_id] = {
             "balance": 0.0,
-            "referrals_count": 0
+            "referrals_count": 0,
+            "referred_by": None,
+            "username": "",
+            "first_name": "User"
         }
+    if user_obj:
+        user_data[user_id]["username"] = user_obj.username or ""
+        user_data[user_id]["first_name"] = user_obj.first_name or "User"
     return user_data[user_id]
 
 def get_main_keyboard(user_id: int):
@@ -233,7 +253,8 @@ def get_admin_inline_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🎁 ایجاد قرعه‌کشی جدید", callback_data="admin_new_gw"), InlineKeyboardButton(text="📊 لیست قرعه‌کشی‌ها", callback_data="admin_list_gw")],
-            [InlineKeyboardButton(text="➕/➖ تغییر موجودی کاربر", callback_data="admin_edit_balance"), InlineKeyboardButton(text="⚙️ حداقل برداشت", callback_data="admin_set_min_wd")],
+            [InlineKeyboardButton(text="👥 مدیریت و جستجوی کاربر", callback_data="admin_search_user"), InlineKeyboardButton(text="➕/➖ تغییر موجودی", callback_data="admin_edit_balance")],
+            [InlineKeyboardButton(text="⚙️ حداقل برداشت", callback_data="admin_set_min_wd"), InlineKeyboardButton(text="🔝 حداکثر برداشت", callback_data="admin_set_max_wd")],
             [InlineKeyboardButton(text="💎 تنظیم پاداش رفرال", callback_data="admin_set_ref_reward"), InlineKeyboardButton(text="⛽️ تنظیم گس‌فی شبکه", callback_data="admin_set_gas_fee")],
             [InlineKeyboardButton(text=status_btn, callback_data="admin_toggle_bot"), InlineKeyboardButton(text="📢 همه‌فرستی (Broadcast)", callback_data="admin_broadcast")],
             [InlineKeyboardButton(text="🔄 بروزرسانی آمار", callback_data="admin_stats")]
@@ -252,7 +273,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
         await message.answer("🛑 <b>ربات در حال حاضر جهت به‌روزرسانی موقتاً خاموش می‌باشد.</b>", parse_mode="HTML")
         return
 
-    prof = get_user_profile(u_id)
+    prof = get_user_profile(u_id, message.from_user)
     args = command.args
 
     is_new_user = u_id not in all_time_users
@@ -265,6 +286,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
             try:
                 referrer_id = int(args.replace("ref_", ""))
                 if referrer_id != u_id and referrer_id in user_data:
+                    prof["referred_by"] = referrer_id
                     ref_prof = get_user_profile(referrer_id)
                     ref_prof["balance"] = round(ref_prof["balance"] + referral_reward, 4)
                     ref_prof["referrals_count"] += 1
@@ -300,6 +322,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
                             "referrals": 0
                         }
                         if referrer_id in gw["participants"] and referrer_id != user.id:
+                            prof["referred_by"] = referrer_id
                             gw["participants"][referrer_id]["referrals"] += 1
                             ref_prof = get_user_profile(referrer_id)
                             ref_prof["balance"] = round(ref_prof["balance"] + referral_reward, 4)
@@ -328,7 +351,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
     save_data()
     await message.answer(
         f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v4.1.1 (Auto Gas Deduction)</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v4.2.0 (User/Ref Manager & Max Withdraw)</code> 💎\n\n"
         f"🎁 <b>به ازای هر رفرال معتبر {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
         f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
         parse_mode="HTML",
@@ -341,7 +364,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 @dp.message(F.text == "💎 کیف‌پول من (Wallet)")
 async def show_wallet(message: types.Message):
     u_id = message.from_user.id
-    prof = get_user_profile(u_id)
+    prof = get_user_profile(u_id, message.from_user)
     
     text = (
         f"💎 <b>کیف‌پول کاربری شما:</b>\n"
@@ -350,7 +373,8 @@ async def show_wallet(message: types.Message):
         f"👥 <b>تعداد کل رفرال‌ها:</b> <code>{prof['referrals_count']}</code> نفر\n"
         f"🔹 <b>درآمد هر رفرال:</b> <code>{referral_reward} TON</code>\n"
         f"⛽️ <b>گس‌فی شبکه:</b> <code>{ton_gas_fee} TON</code>\n"
-        f"🔻 <b>حداقل کف برداشت:</b> <code>{min_withdraw_amount} TON</code>\n"
+        f"🔻 <b>حداقل برداشت:</b> <code>{min_withdraw_amount} TON</code>\n"
+        f"🔝 <b>حداکثر برداشت:</b> <code>{max_withdraw_amount} TON</code>\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
     
@@ -365,7 +389,7 @@ async def show_wallet(message: types.Message):
 async def start_withdraw_callback(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
     u_id = call.from_user.id
-    prof = get_user_profile(u_id)
+    prof = get_user_profile(u_id, call.from_user)
     
     if prof["balance"] < min_withdraw_amount:
         await call.answer(
@@ -377,16 +401,17 @@ async def start_withdraw_callback(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(WithdrawForm.amount)
     await call.message.answer(
         f"💰 <b>موجودی قابل برداشت شما:</b> <code>{prof['balance']:.4f} TON</code>\n"
+        f"🔻 <b>حداقل برداشت:</b> <code>{min_withdraw_amount} TON</code>\n"
+        f"🔝 <b>حداکثر برداشت:</b> <code>{max_withdraw_amount} TON</code>\n"
         f"⛽️ <b>گس‌فی شبکه:</b> <code>{ton_gas_fee} TON</code>\n\n"
-        f"لطفاً مقداری که قصد برداشت دارید را به عدد وارد کنید (مثال: {prof['balance']:.4f}):",
+        f"لطفاً مقداری که قصد برداشت دارید را به عدد وارد کنید:",
         parse_mode="HTML"
     )
 
-# --- اصلاحیه اصلی: محاسبه دقیق گس‌فی و کسر از موجودی ---
 @dp.message(WithdrawForm.amount)
 async def process_withdraw_amount(message: types.Message, state: FSMContext):
     u_id = message.from_user.id
-    prof = get_user_profile(u_id)
+    prof = get_user_profile(u_id, message.from_user)
     
     try:
         req_amount = float(message.text.strip())
@@ -398,18 +423,19 @@ async def process_withdraw_amount(message: types.Message, state: FSMContext):
         await message.answer(f"⚠️ حداقل مقدار برداشت <code>{min_withdraw_amount} TON</code> می‌باشد!")
         return
 
+    if req_amount > max_withdraw_amount:
+        await message.answer(f"⚠️ حداکثر سقف برداشت در هر بار <code>{max_withdraw_amount} TON</code> می‌باشد!")
+        return
+
     if req_amount > prof["balance"]:
         await message.answer("⚠️ مقدار درخواستی بیشتر از موجودی ولت شما است!")
         return
 
-    # منطق جدید محاسباتی:
-    # ۱. اگر کاربر کسر گس‌فی از باقیمانده حسابش ممکن نباشه (مثلاً کل موجودی رو زده باشه)
-    # گس‌فی از اصل مبلغ درخواستی کسر میشه.
+    # محاسبه گس‌فی
     if (prof["balance"] - req_amount) < ton_gas_fee:
         amount_to_send = req_amount - ton_gas_fee
-        deduct_from_balance = prof["balance"]  # کل موجودی صفر میشه
+        deduct_from_balance = prof["balance"]
     else:
-        # ۲. اگر بعد از برداشت، موجودی کافی برای پرداخت گس‌فی باقی بمونه
         amount_to_send = req_amount
         deduct_from_balance = req_amount + ton_gas_fee
 
@@ -442,14 +468,13 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
     deduct_from_balance = data.get("deduct_from_balance")
     
     user = message.from_user
-    prof = get_user_profile(user.id)
+    prof = get_user_profile(user.id, user)
 
     if deduct_from_balance > prof["balance"]:
         await message.answer("❌ خطا: موجودی حساب شما تغییر کرده است.")
         await state.clear()
         return
 
-    # کسر دقیق کل مبلغ (اصل + گس‌فی) از حساب کاربر در ربات
     prof["balance"] = round(prof["balance"] - deduct_from_balance, 4)
     save_data()
 
@@ -480,7 +505,6 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
         await bot.send_message(chat_id=WITHDRAW_CHANNEL, text=withdraw_text, parse_mode="HTML", reply_markup=admin_action_kb)
     except Exception as e:
         logging.error(f"Withdraw channel send error: {e}")
-        # بازگشت وجه در صورت خطا
         prof["balance"] = round(prof["balance"] + deduct_from_balance, 4)
         save_data()
         await message.answer("❌ خطایی در ارسال درخواست به کانال پشتیبانی رخ داد.")
@@ -565,12 +589,12 @@ async def reject_withdraw(call: types.CallbackQuery):
         pass
 
 # ==========================================
-# دریافت لینک رفرال
+# منوهای عمومی کاربر
 # ==========================================
 @dp.message(F.text == "🔗 دریافت لینک رفرال 🚀")
 async def send_referral_link_menu(message: types.Message):
     u_id = message.from_user.id
-    prof = get_user_profile(u_id)
+    prof = get_user_profile(u_id, message.from_user)
     bot_info = await bot.get_me()
     
     general_ref_link = f"https://t.me/{bot_info.username}?start=ref_{u_id}"
@@ -587,7 +611,7 @@ async def send_referral_link_menu(message: types.Message):
 @dp.message(F.text == "👤 پروفایل من")
 async def show_profile(message: types.Message):
     u_id = message.from_user.id
-    prof = get_user_profile(u_id)
+    prof = get_user_profile(u_id, message.from_user)
     
     text = (
         f"👤 <b>پروفایل کاربری شما:</b>\n"
@@ -624,7 +648,7 @@ async def open_admin_panel(message: types.Message):
     total_balance = sum(u.get("balance", 0.0) for u in user_data.values())
     
     admin_text = (
-        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.1.1)</b>\n"
+        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.2.0)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🤖 <b>وضعیت ربات:</b> {'روشن ✅' if bot_active else 'خاموش/تعمیرات 🛑'}\n"
         f"👥 <b>کاربران فعال فعلی:</b> <code>{total_users}</code> نفر\n"
@@ -632,7 +656,8 @@ async def open_admin_panel(message: types.Message):
         f"💎 <b>مجموع موجودی ولت کاربران:</b> <code>{total_balance:.4f} TON</code>\n"
         f"🎁 <b>پاداش هر رفرال:</b> <code>{referral_reward} TON</code>\n"
         f"⛽️ <b>گس‌فی شبکه TON:</b> <code>{ton_gas_fee} TON</code>\n"
-        f"🔻 <b>حداقل کف برداشت فعلی:</b> <code>{min_withdraw_amount} TON</code>\n"
+        f"🔻 <b>حداقل برداشت:</b> <code>{min_withdraw_amount} TON</code>\n"
+        f"🔝 <b>حداکثر برداشت:</b> <code>{max_withdraw_amount} TON</code>\n"
         f"🔥 <b>قرعه‌کشی‌های فعال:</b> <code>{active_gw}</code> عدد\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "جهت مدیریت از دکمه‌های زیر استفاده کنید:"
@@ -660,6 +685,58 @@ async def show_stats_callback(call: types.CallbackQuery):
         return
     await open_admin_panel(call.message)
 
+# --- مدیریت و جستجوی کاربران و رفرال‌های آن‌ها ---
+@dp.callback_query(F.data == "admin_search_user")
+async def start_search_user(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminSearchUserForm.user_id)
+    await call.message.edit_text("🔍 <b>آیدی عددی (User ID) کاربر مورد نظر را بفرستید:</b>", parse_mode="HTML")
+
+@dp.message(AdminSearchUserForm.user_id)
+async def process_search_user(message: types.Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("⚠️ لطفاً یک آیدی عددی معتبر وارد کنید!")
+        return
+
+    target_id = int(message.text)
+    await state.clear()
+
+    if target_id not in user_data:
+        await message.answer(f"❌ کاربر با آیدی <code>{target_id}</code> در دیتابیس ربات یافت نشد!", parse_mode="HTML")
+        return
+
+    target_prof = user_data[target_id]
+    
+    # پیدا کردن زیرمجموعه‌های این کاربر
+    referrals_list = []
+    for u_id, u_info in user_data.items():
+        if u_info.get("referred_by") == target_id:
+            u_name = f"@{u_info['username']}" if u_info.get("username") else html.escape(u_info.get("first_name", "User"))
+            referrals_list.append(f"• {u_name} (ID: <code>{u_id}</code>) - رفرال‌ها: {u_info.get('referrals_count', 0)}")
+
+    ref_by_str = f"<code>{target_prof['referred_by']}</code>" if target_prof.get("referred_by") else "مستقیم (بدون دعوت‌کننده)"
+    
+    ref_list_str = "\n".join(referrals_list[:20]) if referrals_list else "<i>هیچ زیرمجموعه‌ای ندارد.</i>"
+    if len(referrals_list) > 20:
+        ref_list_str += f"\n<i>... و {len(referrals_list) - 20} کاربر دیگر</i>"
+
+    user_info_text = (
+        f"👤 <b>اطلاعات کاربر <code>{target_id}</code>:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>نام:</b> {html.escape(target_prof.get('first_name', 'User'))}\n"
+        f"🆔 <b>یوزرنیم:</b> @{target_prof.get('username', 'ندارد')}\n"
+        f"💰 <b>موجودی TON:</b> <code>{target_prof.get('balance', 0.0):.4f} TON</code>\n"
+        f"👥 <b>تعداد کل رفرال‌ها:</b> <code>{target_prof.get('referrals_count', 0)}</code> نفر\n"
+        f"🔗 <b>دعوت‌شده توسط:</b> {ref_by_str}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 <b>لیست زیرمجموعه‌های این کاربر:</b>\n"
+        f"{ref_list_str}"
+    )
+
+    await message.answer(user_info_text, parse_mode="HTML")
+
 # --- تنظیم حداقل برداشت ---
 @dp.callback_query(F.data == "admin_set_min_wd")
 async def start_set_min_wd(call: types.CallbackQuery, state: FSMContext):
@@ -667,7 +744,7 @@ async def start_set_min_wd(call: types.CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         return
     await state.set_state(AdminSetMinWithdrawForm.amount)
-    await call.message.edit_text("⚙️ <b>حداقل مقدار جدید برای برداشت TON را وارد کنید (مثال: 0.2):</b>", parse_mode="HTML")
+    await call.message.edit_text(f"⚙️ <b>حداقل مقدار جدید برای برداشت TON را وارد کنید (فعلی: {min_withdraw_amount}):</b>", parse_mode="HTML")
 
 @dp.message(AdminSetMinWithdrawForm.amount)
 async def process_set_min_wd(message: types.Message, state: FSMContext):
@@ -678,6 +755,27 @@ async def process_set_min_wd(message: types.Message, state: FSMContext):
         save_data()
         await state.clear()
         await message.answer(f"✅ حداقل کف برداشت به <code>{min_withdraw_amount} TON</code> تغییر یافت!", parse_mode="HTML")
+    except ValueError:
+        await message.answer("⚠️ لطفاً عدد معتبر وارد کنید!")
+
+# --- تنظیم حداکثر برداشت ---
+@dp.callback_query(F.data == "admin_set_max_wd")
+async def start_set_max_wd(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminSetMaxWithdrawForm.amount)
+    await call.message.edit_text(f"🔝 <b>حداکثر سقف جدید برای برداشت TON را وارد کنید (فعلی: {max_withdraw_amount}):</b>", parse_mode="HTML")
+
+@dp.message(AdminSetMaxWithdrawForm.amount)
+async def process_set_max_wd(message: types.Message, state: FSMContext):
+    global max_withdraw_amount
+    try:
+        amount = float(message.text.strip())
+        max_withdraw_amount = amount
+        save_data()
+        await state.clear()
+        await message.answer(f"✅ حداکثر سقف برداشت به <code>{max_withdraw_amount} TON</code> تغییر یافت!", parse_mode="HTML")
     except ValueError:
         await message.answer("⚠️ لطفاً عدد معتبر وارد کنید!")
 
