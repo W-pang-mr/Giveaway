@@ -1,5 +1,5 @@
 # ==========================================
-# Void Giveaway Bot - Version 1.6.3
+# Void Giveaway Bot - Version 1.7.3
 # (Fixed Toncenter & Address List Error)
 # ==========================================
 
@@ -30,7 +30,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v1.6.3) is running!"
+    return "⚡ Void Giveaway Bot (v1.7.3) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -63,7 +63,7 @@ WHEEL_SKINS = [
     {"name": "Rare Skin 🔥👑", "type": "skin", "weight": 2}
 ]
 
-# تابع واریز واقعی و اصلاح شده برای جلوگیری از خطای لیست
+# تابع واریز واقعی و اصلاح شده برای جلوگیری از خطای لیست و بهبود ارتباط با Toncenter
 async def send_ton_payout(destination_address: str, amount_ton: float):
     if not TON_MNEMONIC:
         return False, "کلید امنیتی ولت (TON_MNEMONIC) روی رندر تنظیم نشده است!"
@@ -84,7 +84,7 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
         else:
             wallet_address = wallet.address.to_string(True, True, True)
 
-        # ۲. دریافت Seqno از طریق درخواست مستقیم HTTP به Toncenter
+        # ۲. دریافت Seqno با استفاده از متد عمومی تر یا HTTP V2
         def get_seqno():
             url = "https://toncenter.com/api/v2/runGetMethod"
             payload = {
@@ -92,11 +92,18 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
                 "method": "seqno",
                 "stack": []
             }
-            res = requests.post(url, json=payload, timeout=10).json()
-            if res.get("ok") and res.get("result", {}).get("exit_code") == 0:
-                stack = res["result"]["stack"]
-                if stack and len(stack) > 0:
-                    return int(stack[0][1], 16)
+            try:
+                res = requests.post(url, json=payload, timeout=10).json()
+                if res.get("ok") and res.get("result", {}).get("exit_code") == 0:
+                    stack = res["result"]["stack"]
+                    if stack and len(stack) > 0:
+                        # استک ممکن است به صورت هگز یا عدد برگردد
+                        val = stack[0][1]
+                        if isinstance(val, str) and val.startswith("0x"):
+                            return int(val, 16)
+                        return int(val)
+            except Exception as ex:
+                logging.error(f"Toncenter seqno request error: {ex}")
             return 0
 
         seqno = await asyncio.to_thread(get_seqno)
@@ -282,7 +289,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات بزرگ Void Giveaway خوش آمدی!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v1.6.3</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v1.7.3</code> 💎\n\n"
         f"از منوی زیر می‌تونی توی گردونه شانس شرکت کنی یا انبار اسکینهات رو ببینی 👇",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
