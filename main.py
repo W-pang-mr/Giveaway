@@ -1,6 +1,6 @@
 # ==========================================
-# Void Giveaway Bot - Version 4.5.1 (Stable Release)
-# (Referral + Anti-Fake System, Direct Admin DM, Ban System, Forced Join Channel, MongoDB Integrated)
+# Void Giveaway Bot - Version 4.5.2 (Updated Release)
+# (Multi-Channel Forced Join, Live Wallet Tracker, Direct Admin DM, Ban System, MongoDB Integrated)
 # ==========================================
 
 import asyncio
@@ -31,7 +31,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v4.5.1) is running smoothly!"
+    return "⚡ Void Giveaway Bot (v4.5.2) is running smoothly!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -45,7 +45,7 @@ def keep_alive():
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = [6879499219]
 WITHDRAW_CHANNEL = "@voidwithraw"
-REQUIRED_CHANNEL = "@Voidchanneloffical"
+WALLET_TRACKER_CHANNEL = "@voidwithraw"  # کانال ارسال و بروزرسانی خودکار موجودی ولت سیستم
 TON_MNEMONIC = os.environ.get("TON_MNEMONIC")
 
 # تنظیمات اتصال به MongoDB
@@ -64,13 +64,16 @@ active_giveaways = {}
 user_data = {}
 all_time_users = set()
 banned_users = set()
+required_channels = ["@Voidchanneloffical"]  # پشتیبانی از چند کانال جوین اجباری
+
 bot_active = True
 auto_payout_enabled = False
 min_withdraw_amount = 0.1
 max_withdraw_amount = 10.0
 referral_reward = 0.048
-max_referrals = 50  # سقف مجاز تعداد رفرال
+max_referrals = 50
 ton_gas_fee = 0.005
+tracker_message_id = None
 
 # ==========================================
 # استعلام موجودی ولت سیستم
@@ -100,6 +103,67 @@ async def get_system_wallet_balance():
         return None, str(e)
 
 # ==========================================
+# تابع تراکر خودکار موجودی ولت هر ۳ دقیقه
+# ==========================================
+async def wallet_balance_tracker_loop():
+    global tracker_message_id
+    await asyncio.sleep(5)  # تاخیر اولیه جهت اجرای کامل لود دیتابیس
+    
+    while True:
+        try:
+            balance_ton, wallet_addr = await get_system_wallet_balance()
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            if balance_ton is not None:
+                text = (
+                    f"💎 <b>گزارش لحظه‌ای موجودی ولت اصلی سیستم</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💰 <b>موجودی موجود:</b> <code>{balance_ton:.4f} TON</code> 💎\n"
+                    f"💳 <b>آدرس ولت:</b>\n<code>{wallet_addr}</code>\n\n"
+                    f"⏰ <b>آخرین بروزرسانی:</b> {now_str}\n"
+                    f"🔄 <i>بروزرسانی خودکار هر ۳ دقیقه انجام می‌شود.</i>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━"
+                )
+            else:
+                text = (
+                    f"⚠️ <b>خطا در دریافت موجودی ولت سیستم!</b>\n"
+                    f"علت: {wallet_addr}\n\n"
+                    f"⏰ <b>زمان:</b> {now_str}"
+                )
+
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🚀 استارت ربات و دریافت هدیه", url=f"https://t.me/{(await bot.get_me()).username}")]
+                ]
+            )
+
+            if tracker_message_id is None:
+                try:
+                    sent_msg = await bot.send_message(chat_id=WALLET_TRACKER_CHANNEL, text=text, parse_mode="HTML", reply_markup=kb)
+                    tracker_message_id = sent_msg.message_id
+                    await save_data()
+                except Exception as e:
+                    logging.error(f"Error sending tracker msg to channel: {e}")
+            else:
+                try:
+                    await bot.edit_message_text(chat_id=WALLET_TRACKER_CHANNEL, message_id=tracker_message_id, text=text, parse_mode="HTML", reply_markup=kb)
+                except TelegramBadRequest:
+                    pass
+                except Exception as e:
+                    logging.error(f"Error editing tracker msg: {e}")
+                    try:
+                        sent_msg = await bot.send_message(chat_id=WALLET_TRACKER_CHANNEL, text=text, parse_mode="HTML", reply_markup=kb)
+                        tracker_message_id = sent_msg.message_id
+                        await save_data()
+                    except Exception as ex:
+                        logging.error(f"Error resending tracker msg: {ex}")
+
+        except Exception as e:
+            logging.error(f"Wallet tracker loop exception: {e}")
+
+        await asyncio.sleep(180)  # بروزرسانی هر ۳ دقیقه (۱۸۰ ثانیه)
+
+# ==========================================
 # تابع بررسی اکانت واقعی
 # ==========================================
 async def is_real_user(user: types.User) -> bool:
@@ -121,28 +185,27 @@ async def is_real_user(user: types.User) -> bool:
         return False
 
 # ==========================================
-# تابع بررسی عضویت اجباری
+# تابع بررسی عضویت اجباری (چندکاناله)
 # ==========================================
 async def check_user_subscription(user_id: int) -> bool:
     if is_admin(user_id):
         return True
-    try:
-        member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=user_id)
-        if member.status in ["creator", "administrator", "member"]:
-            return True
-        return False
-    except Exception as e:
-        logging.error(f"Subscription Check Error: {e}")
-        return True
+    for ch in required_channels:
+        try:
+            member = await bot.get_chat_member(chat_id=ch, user_id=user_id)
+            if member.status not in ["creator", "administrator", "member"]:
+                return False
+        except Exception as e:
+            logging.error(f"Subscription Check Error for {ch}: {e}")
+    return True
 
 def get_join_channel_keyboard():
-    channel_url = f"https://t.me/{REQUIRED_CHANNEL.replace('@', '')}"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📢 عضویت در کانال", url=channel_url)],
-            [InlineKeyboardButton(text="✅ بررسی عضویت / ورود", callback_data="check_join_btn")]
-        ]
-    )
+    buttons = []
+    for idx, ch in enumerate(required_channels, 1):
+        clean_ch = ch.replace("@", "")
+        buttons.append([InlineKeyboardButton(text=f"📢 عضویت در کانال {idx} ({ch})", url=f"https://t.me/{clean_ch}")])
+    buttons.append([InlineKeyboardButton(text="✅ بررسی عضویت / ورود", callback_data="check_join_btn")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # ==========================================
 # واریز TON
@@ -216,13 +279,15 @@ async def save_data():
             "setting_id": "global_config",
             "all_time_users": list(all_time_users),
             "banned_users": list(banned_users),
+            "required_channels": required_channels,
             "bot_active": bot_active,
             "auto_payout_enabled": auto_payout_enabled,
             "min_withdraw_amount": min_withdraw_amount,
             "max_withdraw_amount": max_withdraw_amount,
             "referral_reward": referral_reward,
             "max_referrals": max_referrals,
-            "ton_gas_fee": ton_gas_fee
+            "ton_gas_fee": ton_gas_fee,
+            "tracker_message_id": tracker_message_id
         }
         await settings_col.update_one({"setting_id": "global_config"}, {"$set": settings_doc}, upsert=True)
 
@@ -230,12 +295,13 @@ async def save_data():
         logging.error(f"Error saving data to MongoDB: {e}")
 
 async def load_data():
-    global active_giveaways, user_data, all_time_users, banned_users, bot_active, auto_payout_enabled, min_withdraw_amount, max_withdraw_amount, referral_reward, max_referrals, ton_gas_fee
+    global active_giveaways, user_data, all_time_users, banned_users, required_channels, bot_active, auto_payout_enabled, min_withdraw_amount, max_withdraw_amount, referral_reward, max_referrals, ton_gas_fee, tracker_message_id
     try:
         settings_doc = await settings_col.find_one({"setting_id": "global_config"})
         if settings_doc:
             all_time_users = set(settings_doc.get("all_time_users", []))
             banned_users = set(settings_doc.get("banned_users", []))
+            required_channels = settings_doc.get("required_channels", ["@Voidchanneloffical"])
             bot_active = settings_doc.get("bot_active", True)
             auto_payout_enabled = settings_doc.get("auto_payout_enabled", False)
             min_withdraw_amount = settings_doc.get("min_withdraw_amount", 0.1)
@@ -243,6 +309,7 @@ async def load_data():
             referral_reward = settings_doc.get("referral_reward", 0.048)
             max_referrals = settings_doc.get("max_referrals", 50)
             ton_gas_fee = settings_doc.get("ton_gas_fee", 0.005)
+            tracker_message_id = settings_doc.get("tracker_message_id", None)
 
         async for user_doc in users_col.find():
             u_id = int(user_doc["user_id"])
@@ -324,6 +391,12 @@ class AdminSetMaxRefForm(StatesGroup):
 class AdminSetGasFeeForm(StatesGroup):
     amount = State()
 
+class AdminAddChannelForm(StatesGroup):
+    channel = State()
+
+class AdminRemoveChannelForm(StatesGroup):
+    channel = State()
+
 # ==========================================
 # توابع کمکی
 # ==========================================
@@ -362,6 +435,7 @@ def get_admin_inline_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🎁 ایجاد قرعه‌کشی جدید", callback_data="admin_new_gw"), InlineKeyboardButton(text="📊 لیست قرعه‌کشی‌ها", callback_data="admin_list_gw")],
+            [InlineKeyboardButton(text="➕ افزودن کانال اجباری", callback_data="admin_add_channel"), InlineKeyboardButton(text="➖ حذف کانال اجباری", callback_data="admin_remove_channel")],
             [InlineKeyboardButton(text="👥 جستجوی کاربر", callback_data="admin_search_user"), InlineKeyboardButton(text="➕/➖ تغییر موجودی", callback_data="admin_edit_balance")],
             [InlineKeyboardButton(text="💬 ارسال پیام مستقیم", callback_data="admin_direct_msg")],
             [InlineKeyboardButton(text="🚫 بن کردن کاربر", callback_data="admin_ban_user"), InlineKeyboardButton(text="🟢 آن‌بن کاربر", callback_data="admin_unban_user")],
@@ -375,7 +449,7 @@ def get_admin_inline_keyboard():
     )
 
 # ==========================================
-# پردازش رفرال و آنتی‌فیک (بروزرسانی‌شده با کنترل سقف رفرال)
+# پردازش رفرال و آنتی‌فیک
 # ==========================================
 async def process_referral_logic(user: types.User, args: str, state: FSMContext):
     u_id = user.id
@@ -396,7 +470,6 @@ async def process_referral_logic(user: types.User, args: str, state: FSMContext)
                     ref_prof = get_user_profile(referrer_id)
 
                     if real:
-                        # بررسی رعایت سقف رفرال
                         if ref_prof["referrals_count"] < max_referrals:
                             ref_prof["balance"] = round(ref_prof["balance"] + referral_reward, 4)
                             ref_prof["referrals_count"] += 1
@@ -527,14 +600,14 @@ async def check_join_btn_callback(call: types.CallbackQuery, state: FSMContext):
         await call.message.delete()
         await call.message.answer(
             f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-            f"📌 <b>نسخه ربات:</b> <code>v4.5.1</code> 💎\n\n"
+            f"📌 <b>نسخه ربات:</b> <code>v4.5.2</code> 💎\n\n"
             f"🎁 <b>به ازای هر رفرال واقعی {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
             f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
             parse_mode="HTML",
             reply_markup=get_main_keyboard(u_id)
         )
     else:
-        await call.answer("❌ شما هنوز در کانال عضو نشده‌اید!", show_alert=True)
+        await call.answer("❌ شما هنوز در تمام کانال‌های مشخص شده عضو نشده‌اید!", show_alert=True)
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message, command: CommandObject, state: FSMContext):
@@ -555,9 +628,8 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
     is_subscribed = await check_user_subscription(u_id)
     if not is_subscribed:
         await message.answer(
-            f"⚠️ <b>جهت استفاده از ربات و دریافت پاداش‌ها، ابتدا باید در کانال رسمی ما عضو شوید:</b>\n\n"
-            f"📢 کانال: {REQUIRED_CHANNEL}\n\n"
-            f"پس از عضویت، روی دکمه «✅ بررسی عضویت / ورود» کلیک کنید.",
+            f"⚠️ <b>جهت استفاده از ربات و دریافت پاداش‌ها، ابتدا باید در کانال‌های رسمی ما عضو شوید:</b>\n\n"
+            f"پس از عضویت در تمام کانال‌ها، روی دکمه «✅ بررسی عضویت / ورود» کلیک کنید.",
             parse_mode="HTML",
             reply_markup=get_join_channel_keyboard()
         )
@@ -568,7 +640,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v4.5.1</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v4.5.2</code> 💎\n\n"
         f"🎁 <b>به ازای هر رفرال واقعی {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
         f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
         parse_mode="HTML",
@@ -592,7 +664,7 @@ async def show_wallet(message: types.Message):
 
     is_subscribed = await check_user_subscription(u_id)
     if not is_subscribed:
-        await message.answer("⚠️ <b>برای دسترسی ابتدا باید در کانال عضو شوید:</b>", parse_mode="HTML", reply_markup=get_join_channel_keyboard())
+        await message.answer("⚠️ <b>برای دسترسی ابتدا باید در کانال‌ها عضو شوید:</b>", parse_mode="HTML", reply_markup=get_join_channel_keyboard())
         return
 
     prof = get_user_profile(u_id, message.from_user)
@@ -630,7 +702,7 @@ async def start_withdraw_callback(call: types.CallbackQuery, state: FSMContext):
 
     is_subscribed = await check_user_subscription(u_id)
     if not is_subscribed:
-        await call.answer("❌ ابتدا در کانال عضو شوید!", show_alert=True)
+        await call.answer("❌ ابتدا در تمام کانال‌ها عضو شوید!", show_alert=True)
         return
 
     prof = get_user_profile(u_id, call.from_user)
@@ -882,7 +954,7 @@ async def send_referral_link_menu(message: types.Message):
 
     is_subscribed = await check_user_subscription(u_id)
     if not is_subscribed:
-        await message.answer("⚠️ <b>برای دسترسی ابتدا باید در کانال عضو شوید:</b>", parse_mode="HTML", reply_markup=get_join_channel_keyboard())
+        await message.answer("⚠️ <b>برای دسترسی ابتدا باید در کانال‌ها عضو شوید:</b>", parse_mode="HTML", reply_markup=get_join_channel_keyboard())
         return
 
     prof = get_user_profile(u_id, message.from_user)
@@ -913,7 +985,7 @@ async def show_profile(message: types.Message):
 
     is_subscribed = await check_user_subscription(u_id)
     if not is_subscribed:
-        await message.answer("⚠️ <b>برای دسترسی ابتدا باید در کانال عضو شوید:</b>", parse_mode="HTML", reply_markup=get_join_channel_keyboard())
+        await message.answer("⚠️ <b>برای دسترسی ابتدا باید در کانال‌ها عضو شوید:</b>", parse_mode="HTML", reply_markup=get_join_channel_keyboard())
         return
 
     prof = get_user_profile(u_id, message.from_user)
@@ -941,7 +1013,7 @@ async def show_help(message: types.Message):
 
     is_subscribed = await check_user_subscription(u_id)
     if not is_subscribed:
-        await message.answer("⚠️ <b>برای دسترسی ابتدا باید در کانال عضو شوید:</b>", parse_mode="HTML", reply_markup=get_join_channel_keyboard())
+        await message.answer("⚠️ <b>برای دسترسی ابتدا باید در کانال‌ها عضو شوید:</b>", parse_mode="HTML", reply_markup=get_join_channel_keyboard())
         return
 
     text = (
@@ -974,14 +1046,16 @@ async def open_admin_panel(message: types.Message):
     else:
         wallet_str = f"⚠️ <b>خطا در استعلام:</b> {wallet_addr}"
 
+    ch_list_str = ", ".join(required_channels) if required_channels else "هیچ کانالی تنظیم نشده است."
+
     admin_text = (
-        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.5.1)</b>\n"
+        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.5.2)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💎 <b>موجودی واقعى ولت اصلی ربات:</b> {wallet_str}\n"
+        f"💎 <b>موجودی واقعی ولت اصلی ربات:</b> {wallet_str}\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🤖 <b>وضعیت ربات:</b> {'روشن ✅' if bot_active else 'خاموش/تعمیرات 🛑'}\n"
         f"⚡️ <b>سیستم واریز:</b> {'خودکار اتوماتیک 🚀' if auto_payout_enabled else 'دستی (تایید کانال) 📝'}\n"
-        f"📢 <b>کانال جوین اجباری:</b> {REQUIRED_CHANNEL}\n"
+        f"📢 <b>کانال‌های جوین اجباری ({len(required_channels)}):</b> {ch_list_str}\n"
         f"👥 <b>کاربران فعال فعلی:</b> <code>{total_users}</code> نفر\n"
         f"📜 <b>کل کاربران تاریخی:</b> <code>{total_all_time}</code> نفر\n"
         f"🚫 <b>کاربران بن شده:</b> <code>{banned_count}</code> نفر\n"
@@ -997,6 +1071,75 @@ async def open_admin_panel(message: types.Message):
     )
     
     await message.answer(admin_text, parse_mode="HTML", reply_markup=get_admin_inline_keyboard())
+
+# --- افزودن و حذف کانال جوین اجباری ---
+@dp.callback_query(F.data == "admin_add_channel")
+async def start_add_channel(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminAddChannelForm.channel)
+    await call.message.edit_text("➕ <b>یوزرنیم کانال جدید جهت اضافه کردن به جوین اجباری را بفرستید (مثال: @mychannel):</b>", parse_mode="HTML")
+
+@dp.message(AdminAddChannelForm.channel)
+async def process_add_channel(message: types.Message, state: FSMContext):
+    raw_channel = message.text.strip()
+    if "t.me/" in raw_channel:
+        raw_channel = raw_channel.split("t.me/")[-1].replace("/", "")
+    channel_id = raw_channel if raw_channel.startswith("@") else "@" + raw_channel
+
+    try:
+        chat = await bot.get_chat(channel_id)
+        member = await bot.get_chat_member(chat_id=chat.id, user_id=bot.id)
+        if member.status not in ["administrator", "creator"]:
+            await message.answer("❌ ربات در این کانال ادمین نیست! ابتدا ربات را ادمین کانال کنید.")
+            return
+    except Exception:
+        await message.answer("❌ کانال یافت نشد یا ربات دسترسی ندارد!")
+        return
+
+    if channel_id in required_channels:
+        await message.answer("⚠️ این کانال قبلاً در لیست موجود می‌باشد.")
+        await state.clear()
+        return
+
+    required_channels.append(channel_id)
+    await save_data()
+    await state.clear()
+    await message.answer(f"✅ کانال <code>{channel_id}</code> با موفقیت به قفل جوین اجباری اضافه شد!", parse_mode="HTML")
+
+@dp.callback_query(F.data == "admin_remove_channel")
+async def start_remove_channel(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+    
+    if not required_channels:
+        await call.message.edit_text("⚠️ هیچ کانالی در لیست وجود ندارد.")
+        return
+
+    buttons = []
+    for ch in required_channels:
+        buttons.append([InlineKeyboardButton(text=f"❌ حذف {ch}", callback_data=f"remove_ch_{ch}")])
+    buttons.append([InlineKeyboardButton(text="🔙 بازگشت به پنل", callback_data="admin_stats")])
+    
+    await call.message.edit_text("➖ <b>جهت حذف کانال روی گزینه مورد نظر کلیک کنید:</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@dp.callback_query(F.data.startswith("remove_ch_"))
+async def process_remove_channel_callback(call: types.CallbackQuery):
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+
+    ch_to_remove = call.data.replace("remove_ch_", "")
+    if ch_to_remove in required_channels:
+        required_channels.remove(ch_to_remove)
+        await save_data()
+        await call.answer(f"✅ کانال {ch_to_remove} حذف شد!", show_alert=True)
+    else:
+        await call.answer("⚠️ کانال در لیست یافت نشد.", show_alert=True)
+    
+    await open_admin_panel(call.message)
 
 @dp.callback_query(F.data == "admin_toggle_bot")
 async def toggle_bot_callback(call: types.CallbackQuery):
@@ -1705,6 +1848,7 @@ async def main():
             asyncio.create_task(run_giveaway_timer(gw["channel"], msg_id))
 
     keep_alive()
+    asyncio.create_task(wallet_balance_tracker_loop())
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
