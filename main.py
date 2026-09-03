@@ -1,5 +1,5 @@
 # ==========================================
-# Void Giveaway Bot - Version 4.5.2 (Updated Release)
+# Void Giveaway Bot - Version 4.5.3 (Updated Release)
 # (Multi-Channel Forced Join, Live Wallet Tracker, Direct Admin DM, Ban System, MongoDB Integrated)
 # ==========================================
 
@@ -31,7 +31,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v4.5.2) is running smoothly!"
+    return "⚡ Void Giveaway Bot (v4.5.3) is running smoothly!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -45,7 +45,7 @@ def keep_alive():
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = [6879499219]
 WITHDRAW_CHANNEL = "@voidwithraw"
-WALLET_TRACKER_CHANNEL = -1004396011153  # کانال جدید جهت ارسال و بروزرسانی خودکار موجودی ولت سیستم
+WALLET_TRACKER_CHANNEL = "@Voidchanneloffical"  # اصلاح‌شده: استفاده مستقیم از آیدی کانال مورد نظر جهت ارسال و بروزرسانی خودکار موجودی ولت
 TON_MNEMONIC = os.environ.get("TON_MNEMONIC")
 
 # تنظیمات اتصال به MongoDB
@@ -388,7 +388,7 @@ async def load_data():
                 "prize": gw_doc["prize"],
                 "winners_count": gw_doc["winners_count"],
                 "participants": participants,
-                "end_time": datetime.fromisoformat(gw_doc["end_time"]),
+                "end_time": datetime.fromisoformat(gw_doc["end_index"] if "end_index" in gw_doc else gw_doc["end_time"]),
                 "ended": gw_doc["ended"]
             }
     except Exception as e:
@@ -652,7 +652,7 @@ async def check_join_btn_callback(call: types.CallbackQuery, state: FSMContext):
         await call.message.delete()
         await call.message.answer(
             f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-            f"📌 <b>نسخه ربات:</b> <code>v4.5.2</code> 💎\n\n"
+            f"📌 <b>نسخه ربات:</b> <code>v4.5.3</code> 💎\n\n"
             f"🎁 <b>به ازای هر رفرال واقعی {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
             f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
             parse_mode="HTML",
@@ -692,7 +692,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v4.5.2</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v4.5.3</code> 💎\n\n"
         f"🎁 <b>به ازای هر رفرال واقعی {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
         f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
         parse_mode="HTML",
@@ -1101,7 +1101,7 @@ async def open_admin_panel(message: types.Message):
     ch_list_str = ", ".join(required_channels) if required_channels else "هیچ کانالی تنظیم نشده است."
 
     admin_text = (
-        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.5.2)</b>\n"
+        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.5.3)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💎 <b>موجودی واقعی ولت اصلی ربات:</b> {wallet_str}\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1763,6 +1763,14 @@ async def list_giveaways_callback(call: types.CallbackQuery):
     if not is_admin(call.from_user.id):
         return
 
+    ...
+
+@dp.callback_query(F.data == "admin_list_gw")
+async def list_giveaways_callback(call: types.CallbackQuery):
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+
     if not active_giveaways:
         await call.message.edit_text("📋 <b>هیچ قرعه‌کشی در دیتابیس ثبت نشده است.</b>", parse_mode="HTML")
         return
@@ -1792,12 +1800,12 @@ async def main():
     for msg_id, gw in active_giveaways.items():
         if not gw["ended"]:
             rem = (gw["end_time"] - now).total_seconds()
-            if rem > 0:
+            if rem > 2:
                 asyncio.create_task(schedule_giveaway_end(msg_id, int(rem)))
             else:
                 asyncio.create_task(finish_giveaway(msg_id))
 
-    logging.info("⚡ Void Giveaway Bot (v4.5.2) started successfully!")
+    logging.info("⚡ Void Giveaway Bot (v4.5.3) started successfully!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
