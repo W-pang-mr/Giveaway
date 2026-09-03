@@ -1,6 +1,6 @@
 # ==========================================
-# Void Giveaway Bot - Version 4.4.0
-# (Referral Only, Forced Join Channel, Bot On/Off Switch, Auto/Manual Payouts + MongoDB Integrated)
+# Void Giveaway Bot - Version 4.5.0
+# (Referral + Anti-Fake System, Direct Admin DM, Ban System, Forced Join Channel, MongoDB Integrated)
 # ==========================================
 
 import asyncio
@@ -31,7 +31,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v4.4.0) is running!"
+    return "⚡ Void Giveaway Bot (v4.5.0) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -63,12 +63,41 @@ dp = Dispatcher(storage=MemoryStorage())
 active_giveaways = {}
 user_data = {}
 all_time_users = set()  # برای جلوگیری از باگ رفرال فیک
+banned_users = set()    # لیست کاربران بن شده
 bot_active = True        # وضعیت روشن/خاموش بودن ربات
-auto_payout_enabled = False # حالت واریز خودکار (غیرفعال = دستی از کانال)
+auto_payout_enabled = False # حالت واریز خودکار
 min_withdraw_amount = 0.1  # حداقل کفی برداشت TON
 max_withdraw_amount = 10.0 # حداکثر سقف برداشت TON
 referral_reward = 0.048    # پاداش هر رفرال
 ton_gas_fee = 0.005        # مقدار گس‌فی شبکه TON
+
+# ==========================================
+# تابع بررسی رفرال واقعی (عکس، بیو، یوزرنیم، اسم)
+# ==========================================
+async def is_real_user(user: types.User) -> bool:
+    """
+    بررسی معتبر بودن کاربر برای جلوگیری از رفرال فیک.
+    شرایط: داشتن عکس پروفایل، بیوگرافی، یوزرنیم و نام.
+    """
+    try:
+        # ۱. بررسی داشتن یوزرنیم و نام
+        if not user.username or not user.first_name:
+            return False
+
+        # ۲. بررسی عکس پروفایل
+        photos = await bot.get_user_profile_photos(user.id, limit=1)
+        if photos.total_count == 0:
+            return False
+
+        # ۳. بررسی داشتن بیوگرافی
+        chat = await bot.get_chat(user.id)
+        if not chat.bio or chat.bio.strip() == "":
+            return False
+
+        return True
+    except Exception as e:
+        logging.error(f"Anti-Fake Validation Error: {e}")
+        return False
 
 # ==========================================
 # تابع بررسی جوین اجباری کانال
@@ -169,6 +198,7 @@ async def save_data():
         settings_doc = {
             "setting_id": "global_config",
             "all_time_users": list(all_time_users),
+            "banned_users": list(banned_users),
             "bot_active": bot_active,
             "auto_payout_enabled": auto_payout_enabled,
             "min_withdraw_amount": min_withdraw_amount,
@@ -182,12 +212,13 @@ async def save_data():
         logging.error(f"Error saving data to MongoDB: {e}")
 
 async def load_data():
-    global active_giveaways, user_data, all_time_users, bot_active, auto_payout_enabled, min_withdraw_amount, max_withdraw_amount, referral_reward, ton_gas_fee
+    global active_giveaways, user_data, all_time_users, banned_users, bot_active, auto_payout_enabled, min_withdraw_amount, max_withdraw_amount, referral_reward, ton_gas_fee
     try:
         # ۱. بازیابی تنظیمات
         settings_doc = await settings_col.find_one({"setting_id": "global_config"})
         if settings_doc:
             all_time_users = set(settings_doc.get("all_time_users", []))
+            banned_users = set(settings_doc.get("banned_users", []))
             bot_active = settings_doc.get("bot_active", True)
             auto_payout_enabled = settings_doc.get("auto_payout_enabled", False)
             min_withdraw_amount = settings_doc.get("min_withdraw_amount", 0.1)
@@ -252,6 +283,16 @@ class AdminManageUserForm(StatesGroup):
 class AdminSearchUserForm(StatesGroup):
     user_id = State()
 
+class AdminBanUserForm(StatesGroup):
+    user_id = State()
+
+class AdminUnbanUserForm(StatesGroup):
+    user_id = State()
+
+class AdminDirectMessageForm(StatesGroup):
+    user_id = State()
+    message = State()
+
 class AdminSetMinWithdrawForm(StatesGroup):
     amount = State()
 
@@ -269,6 +310,9 @@ class AdminSetGasFeeForm(StatesGroup):
 # ==========================================
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+def is_banned(user_id: int) -> bool:
+    return user_id in banned_users
 
 def get_user_profile(user_id: int, user_obj: types.User = None):
     if user_id not in user_data:
@@ -299,7 +343,9 @@ def get_admin_inline_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🎁 ایجاد قرعه‌کشی جدید", callback_data="admin_new_gw"), InlineKeyboardButton(text="📊 لیست قرعه‌کشی‌ها", callback_data="admin_list_gw")],
-            [InlineKeyboardButton(text="👥 مدیریت و جستجوی کاربر", callback_data="admin_search_user"), InlineKeyboardButton(text="➕/➖ تغییر موجودی", callback_data="admin_edit_balance")],
+            [InlineKeyboardButton(text="👥 جستجوی کاربر", callback_data="admin_search_user"), InlineKeyboardButton(text="➕/➖ تغییر موجودی", callback_data="admin_edit_balance")],
+            [InlineKeyboardButton(text="💬 ارسال پیام مستقیم", callback_data="admin_direct_msg")],
+            [InlineKeyboardButton(text="🚫 بن کردن کاربر", callback_data="admin_ban_user"), InlineKeyboardButton(text="🟢 آن‌بن کاربر", callback_data="admin_unban_user")],
             [InlineKeyboardButton(text="⚙️ حداقل برداشت", callback_data="admin_set_min_wd"), InlineKeyboardButton(text="🔝 حداکثر برداشت", callback_data="admin_set_max_wd")],
             [InlineKeyboardButton(text="💎 تنظیم پاداش رفرال", callback_data="admin_set_ref_reward"), InlineKeyboardButton(text="⛽️ تنظیم گس‌فی شبکه", callback_data="admin_set_gas_fee")],
             [InlineKeyboardButton(text=auto_btn, callback_data="admin_toggle_auto_payout")],
@@ -309,7 +355,7 @@ def get_admin_inline_keyboard():
     )
 
 # ==========================================
-# پردازش اختصاصی منطق ثبت رفرال
+# پردازش اختصاصی منطق ثبت رفرال + آنتی-فیک
 # ==========================================
 async def process_referral_logic(user: types.User, args: str, state: FSMContext):
     u_id = user.id
@@ -320,31 +366,46 @@ async def process_referral_logic(user: types.User, args: str, state: FSMContext)
         all_time_users.add(u_id)
 
     if args and is_new_user:
+        # بررسی واقعی بودن کاربر
+        real = await is_real_user(user)
+
         # ۱. رفرال مستقیم ربات
         if args.startswith("ref_"):
             try:
                 referrer_id = int(args.replace("ref_", ""))
                 if referrer_id != u_id and referrer_id in user_data:
                     prof["referred_by"] = referrer_id
-                    ref_prof = get_user_profile(referrer_id)
-                    ref_prof["balance"] = round(ref_prof["balance"] + referral_reward, 4)
-                    ref_prof["referrals_count"] += 1
                     
-                    await users_col.update_one(
-                        {"user_id": referrer_id},
-                        {"$set": user_data[referrer_id]},
-                        upsert=True
-                    )
-
-                    try:
-                        await bot.send_message(
-                            referrer_id,
-                            f"🎉 <b>یک کاربر جدید با لینک شما وارد ربات شد!</b>\n"
-                            f"💎 <b>+{referral_reward} TON</b> مستقیماً به ولت شما اضافه شد!",
-                            parse_mode="HTML"
+                    if real:
+                        ref_prof = get_user_profile(referrer_id)
+                        ref_prof["balance"] = round(ref_prof["balance"] + referral_reward, 4)
+                        ref_prof["referrals_count"] += 1
+                        
+                        await users_col.update_one(
+                            {"user_id": referrer_id},
+                            {"$set": user_data[referrer_id]},
+                            upsert=True
                         )
-                    except Exception:
-                        pass
+
+                        try:
+                            await bot.send_message(
+                                referrer_id,
+                                f"🎉 <b>یک کاربر واقعی جدید با لینک شما وارد ربات شد!</b>\n"
+                                f"💎 <b>+{referral_reward} TON</b> مستقیماً به ولت شما اضافه شد!",
+                                parse_mode="HTML"
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            await bot.send_message(
+                                referrer_id,
+                                f"⚠️ <b>یک کاربر با لینک شما وارد شد اما پاداش تعلق نگرفت!</b>\n"
+                                f"علت: کاربر فیک است (فاقد عکس پروفایل، بیوگرافی، یوزرنیم یا نام معتبر).",
+                                parse_mode="HTML"
+                            )
+                        except Exception:
+                            pass
             except Exception as e:
                 logging.error(f"Direct Referral Error: {e}")
 
@@ -366,25 +427,37 @@ async def process_referral_logic(user: types.User, args: str, state: FSMContext)
                         }
                         if referrer_id in gw["participants"] and referrer_id != user.id:
                             prof["referred_by"] = referrer_id
-                            gw["participants"][referrer_id]["referrals"] += 1
-                            ref_prof = get_user_profile(referrer_id)
-                            ref_prof["balance"] = round(ref_prof["balance"] + referral_reward, 4)
-                            ref_prof["referrals_count"] += 1
                             
-                            await users_col.update_one(
-                                {"user_id": referrer_id},
-                                {"$set": user_data[referrer_id]},
-                                upsert=True
-                            )
-                            try:
-                                await bot.send_message(
-                                    referrer_id,
-                                    f"🔥 <b>یک نفر با لینکت وارد قرعه‌کشی {gw['title']} شد!</b>\n"
-                                    f"🎉 <b>+۱ شانس اضافه</b> + <b>+{referral_reward} TON</b> به ولت شما اضافه شد!",
-                                    parse_mode="HTML"
+                            if real:
+                                gw["participants"][referrer_id]["referrals"] += 1
+                                ref_prof = get_user_profile(referrer_id)
+                                ref_prof["balance"] = round(ref_prof["balance"] + referral_reward, 4)
+                                ref_prof["referrals_count"] += 1
+                                
+                                await users_col.update_one(
+                                    {"user_id": referrer_id},
+                                    {"$set": user_data[referrer_id]},
+                                    upsert=True
                                 )
-                            except Exception:
-                                pass
+                                try:
+                                    await bot.send_message(
+                                        referrer_id,
+                                        f"🔥 <b>یک کاربر واقعی با لینکت وارد قرعه‌کشی {gw['title']} شد!</b>\n"
+                                        f"🎉 <b>+۱ شانس اضافه</b> + <b>+{referral_reward} TON</b> به ولت شما اضافه شد!",
+                                        parse_mode="HTML"
+                                    )
+                                except Exception:
+                                    pass
+                            else:
+                                try:
+                                    await bot.send_message(
+                                        referrer_id,
+                                        f"⚠️ <b>یک کاربر با لینک شما وارد قرعه‌کشی شد اما اکانت فیک شناسایی شد!</b>\n"
+                                        f"شانس اضافه و پاداش TON محاسبه نگردید.",
+                                        parse_mode="HTML"
+                                    )
+                                except Exception:
+                                    pass
 
                         await update_post_text(gw["channel"], msg_id)
             except Exception as e:
@@ -398,6 +471,11 @@ async def process_referral_logic(user: types.User, args: str, state: FSMContext)
 @dp.callback_query(F.data == "check_join_btn")
 async def check_join_btn_callback(call: types.CallbackQuery, state: FSMContext):
     u_id = call.from_user.id
+    
+    if is_banned(u_id):
+        await call.answer("🚫 حساب شما از استفاده از ربات مسدود شده است.", show_alert=True)
+        return
+
     if not bot_active and not is_admin(u_id):
         await call.answer("🛑 ربات در حال حاضر جهت به‌روزرسانی موقتاً خاموش می‌باشد.", show_alert=True)
         return
@@ -415,8 +493,8 @@ async def check_join_btn_callback(call: types.CallbackQuery, state: FSMContext):
         await call.message.delete()
         await call.message.answer(
             f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-            f"📌 <b>نسخه ربات:</b> <code>v4.4.0</code> 💎\n\n"
-            f"🎁 <b>به ازای هر رفرال معتبر {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
+            f"📌 <b>نسخه ربات:</b> <code>v4.5.0</code> 💎\n\n"
+            f"🎁 <b>به ازای هر رفرال واقعی {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
             f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
             parse_mode="HTML",
             reply_markup=get_main_keyboard(u_id)
@@ -430,6 +508,10 @@ async def check_join_btn_callback(call: types.CallbackQuery, state: FSMContext):
 @dp.message(CommandStart())
 async def start_handler(message: types.Message, command: CommandObject, state: FSMContext):
     u_id = message.from_user.id
+
+    if is_banned(u_id):
+        await message.answer("🚫 <b>حساب کاربری شما مسدود می‌باشد.</b>", parse_mode="HTML")
+        return
 
     if not bot_active and not is_admin(u_id):
         await message.answer("🛑 <b>ربات در حال حاضر جهت به‌روزرسانی موقتاً خاموش می‌باشد.</b>", parse_mode="HTML")
@@ -456,8 +538,8 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v4.4.0</code> 💎\n\n"
-        f"🎁 <b>به ازای هر رفرال معتبر {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v4.5.0</code> 💎\n\n"
+        f"🎁 <b>به ازای هر رفرال واقعی {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
         f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
@@ -469,6 +551,10 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 @dp.message(F.text == "💎 کیف‌پول من (Wallet)")
 async def show_wallet(message: types.Message):
     u_id = message.from_user.id
+
+    if is_banned(u_id):
+        await message.answer("🚫 <b>حساب کاربری شما مسدود می‌باشد.</b>", parse_mode="HTML")
+        return
 
     if not bot_active and not is_admin(u_id):
         await message.answer("🛑 <b>ربات در حال حاضر جهت به‌روزرسانی موقتاً خاموش می‌باشد.</b>", parse_mode="HTML")
@@ -504,6 +590,10 @@ async def start_withdraw_callback(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
     u_id = call.from_user.id
 
+    if is_banned(u_id):
+        await call.answer("🚫 حساب شما مسدود می‌باشد.", show_alert=True)
+        return
+
     if not bot_active and not is_admin(u_id):
         await call.answer("🛑 ربات خاموش می‌باشد.", show_alert=True)
         return
@@ -534,6 +624,9 @@ async def start_withdraw_callback(call: types.CallbackQuery, state: FSMContext):
 @dp.message(WithdrawForm.amount)
 async def process_withdraw_amount(message: types.Message, state: FSMContext):
     u_id = message.from_user.id
+    if is_banned(u_id):
+        return
+
     prof = get_user_profile(u_id, message.from_user)
     
     try:
@@ -580,6 +673,10 @@ async def process_withdraw_amount(message: types.Message, state: FSMContext):
 
 @dp.message(WithdrawForm.wallet_address)
 async def process_withdraw_address(message: types.Message, state: FSMContext):
+    u_id = message.from_user.id
+    if is_banned(u_id):
+        return
+
     wallet_addr = message.text.strip()
     data = await state.get_data()
     
@@ -627,7 +724,6 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
                 reply_markup=get_main_keyboard(user.id)
             )
         else:
-            # در صورت بروز خطای فنی شبکه، مبلغ به حساب برمی‌گردد
             prof["balance"] = round(prof["balance"] + deduct_from_balance, 4)
             await save_data()
             await message.answer(
@@ -729,10 +825,9 @@ async def reject_withdraw(call: types.CallbackQuery):
     parts = call.data.split("_")
     target_user_id = int(parts[2])
 
-    # توجه: مبلغ به ولت بازنمی‌گردد و سوخت می‌شود.
     updated_text = call.message.text + "\n\n❌ <b>وضعیت: رد شد (به علت ثبت رفرال فیک)</b>"
     await call.message.edit_text(updated_text, parse_mode="HTML", reply_markup=None)
-    await call.answer("❌ درخواست رد شد و پیام فیک زدید برای کاربر ارسال گشت.", show_alert=True)
+    await call.answer("❌ درخواست رد شد.", show_alert=True)
 
     try:
         await bot.send_message(
@@ -749,6 +844,10 @@ async def reject_withdraw(call: types.CallbackQuery):
 @dp.message(F.text == "🔗 دریافت لینک رفرال 🚀")
 async def send_referral_link_menu(message: types.Message):
     u_id = message.from_user.id
+
+    if is_banned(u_id):
+        await message.answer("🚫 <b>حساب کاربری شما مسدود می‌باشد.</b>", parse_mode="HTML")
+        return
 
     if not bot_active and not is_admin(u_id):
         await message.answer("🛑 <b>ربات در حال حاضر جهت به‌روزرسانی موقتاً خاموش می‌باشد.</b>", parse_mode="HTML")
@@ -767,15 +866,19 @@ async def send_referral_link_menu(message: types.Message):
     text = (
         f"🚀 <b>لینک دعوت اختصاصی شما:</b>\n\n"
         f"🔗 <code>{general_ref_link}</code>\n\n"
-        f"💎 <b>پاداش دعوت:</b> به ازای هر کاربر جدید <b>{referral_reward} TON</b>\n"
+        f"💎 <b>پاداش دعوت:</b> به ازای هر کاربر واقعی <b>{referral_reward} TON</b>\n"
         f"👥 <b>مجموع دعوت‌های معتبر شما:</b> {prof['referrals_count']} نفر\n\n"
-        f"📌 لینک را برای دوستان خود بفرستید تا بلافاصله تونکوین کسب کنید!"
+        f"⚠️ <i>توجه: کاربران حتما باید دارای عکس پروفایل، یوزرنیم، نام و بیوگرافی باشند تا رفرال واقعی محاسبه شوند.</i>"
     )
     await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
 
 @dp.message(F.text == "👤 پروفایل من")
 async def show_profile(message: types.Message):
     u_id = message.from_user.id
+
+    if is_banned(u_id):
+        await message.answer("🚫 <b>حساب کاربری شما مسدود می‌باشد.</b>", parse_mode="HTML")
+        return
 
     if not bot_active and not is_admin(u_id):
         await message.answer("🛑 <b>ربات در حال حاضر جهت به‌روزرسانی موقتاً خاموش می‌باشد.</b>", parse_mode="HTML")
@@ -801,6 +904,10 @@ async def show_profile(message: types.Message):
 async def show_help(message: types.Message):
     u_id = message.from_user.id
 
+    if is_banned(u_id):
+        await message.answer("🚫 <b>حساب کاربری شما مسدود می‌باشد.</b>", parse_mode="HTML")
+        return
+
     if not bot_active and not is_admin(u_id):
         await message.answer("🛑 <b>ربات در حال حاضر جهت به‌روزرسانی موقتاً خاموش می‌باشد.</b>", parse_mode="HTML")
         return
@@ -812,10 +919,10 @@ async def show_help(message: types.Message):
 
     text = (
         f"ℹ️ <b>راهنمای ربات Void Giveaway:</b>\n\n"
-        f"1️⃣ با دعوت هر کاربر جدید از طریق لینک رفرال خود <b>{referral_reward} TON</b> پاداش دریافت می‌کنید.\n"
-        f"2️⃣ پاداش‌ها مستقیماً وارد «کیف‌پول من» می‌شوند.\n"
-        f"3️⃣ پس از رسیدن به حداقل کف برداشت (<code>{min_withdraw_amount} TON</code>) می‌توانید درخواست واریز ثبت کنید.\n"
-        f"4️⃣ همچنین می‌توانید در قرعه‌کشی‌های کانال شرکت کنید."
+        f"1️⃣ با دعوت هر کاربر جدید و واقعی از طریق لینک رفرال خود <b>{referral_reward} TON</b> پاداش دریافت می‌کنید.\n"
+        f"2️⃣ کاربر جدید جهت تایید رفرال واقعی حتماً باید عکس، بیوگرافی، یوزرنیم و اسم داشته باشد.\n"
+        f"3️⃣ پاداش‌ها مستقیماً وارد «کیف‌پول من» می‌شوند.\n"
+        f"4️⃣ پس از رسیدن به حداقل کف برداشت (<code>{min_withdraw_amount} TON</code>) می‌توانید درخواست واریز ثبت کنید."
     )
     await message.answer(text, parse_mode="HTML")
 
@@ -829,17 +936,19 @@ async def open_admin_panel(message: types.Message):
     
     total_users = len(user_data)
     total_all_time = len(all_time_users)
+    banned_count = len(banned_users)
     active_gw = sum(1 for gw in active_giveaways.values() if not gw["ended"])
     total_balance = sum(u.get("balance", 0.0) for u in user_data.values())
     
     admin_text = (
-        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.4.0)</b>\n"
+        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.5.0)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🤖 <b>وضعیت ربات:</b> {'روشن ✅' if bot_active else 'خاموش/تعمیرات 🛑'}\n"
         f"⚡️ <b>سیستم واریز:</b> {'خودکار اتوماتیک 🚀' if auto_payout_enabled else 'دستی (تایید کانال) 📝'}\n"
         f"📢 <b>کانال جوین اجباری:</b> {REQUIRED_CHANNEL}\n"
         f"👥 <b>کاربران فعال فعلی:</b> <code>{total_users}</code> نفر\n"
         f"📜 <b>کل کاربران تاریخی:</b> <code>{total_all_time}</code> نفر\n"
+        f"🚫 <b>کاربران بن شده:</b> <code>{banned_count}</code> نفر\n"
         f"💎 <b>مجموع موجودی ولت کاربران:</b> <code>{total_balance:.4f} TON</code>\n"
         f"🎁 <b>پاداش هر رفرال:</b> <code>{referral_reward} TON</code>\n"
         f"⛽️ <b>گس‌فی شبکه TON:</b> <code>{ton_gas_fee} TON</code>\n"
@@ -885,6 +994,88 @@ async def show_stats_callback(call: types.CallbackQuery):
         return
     await open_admin_panel(call.message)
 
+# --- سیستم بن و آن‌بن کاربر ---
+@dp.callback_query(F.data == "admin_ban_user")
+async def start_ban_user(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminBanUserForm.user_id)
+    await call.message.edit_text("🚫 <b>آیدی عددی (User ID) کاربر جهت بن کردن را وارد کنید:</b>", parse_mode="HTML")
+
+@dp.message(AdminBanUserForm.user_id)
+async def process_ban_user(message: types.Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("⚠️ لطفاً آیدی عددی معتبر وارد کنید!")
+        return
+
+    target_id = int(message.text)
+    await state.clear()
+
+    if target_id in ADMIN_IDS:
+        await message.answer("❌ امکان بن کردن ادمین وجود ندارد!")
+        return
+
+    banned_users.add(target_id)
+    await save_data()
+    await message.answer(f"✅ کاربر <code>{target_id}</code> با موفقیت بن شد!", parse_mode="HTML")
+
+@dp.callback_query(F.data == "admin_unban_user")
+async def start_unban_user(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminUnbanUserForm.user_id)
+    await call.message.edit_text("🟢 <b>آیدی عددی (User ID) کاربر جهت آن‌بن کردن را وارد کنید:</b>", parse_mode="HTML")
+
+@dp.message(AdminUnbanUserForm.user_id)
+async def process_unban_user(message: types.Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("⚠️ لطفاً آیدی عددی معتبر وارد کنید!")
+        return
+
+    target_id = int(message.text)
+    await state.clear()
+
+    if target_id in banned_users:
+        banned_users.remove(target_id)
+        await save_data()
+        await message.answer(f"✅ کاربر <code>{target_id}</code> آن‌بن شد!", parse_mode="HTML")
+    else:
+        await message.answer("⚠️ این کاربر در لیست بن شده‌ها قرار ندارد.")
+
+# --- ارسال پیام مستقیم از پنل ادمین ---
+@dp.callback_query(F.data == "admin_direct_msg")
+async def start_direct_message(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminDirectMessageForm.user_id)
+    await call.message.edit_text("💬 <b>آیدی عددی (User ID) کاربر مورد نظر را بفرستید:</b>", parse_mode="HTML")
+
+@dp.message(AdminDirectMessageForm.user_id)
+async def process_direct_msg_user(message: types.Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("⚠️ لطفاً آیدی عددی معتبر وارد کنید!")
+        return
+
+    target_id = int(message.text)
+    await state.update_data(target_u_id=target_id)
+    await state.set_state(AdminDirectMessageForm.message)
+    await message.answer(f"📝 <b>پیام خود را جهت ارسال به کاربر <code>{target_id}</code> وارد کنید:</b>", parse_mode="HTML")
+
+@dp.message(AdminDirectMessageForm.message)
+async def process_direct_msg_send(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    target_id = data.get("target_u_id")
+    await state.clear()
+
+    try:
+        await message.copy_to(chat_id=target_id)
+        await message.answer(f"✅ <b>پیام شما با موفقیت برای کاربر <code>{target_id}</code> ارسال شد!</b>", parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"❌ <b>خطا در ارسال پیام:</b> {e}", parse_mode="HTML")
+
 # --- مدیریت و جستجوی کاربران و رفرال‌های آن‌ها ---
 @dp.callback_query(F.data == "admin_search_user")
 async def start_search_user(call: types.CallbackQuery, state: FSMContext):
@@ -908,6 +1099,7 @@ async def process_search_user(message: types.Message, state: FSMContext):
         return
 
     target_prof = user_data[target_id]
+    ban_status = "بله 🚫" if is_banned(target_id) else "خیر 🟢"
     
     referrals_list = []
     for u_id, u_info in user_data.items():
@@ -926,6 +1118,7 @@ async def process_search_user(message: types.Message, state: FSMContext):
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 <b>نام:</b> {html.escape(target_prof.get('first_name', 'User'))}\n"
         f"🆔 <b>یوزرنیم:</b> @{target_prof.get('username', 'ندارد')}\n"
+        f"🚫 <b>وضعیت بن:</b> {ban_status}\n"
         f"💰 <b>موجودی TON:</b> <code>{target_prof.get('balance', 0.0):.4f} TON</code>\n"
         f"👥 <b>تعداد کل رفرال‌ها:</b> <code>{target_prof.get('referrals_count', 0)}</code> نفر\n"
         f"🔗 <b>دعوت‌شده توسط:</b> {ref_by_str}\n"
@@ -1265,6 +1458,10 @@ async def join_giveaway(call: types.CallbackQuery):
     msg_id = call.message.message_id
     user = call.from_user
 
+    if is_banned(user.id):
+        await call.answer("🚫 حساب شما مسدود می‌باشد.", show_alert=True)
+        return
+
     if not bot_active and not is_admin(user.id):
         await call.answer("🛑 ربات در حال حاضر جهت به‌روزرسانی موقتاً خاموش می‌باشد.", show_alert=True)
         return
@@ -1301,6 +1498,10 @@ async def get_referral_link(call: types.CallbackQuery):
     msg_id = call.message.message_id
     user = call.from_user
 
+    if is_banned(user.id):
+        await call.answer("🚫 حساب شما مسدود می‌باشد.", show_alert=True)
+        return
+
     if not bot_active and not is_admin(user.id):
         await call.answer("🛑 ربات در حال حاضر جهت به‌روزرسانی موقتاً خاموش می‌باشد.", show_alert=True)
         return
@@ -1320,7 +1521,7 @@ async def get_referral_link(call: types.CallbackQuery):
                 f"👑 <b>لینک اختصاصی دعوت شما:</b>\n"
                 f"📌 <b>قرعه‌کشی:</b> {gw['title']}\n\n"
                 f"🔗 <code>{ref_link}</code>\n\n"
-                f"✨ با دعوت هر کاربر: <b>+۱ شانس اضافه</b> در قرعه‌کشی + <b>{referral_reward} TON</b> هدیه دریافت می‌کنید!"
+                f"✨ با دعوت هر کاربر واقعی: <b>+۱ شانس اضافه</b> در قرعه‌کشی + <b>{referral_reward} TON</b> هدیه دریافت می‌کنید!"
             ),
             parse_mode="HTML"
         )
