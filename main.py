@@ -131,9 +131,10 @@ async def wallet_balance_tracker_loop():
                     f"⏰ <b>زمان:</b> {now_str}"
                 )
 
+            bot_info = await bot.get_me()
             kb = InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton(text="🚀 استارت ربات و دریافت هدیه", url=f"https://t.me/{(await bot.get_me()).username}")]
+                    [InlineKeyboardButton(text="🚀 استارت ربات و دریافت هدیه", url=f"https://t.me/{bot_info.username}")]
                 ]
             )
 
@@ -162,6 +163,56 @@ async def wallet_balance_tracker_loop():
             logging.error(f"Wallet tracker loop exception: {e}")
 
         await asyncio.sleep(180)  # بروزرسانی هر ۳ دقیقه (۱۸۰ ثانیه)
+
+# ==========================================
+# تابع ارسال گزارش آنی به کانال پس از تغییرات
+# ==========================================
+async def update_wallet_tracker_channel_now():
+    global tracker_message_id
+    try:
+        balance_ton, wallet_addr = await get_system_wallet_balance()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        if balance_ton is not None:
+            text = (
+                f"💎 <b>گزارش لحظه‌ای موجودی ولت اصلی سیستم</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💰 <b>موجودی موجود:</b> <code>{balance_ton:.4f} TON</code> 💎\n"
+                f"💳 <b>آدرس ولت:</b>\n<code>{wallet_addr}</code>\n\n"
+                f"⏰ <b>آخرین بروزرسانی:</b> {now_str}\n"
+                f"🔄 <i>بروزرسانی خودکار انجام شد.</i>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━"
+            )
+        else:
+            text = (
+                f"⚠️ <b>خطا در دریافت موجودی ولت سیستم!</b>\n"
+                f"علت: {wallet_addr}\n\n"
+                f"⏰ <b>زمان:</b> {now_str}"
+            )
+
+        bot_info = await bot.get_me()
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🚀 استارت ربات و دریافت هدیه", url=f"https://t.me/{bot_info.username}")]
+            ]
+        )
+
+        if tracker_message_id is None:
+            try:
+                sent_msg = await bot.send_message(chat_id=WALLET_TRACKER_CHANNEL, text=text, parse_mode="HTML", reply_markup=kb)
+                tracker_message_id = sent_msg.message_id
+                await save_data()
+            except Exception as e:
+                logging.error(f"Error sending immediate tracker msg: {e}")
+        else:
+            try:
+                await bot.edit_message_text(chat_id=WALLET_TRACKER_CHANNEL, message_id=tracker_message_id, text=text, parse_mode="HTML", reply_markup=kb)
+            except TelegramBadRequest:
+                pass
+            except Exception as e:
+                logging.error(f"Error editing immediate tracker msg: {e}")
+    except Exception as e:
+        logging.error(f"Error updating wallet channel immediately: {e}")
 
 # ==========================================
 # تابع بررسی اکانت واقعی
@@ -231,6 +282,7 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
         )
 
         await client.close()
+        asyncio.create_task(update_wallet_tracker_channel_now())
         return True, f"تراکنش انجام شد! (مبلغ: {amount_ton:.4f} TON) 🚀"
 
     except Exception as e:
@@ -1769,6 +1821,16 @@ async def update_post_text(chat_id, message_id):
     except Exception as e:
         logging.error(f"General Edit Error: {e}")
 
+async def run_giveaway_timer(chat_id, message_id):
+    while message_id in active_giveaways and not active_giveaways[message_id]["ended"]:
+        gw = active_giveaways[message_id]
+        now = datetime.now()
+        if now >= gw["end_time"]:
+            await finish_giveaway(chat_id, message_id)
+            break
+        await asyncio.sleep(5)
+        await update_post_text(chat_id, message_id)
+
 async def finish_giveaway(chat_id, message_id):
     if message_id not in active_giveaways or active_giveaways[message_id]["ended"]:
         return
@@ -1796,60 +1858,50 @@ async def finish_giveaway(chat_id, message_id):
             chosen_id = random.choice(pool)
             unique_winners.add(chosen_id)
             
-        winners_list = []
-        for u_id in unique_winners:
-            u_info = participants[u_id]
-            name = f"🏆 @{u_info['username']}" if u_info["username"] else f'🏆 <a href="tg://user?id={u_id}">{html.escape(u_info["first_name"])}</a>'
-            winners_list.append(name)
-        
-        winners_str = "\n".join(winners_list)
+        winner_texts = []
+        for w_id in unique_winners:
+            w_info = participants[w_id]
+            w_name = f"@{w_info['username']}" if w_info["username"] else html.escape(w_info["first_name"])
+            winner_texts.append(f"🏆 {w_name} (ID: <code>{w_id}</code>)")
+
+            try:
+                await bot.send_message(
+                    chat_id=w_id,
+                    text=f"🎉 <b>تبریک! شما برنده قرعه‌کشی «{gw['title']}» شدید!</b>\n🎁 جایزه: {gw['prize']}",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+
         final_text = (
-            f"👑 <b>قرعه‌کشی به پایان رسید!</b> 👑\n\n"
+            f"🏁 <b>قرعه‌کشی به پایان رسید!</b>\n\n"
             f"📌 <b>عنوان:</b> {gw['title']}\n"
             f"🎁 <b>جایزه:</b> {gw['prize']}\n\n"
-            f"🎉 <b>برندگان خوش‌شانس:</b>\n{winners_str}\n"
+            f"👑 <b>برندگان خوش‌شانس:</b>\n" + "\n".join(winner_texts)
         )
-    
+
     try:
         await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=final_text, parse_mode="HTML", reply_markup=None)
     except Exception as e:
-        logging.error(f"Error updating winner message: {e}")
-    
+        logging.error(f"Error updating finished giveaway text: {e}")
+
     await save_data()
 
-async def run_giveaway_timer(chat_id, message_id):
-    while message_id in active_giveaways:
-        gw = active_giveaways[message_id]
-        if gw["ended"]:
-            break
-            
-        remaining = (gw["end_time"] - datetime.now()).total_seconds()
-        if remaining <= 0:
-            await finish_giveaway(chat_id, message_id)
-            break
-        else:
-            await update_post_text(chat_id, message_id)
-            
-        await asyncio.sleep(10)
-
-@dp.callback_query(F.data == "cancel_launch")
-async def cancel_launch(call: types.CallbackQuery, state: FSMContext):
-    await call.answer()
-    await state.clear()
-    await call.message.edit_text("❌ لغو شد.", parse_mode="HTML")
-
 # ==========================================
-# اجرای اصلی برنامه
+# شروع به کار ربات
 # ==========================================
 async def main():
+    keep_alive()
     await load_data()
-    for msg_id, gw in list(active_giveaways.items()):
+    asyncio.create_task(wallet_balance_tracker_loop())
+    
+    # اجرای مجدد تایمر قرعه‌کشی‌های فعال پس از ریستارت
+    for msg_id, gw in active_giveaways.items():
         if not gw["ended"]:
             asyncio.create_task(run_giveaway_timer(gw["channel"], msg_id))
 
-    keep_alive()
-    asyncio.create_task(wallet_balance_tracker_loop())
+    logging.info("Bot started successfully...")
     await dp.start_polling(bot)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())
