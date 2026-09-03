@@ -44,7 +44,7 @@ def keep_alive():
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = [6879499219]
 WITHDRAW_CHANNEL = "@voidwithraw"
-WALLET_TRACKER_CHANNEL = "@voidwithraw"  # کانال ارسال و بروزرسانی خودکار موجودی ولت سیستم
+WALLET_TRACKER_CHANNEL = "@Voidchanneloffical"  # کانال ارسال و بروزرسانی خودکار موجودی ولت سیستم
 TON_MNEMONIC = os.environ.get("TON_MNEMONIC")
 
 # تنظیمات اتصال به MongoDB
