@@ -1,5 +1,5 @@
 # ==========================================
-# Void Giveaway Bot - Version 4.5.3 (Updated Release)
+# Void Giveaway Bot - Version 4.5.4 (Updated Release)
 # (Multi-Channel Forced Join, Live Wallet Tracker, Direct Admin DM, Ban System, MongoDB Integrated)
 # ==========================================
 
@@ -31,7 +31,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v4.5.3) is running smoothly!"
+    return "⚡ Void Giveaway Bot (v4.5.4) is running smoothly!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -45,7 +45,7 @@ def keep_alive():
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = [6879499219]
 WITHDRAW_CHANNEL = "@voidwithraw"
-WALLET_TRACKER_CHANNEL = "@Voidchanneloffical"  # اصلاح‌شده: استفاده مستقیم از آیدی کانال مورد نظر جهت ارسال و بروزرسانی خودکار موجودی ولت
+WALLET_TRACKER_CHANNEL = "@Voidchanneloffical"  
 TON_MNEMONIC = os.environ.get("TON_MNEMONIC")
 
 # تنظیمات اتصال به MongoDB
@@ -64,10 +64,11 @@ active_giveaways = {}
 user_data = {}
 all_time_users = set()
 banned_users = set()
-required_channels = ["@Voidchanneloffical"]  # پشتیبانی از چند کانال جوین اجباری
+required_channels = ["@Voidchanneloffical"]  
 
 bot_active = True
 auto_payout_enabled = False
+show_wallet_to_users = True  # قابلیت جدید: فعال/غیرفعال سازی نمایش موجودی ولت به کاربران
 min_withdraw_amount = 0.1
 max_withdraw_amount = 10.0
 referral_reward = 0.048
@@ -107,7 +108,7 @@ async def get_system_wallet_balance():
 # ==========================================
 async def wallet_balance_tracker_loop():
     global tracker_message_id
-    await asyncio.sleep(5)  # تاخیر اولیه جهت اجرای کامل لود دیتابیس
+    await asyncio.sleep(5)  
     
     while True:
         try:
@@ -162,7 +163,7 @@ async def wallet_balance_tracker_loop():
         except Exception as e:
             logging.error(f"Wallet tracker loop exception: {e}")
 
-        await asyncio.sleep(180)  # بروزرسانی هر ۳ دقیقه (۱۸۰ ثانیه)
+        await asyncio.sleep(180)  
 
 # ==========================================
 # تابع ارسال گزارش آنی به کانال پس از تغییرات
@@ -334,6 +335,7 @@ async def save_data():
             "required_channels": required_channels,
             "bot_active": bot_active,
             "auto_payout_enabled": auto_payout_enabled,
+            "show_wallet_to_users": show_wallet_to_users,
             "min_withdraw_amount": min_withdraw_amount,
             "max_withdraw_amount": max_withdraw_amount,
             "referral_reward": referral_reward,
@@ -347,7 +349,7 @@ async def save_data():
         logging.error(f"Error saving data to MongoDB: {e}")
 
 async def load_data():
-    global active_giveaways, user_data, all_time_users, banned_users, required_channels, bot_active, auto_payout_enabled, min_withdraw_amount, max_withdraw_amount, referral_reward, max_referrals, ton_gas_fee, tracker_message_id
+    global active_giveaways, user_data, all_time_users, banned_users, required_channels, bot_active, auto_payout_enabled, show_wallet_to_users, min_withdraw_amount, max_withdraw_amount, referral_reward, max_referrals, ton_gas_fee, tracker_message_id
     try:
         settings_doc = await settings_col.find_one({"setting_id": "global_config"})
         if settings_doc:
@@ -356,6 +358,7 @@ async def load_data():
             required_channels = settings_doc.get("required_channels", ["@Voidchanneloffical"])
             bot_active = settings_doc.get("bot_active", True)
             auto_payout_enabled = settings_doc.get("auto_payout_enabled", False)
+            show_wallet_to_users = settings_doc.get("show_wallet_to_users", True)
             min_withdraw_amount = settings_doc.get("min_withdraw_amount", 0.1)
             max_withdraw_amount = settings_doc.get("max_withdraw_amount", 10.0)
             referral_reward = settings_doc.get("referral_reward", 0.048)
@@ -484,6 +487,7 @@ def get_main_keyboard(user_id: int):
 def get_admin_inline_keyboard():
     status_btn = "🛑 خاموش کردن ربات" if bot_active else "✅ روشن کردن ربات"
     auto_btn = "⚡️ واریز خودکار: غیرفعال" if not auto_payout_enabled else "⚡️ واریز خودکار: فعال"
+    wallet_btn = "👁‍🗨 نمایش ولت به کاربران: فعال" if show_wallet_to_users else "🔒 نمایش ولت به کاربران: مخفی"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🎁 ایجاد قرعه‌کشی جدید", callback_data="admin_new_gw"), InlineKeyboardButton(text="📊 لیست قرعه‌کشی‌ها", callback_data="admin_list_gw")],
@@ -495,6 +499,7 @@ def get_admin_inline_keyboard():
             [InlineKeyboardButton(text="💎 تنظیم پاداش رفرال", callback_data="admin_set_ref_reward"), InlineKeyboardButton(text="👥 تنظیم سقف رفرال", callback_data="admin_set_max_ref")],
             [InlineKeyboardButton(text="⛽️ تنظیم گس‌فی شبکه", callback_data="admin_set_gas_fee")],
             [InlineKeyboardButton(text=auto_btn, callback_data="admin_toggle_auto_payout")],
+            [InlineKeyboardButton(text=wallet_btn, callback_data="admin_toggle_show_wallet")],
             [InlineKeyboardButton(text=status_btn, callback_data="admin_toggle_bot"), InlineKeyboardButton(text="📢 همه‌فرستی (Broadcast)", callback_data="admin_broadcast")],
             [InlineKeyboardButton(text="🔄 بروزرسانی آمار", callback_data="admin_stats")]
         ]
@@ -652,7 +657,7 @@ async def check_join_btn_callback(call: types.CallbackQuery, state: FSMContext):
         await call.message.delete()
         await call.message.answer(
             f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-            f"📌 <b>نسخه ربات:</b> <code>v4.5.3</code> 💎\n\n"
+            f"📌 <b>نسخه ربات:</b> <code>v4.5.4</code> 💎\n\n"
             f"🎁 <b>به ازای هر رفرال واقعی {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
             f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
             parse_mode="HTML",
@@ -692,7 +697,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v4.5.3</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v4.5.4</code> 💎\n\n"
         f"🎁 <b>به ازای هر رفرال واقعی {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
         f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
         parse_mode="HTML",
@@ -717,6 +722,11 @@ async def show_wallet(message: types.Message):
     is_subscribed = await check_user_subscription(u_id)
     if not is_subscribed:
         await message.answer("⚠️ <b>برای دسترسی ابتدا باید در کانال‌ها عضو شوید:</b>", parse_mode="HTML", reply_markup=get_join_channel_keyboard())
+        return
+
+    # بررسی قابلیت نمایش ولت به کاربران
+    if not show_wallet_to_users and not is_admin(u_id):
+        await message.answer("🔒 <b>بخش کیف‌پول و نمایش موجودی در حال حاضر توسط مدیریت غیرفعال شده است.</b>", parse_mode="HTML")
         return
 
     prof = get_user_profile(u_id, message.from_user)
@@ -750,6 +760,10 @@ async def start_withdraw_callback(call: types.CallbackQuery, state: FSMContext):
 
     if not bot_active and not is_admin(u_id):
         await call.answer("🛑 ربات خاموش می‌باشد.", show_alert=True)
+        return
+
+    if not show_wallet_to_users and not is_admin(u_id):
+        await call.answer("🔒 بخش برداشت موجودی در حال حاضر بسته است.", show_alert=True)
         return
 
     is_subscribed = await check_user_subscription(u_id)
@@ -1041,11 +1055,13 @@ async def show_profile(message: types.Message):
         return
 
     prof = get_user_profile(u_id, message.from_user)
+    wallet_info = f"<code>{prof['balance']:.4f} TON</code>" if (show_wallet_to_users or is_admin(u_id)) else "🔒 <i>مخفی‌شده توسط ادمین</i>"
+    
     text = (
         f"👤 <b>پروفایل کاربری شما:</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🆔 <b>آیدی عددی:</b> <code>{u_id}</code>\n"
-        f"💎 <b>موجودی ولت:</b> <code>{prof['balance']:.4f} TON</code>\n"
+        f"💎 <b>موجودی ولت:</b> {wallet_info}\n"
         f"👥 <b>تعداد رفرال‌ها:</b> {prof['referrals_count']} از {max_referrals} نفر\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
@@ -1101,12 +1117,13 @@ async def open_admin_panel(message: types.Message):
     ch_list_str = ", ".join(required_channels) if required_channels else "هیچ کانالی تنظیم نشده است."
 
     admin_text = (
-        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.5.3)</b>\n"
+        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.5.4)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💎 <b>موجودی واقعی ولت اصلی ربات:</b> {wallet_str}\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🤖 <b>وضعیت ربات:</b> {'روشن ✅' if bot_active else 'خاموش/تعمیرات 🛑'}\n"
         f"⚡️ <b>سیستم واریز:</b> {'خودکار اتوماتیک 🚀' if auto_payout_enabled else 'دستی (تایید کانال) 📝'}\n"
+        f"👁‍🗨 <b>نمایش ولت به کاربران:</b> {'فعال ✅' if show_wallet_to_users else 'غیرفعال 🔒'}\n"
         f"📢 <b>کانال‌های جوین اجباری ({len(required_channels)}):</b> {ch_list_str}\n"
         f"👥 <b>کاربران فعال فعلی:</b> <code>{total_users}</code> نفر\n"
         f"📜 <b>کل کاربران تاریخی:</b> <code>{total_all_time}</code> نفر\n"
@@ -1216,6 +1233,19 @@ async def toggle_auto_payout_callback(call: types.CallbackQuery):
     auto_payout_enabled = not auto_payout_enabled
     await save_data()
     status_msg = "⚡️ واریز خودکار فعال شد." if auto_payout_enabled else "📝 واریز به حالت دستی تغییر یافت."
+    await call.answer(status_msg, show_alert=True)
+    await open_admin_panel(call.message)
+
+@dp.callback_query(F.data == "admin_toggle_show_wallet")
+async def toggle_show_wallet_callback(call: types.CallbackQuery):
+    global show_wallet_to_users
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+    
+    show_wallet_to_users = not show_wallet_to_users
+    await save_data()
+    status_msg = "👁‍🗨 نمایش ولت به کاربران فعال شد." if show_wallet_to_users else "🔒 نمایش ولت به کاربران مخفی شد."
     await call.answer(status_msg, show_alert=True)
     await open_admin_panel(call.message)
 
@@ -1763,14 +1793,6 @@ async def list_giveaways_callback(call: types.CallbackQuery):
     if not is_admin(call.from_user.id):
         return
 
-    ...
-
-@dp.callback_query(F.data == "admin_list_gw")
-async def list_giveaways_callback(call: types.CallbackQuery):
-    await call.answer()
-    if not is_admin(call.from_user.id):
-        return
-
     if not active_giveaways:
         await call.message.edit_text("📋 <b>هیچ قرعه‌کشی در دیتابیس ثبت نشده است.</b>", parse_mode="HTML")
         return
@@ -1792,10 +1814,8 @@ async def main():
     keep_alive()
     await load_data()
     
-    # اجرای بک‌گراند تراکر موجودی ولت
     asyncio.create_task(wallet_balance_tracker_loop())
     
-    # تنظیم جاب برای قرعه‌کشی‌های فعال بازیابی‌شده
     now = datetime.now()
     for msg_id, gw in active_giveaways.items():
         if not gw["ended"]:
@@ -1805,7 +1825,7 @@ async def main():
             else:
                 asyncio.create_task(finish_giveaway(msg_id))
 
-    logging.info("⚡ Void Giveaway Bot (v4.5.3) started successfully!")
+    logging.info("⚡ Void Giveaway Bot (v4.5.4) started successfully!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
