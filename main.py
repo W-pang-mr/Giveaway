@@ -1,5 +1,5 @@
 # ==========================================
-# Void Giveaway Bot - Version 4.5.0
+# Void Giveaway Bot - Version 4.5.1 (Stable Release)
 # (Referral + Anti-Fake System, Direct Admin DM, Ban System, Forced Join Channel, MongoDB Integrated)
 # ==========================================
 
@@ -31,7 +31,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v4.5.0) is running!"
+    return "⚡ Void Giveaway Bot (v4.5.1) is running smoothly!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -45,7 +45,7 @@ def keep_alive():
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = [6879499219]
 WITHDRAW_CHANNEL = "@voidwithraw"
-REQUIRED_CHANNEL = "@Voidchanneloffical"  # کانال جوین اجباری
+REQUIRED_CHANNEL = "@Voidchanneloffical"
 TON_MNEMONIC = os.environ.get("TON_MNEMONIC")
 
 # تنظیمات اتصال به MongoDB
@@ -62,17 +62,17 @@ dp = Dispatcher(storage=MemoryStorage())
 
 active_giveaways = {}
 user_data = {}
-all_time_users = set()  # برای جلوگیری از باگ رفرال فیک
-banned_users = set()    # لیست کاربران بن شده
-bot_active = True        # وضعیت روشن/خاموش بودن ربات
-auto_payout_enabled = False # حالت واریز خودکار
-min_withdraw_amount = 0.1  # حداقل کفی برداشت TON
-max_withdraw_amount = 10.0 # حداکثر سقف برداشت TON
-referral_reward = 0.048    # پاداش هر رفرال
-ton_gas_fee = 0.005        # مقدار گس‌فی شبکه TON
+all_time_users = set()
+banned_users = set()
+bot_active = True
+auto_payout_enabled = False
+min_withdraw_amount = 0.1
+max_withdraw_amount = 10.0
+referral_reward = 0.048
+ton_gas_fee = 0.005
 
 # ==========================================
-# تابع استعلام موجودی واقعی ولت ربات از شبکه TON
+# استعلام موجودی ولت سیستم
 # ==========================================
 async def get_system_wallet_balance():
     if not TON_MNEMONIC:
@@ -86,7 +86,6 @@ async def get_system_wallet_balance():
         mnemonics = TON_MNEMONIC.strip().split()
         wallet = await WalletV5R1.from_mnemonic(client, mnemonics, network_global_id=-239)
 
-        # دریافت اطلاعات و موجودی آدرس ولت
         account_state = await client.get_account_state(wallet.address)
         balance_nano = account_state.balance
         balance_ton = balance_nano / 10**9
@@ -100,7 +99,7 @@ async def get_system_wallet_balance():
         return None, str(e)
 
 # ==========================================
-# تابع بررسی رفرال واقعی (عکس، بیو، یوزرنیم، اسم)
+# تابع بررسی اکانت واقعی
 # ==========================================
 async def is_real_user(user: types.User) -> bool:
     try:
@@ -121,7 +120,7 @@ async def is_real_user(user: types.User) -> bool:
         return False
 
 # ==========================================
-# تابع بررسی جوین اجباری کانال
+# تابع بررسی عضویت اجباری
 # ==========================================
 async def check_user_subscription(user_id: int) -> bool:
     if is_admin(user_id):
@@ -145,11 +144,11 @@ def get_join_channel_keyboard():
     )
 
 # ==========================================
-# ارسال پاداش شبکه TON
+# واریز TON
 # ==========================================
 async def send_ton_payout(destination_address: str, amount_ton: float):
     if not TON_MNEMONIC:
-        return False, "کلید امنیتی ولت (TON_MNEMONIC) روی رندر تنظیم نشده است!"
+        return False, "کلید امنیتی ولت (TON_MNEMONIC) تنظیم نشده است!"
     
     client = None
     try:
@@ -168,7 +167,7 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
         )
 
         await client.close()
-        return True, f"تراکنش با موفقیت انجام شد! (مبلغ واریزی: {amount_ton:.4f} TON) 🚀"
+        return True, f"تراکنش انجام شد! (مبلغ: {amount_ton:.4f} TON) 🚀"
 
     except Exception as e:
         logging.error(f"pytoniq W5 Payout Error: {e}")
@@ -177,7 +176,7 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
         return False, str(e)
 
 # ==========================================
-# مدیریت ذخیره و بازیابی داده‌ها (MongoDB Async)
+# ذخیره و بازیابی دیتابیس MongoDB
 # ==========================================
 async def save_data():
     try:
@@ -320,7 +319,7 @@ class AdminSetGasFeeForm(StatesGroup):
     amount = State()
 
 # ==========================================
-# توابع كمكی و کیبوردها
+# توابع کمکی
 # ==========================================
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -369,7 +368,7 @@ def get_admin_inline_keyboard():
     )
 
 # ==========================================
-# پردازش اختصاصی منطق ثبت رفرال + آنتی-فیک
+# پردازش رفرال و آنتی‌فیک
 # ==========================================
 async def process_referral_logic(user: types.User, args: str, state: FSMContext):
     u_id = user.id
@@ -393,11 +392,7 @@ async def process_referral_logic(user: types.User, args: str, state: FSMContext)
                         ref_prof["balance"] = round(ref_prof["balance"] + referral_reward, 4)
                         ref_prof["referrals_count"] += 1
                         
-                        await users_col.update_one(
-                            {"user_id": referrer_id},
-                            {"$set": user_data[referrer_id]},
-                            upsert=True
-                        )
+                        await users_col.update_one({"user_id": referrer_id}, {"$set": user_data[referrer_id]}, upsert=True)
 
                         try:
                             await bot.send_message(
@@ -445,11 +440,7 @@ async def process_referral_logic(user: types.User, args: str, state: FSMContext)
                                 ref_prof["balance"] = round(ref_prof["balance"] + referral_reward, 4)
                                 ref_prof["referrals_count"] += 1
                                 
-                                await users_col.update_one(
-                                    {"user_id": referrer_id},
-                                    {"$set": user_data[referrer_id]},
-                                    upsert=True
-                                )
+                                await users_col.update_one({"user_id": referrer_id}, {"$set": user_data[referrer_id]}, upsert=True)
                                 try:
                                     await bot.send_message(
                                         referrer_id,
@@ -477,7 +468,7 @@ async def process_referral_logic(user: types.User, args: str, state: FSMContext)
     await save_data()
 
 # ==========================================
-# بررسی کلیک روی دکمه عضو شدم
+# دکمه‌های مربوط به استارت و جوین اجباری
 # ==========================================
 @dp.callback_query(F.data == "check_join_btn")
 async def check_join_btn_callback(call: types.CallbackQuery, state: FSMContext):
@@ -504,7 +495,7 @@ async def check_join_btn_callback(call: types.CallbackQuery, state: FSMContext):
         await call.message.delete()
         await call.message.answer(
             f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-            f"📌 <b>نسخه ربات:</b> <code>v4.5.0</code> 💎\n\n"
+            f"📌 <b>نسخه ربات:</b> <code>v4.5.1</code> 💎\n\n"
             f"🎁 <b>به ازای هر رفرال واقعی {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
             f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
             parse_mode="HTML",
@@ -513,9 +504,6 @@ async def check_join_btn_callback(call: types.CallbackQuery, state: FSMContext):
     else:
         await call.answer("❌ شما هنوز در کانال عضو نشده‌اید!", show_alert=True)
 
-# ==========================================
-# دستور /start و سیستم آنتی-فیک رفرال + جوین اجباری
-# ==========================================
 @dp.message(CommandStart())
 async def start_handler(message: types.Message, command: CommandObject, state: FSMContext):
     u_id = message.from_user.id
@@ -548,7 +536,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v4.5.0</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v4.5.1</code> 💎\n\n"
         f"🎁 <b>به ازای هر رفرال واقعی {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
         f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
         parse_mode="HTML",
@@ -556,7 +544,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
     )
 
 # ==========================================
-# سیستم کیف‌پول و برداشت مستقیم
+# سیستم برداشت و مدیریت موجودی
 # ==========================================
 @dp.message(F.text == "💎 کیف‌پول من (Wallet)")
 async def show_wallet(message: types.Message):
@@ -783,7 +771,7 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
     )
 
 # ==========================================
-# تایید یا رد برداشت توسط ادمین
+# تایید/رد واریزها توسط ادمین
 # ==========================================
 @dp.callback_query(F.data.startswith("wd_approve_"))
 async def approve_withdraw(call: types.CallbackQuery):
@@ -846,7 +834,7 @@ async def reject_withdraw(call: types.CallbackQuery):
         pass
 
 # ==========================================
-# منوهای عمومی کاربر
+# گزینه‌های پروفایل و راهنما
 # ==========================================
 @dp.message(F.text == "🔗 دریافت لینک رفرال 🚀")
 async def send_referral_link_menu(message: types.Message):
@@ -934,7 +922,7 @@ async def show_help(message: types.Message):
     await message.answer(text, parse_mode="HTML")
 
 # ==========================================
-# پنل مدیریت پیشرفته ادمین (با نمایش موجودی ولت اصلی)
+# پنل مدیریت پیشرفته ادمین
 # ==========================================
 @dp.message(F.text == "⚙️ پنل مدیریت ادمین 👑")
 async def open_admin_panel(message: types.Message):
@@ -947,7 +935,6 @@ async def open_admin_panel(message: types.Message):
     active_gw = sum(1 for gw in active_giveaways.values() if not gw["ended"])
     total_balance = sum(u.get("balance", 0.0) for u in user_data.values())
     
-    # گرفتن موجودی لحظه‌ای ولت سورس ربات
     sys_balance, wallet_addr = await get_system_wallet_balance()
     if sys_balance is not None:
         wallet_str = f"<code>{sys_balance:.4f} TON</code>\n💳 <b>آدرس ولت:</b> <code>{wallet_addr}</code>"
@@ -955,7 +942,7 @@ async def open_admin_panel(message: types.Message):
         wallet_str = f"⚠️ <b>خطا در استعلام:</b> {wallet_addr}"
 
     admin_text = (
-        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.5.0)</b>\n"
+        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.5.1)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💎 <b>موجودی واقعى ولت اصلی ربات:</b> {wallet_str}\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1010,7 +997,7 @@ async def show_stats_callback(call: types.CallbackQuery):
         return
     await open_admin_panel(call.message)
 
-# --- سیستم بن و آن‌بن کاربر ---
+# --- سیستم بن و آن‌بن ---
 @dp.callback_query(F.data == "admin_ban_user")
 async def start_ban_user(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
@@ -1060,7 +1047,7 @@ async def process_unban_user(message: types.Message, state: FSMContext):
     else:
         await message.answer("⚠️ این کاربر در لیست بن شده‌ها قرار ندارد.")
 
-# --- ارسال پیام مستقیم از پنل ادمین ---
+# --- ارسال پیام مستقیم ---
 @dp.callback_query(F.data == "admin_direct_msg")
 async def start_direct_message(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
@@ -1092,7 +1079,7 @@ async def process_direct_msg_send(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"❌ <b>خطا در ارسال پیام:</b> {e}", parse_mode="HTML")
 
-# --- مدیریت و جستجوی کاربران و رفرال‌های آن‌ها ---
+# --- جستجوی کاربر ---
 @dp.callback_query(F.data == "admin_search_user")
 async def start_search_user(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
@@ -1145,7 +1132,7 @@ async def process_search_user(message: types.Message, state: FSMContext):
 
     await message.answer(user_info_text, parse_mode="HTML")
 
-# --- تنظیم حداقل برداشت ---
+# --- تغییر کانفیگ‌ها ---
 @dp.callback_query(F.data == "admin_set_min_wd")
 async def start_set_min_wd(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
@@ -1166,7 +1153,6 @@ async def process_set_min_wd(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("⚠️ لطفاً عدد معتبر وارد کنید!")
 
-# --- تنظیم حداکثر برداشت ---
 @dp.callback_query(F.data == "admin_set_max_wd")
 async def start_set_max_wd(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
@@ -1187,7 +1173,6 @@ async def process_set_max_wd(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("⚠️ لطفاً عدد معتبر وارد کنید!")
 
-# --- تنظیم پاداش هر رفرال ---
 @dp.callback_query(F.data == "admin_set_ref_reward")
 async def start_set_ref_reward(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
@@ -1208,7 +1193,6 @@ async def process_set_ref_reward(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("⚠️ لطفاً عدد معتبر وارد کنید!")
 
-# --- تنظیم گس‌فی شبکه TON ---
 @dp.callback_query(F.data == "admin_set_gas_fee")
 async def start_set_gas_fee(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
@@ -1229,7 +1213,6 @@ async def process_set_gas_fee(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("⚠️ لطفاً عدد معتبر وارد کنید!")
 
-# --- تغییر موجودی کاربر ---
 @dp.callback_query(F.data == "admin_edit_balance")
 async def start_edit_balance(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
@@ -1268,7 +1251,6 @@ async def process_edit_balance_amount(message: types.Message, state: FSMContext)
         parse_mode="HTML"
     )
 
-# --- همه‌فرستی ---
 @dp.callback_query(F.data == "admin_broadcast")
 async def start_broadcast(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
@@ -1660,6 +1642,9 @@ async def cancel_launch(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await call.message.edit_text("❌ لغو شد.", parse_mode="HTML")
 
+# ==========================================
+# اجرای اصلی برنامه
+# ==========================================
 async def main():
     await load_data()
     for msg_id, gw in list(active_giveaways.items()):
