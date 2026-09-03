@@ -1,6 +1,6 @@
 # ==========================================
-# Void Giveaway Bot - Version 4.6.0
-# (Referral + Anti-Fake System, Wallet Live Tracker, Direct Admin DM, Ban System, Forced Join Channel, MongoDB Integrated)
+# Void Giveaway Bot - Version 4.5.0
+# (Referral + Anti-Fake System, Direct Admin DM, Ban System, Forced Join Channel, MongoDB Integrated)
 # ==========================================
 
 import asyncio
@@ -31,7 +31,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v4.6.0) is running!"
+    return "⚡ Void Giveaway Bot (v4.5.0) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -45,11 +45,8 @@ def keep_alive():
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = [6879499219]
 WITHDRAW_CHANNEL = "@voidwithraw"
-REQUIRED_CHANNEL = "@Voidchanneloffical"  # کانال جوین اجباری و نمایش موجودی ولت
+REQUIRED_CHANNEL = "@Voidchanneloffical"  # کانال جوین اجباری
 TON_MNEMONIC = os.environ.get("TON_MNEMONIC")
-
-# متغیر ذخیره آیدی پیام موجودی ولت جهت ویرایش مداوم در کانال
-balance_msg_id = None
 
 # تنظیمات اتصال به MongoDB
 MONGO_URI = os.environ.get("MONGO_URI", "")
@@ -73,6 +70,34 @@ min_withdraw_amount = 0.1  # حداقل کفی برداشت TON
 max_withdraw_amount = 10.0 # حداکثر سقف برداشت TON
 referral_reward = 0.048    # پاداش هر رفرال
 ton_gas_fee = 0.005        # مقدار گس‌فی شبکه TON
+
+# ==========================================
+# تابع استعلام موجودی واقعی ولت ربات از شبکه TON
+# ==========================================
+async def get_system_wallet_balance():
+    if not TON_MNEMONIC:
+        return None, "کلید امنیتی ولت (TON_MNEMONIC) تنظیم نشده است!"
+    
+    client = None
+    try:
+        client = LiteClient.from_mainnet_config(ls_i=0, trust_level=2)
+        await client.connect()
+
+        mnemonics = TON_MNEMONIC.strip().split()
+        wallet = await WalletV5R1.from_mnemonic(client, mnemonics, network_global_id=-239)
+
+        # دریافت اطلاعات و موجودی آدرس ولت
+        account_state = await client.get_account_state(wallet.address)
+        balance_nano = account_state.balance
+        balance_ton = balance_nano / 10**9
+
+        await client.close()
+        return balance_ton, wallet.address.to_str(is_user_friendly=True, is_bounceable=False)
+    except Exception as e:
+        logging.error(f"Error fetching wallet balance: {e}")
+        if client and client.is_connected():
+            await client.close()
+        return None, str(e)
 
 # ==========================================
 # تابع بررسی رفرال واقعی (عکس، بیو، یوزرنیم، اسم)
@@ -152,60 +177,10 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
         return False, str(e)
 
 # ==========================================
-# آپدیت خودکار موجودی ولت پرداختی در کانال (هر ۱ دقیقه)
-# ==========================================
-async def auto_update_wallet_balance_loop():
-    global balance_msg_id
-    await asyncio.sleep(5)  # تاخیر اولیه جهت صعودی شدن فرآیند استارت
-    
-    while True:
-        try:
-            if TON_MNEMONIC:
-                client = LiteClient.from_mainnet_config(ls_i=0, trust_level=2)
-                await client.connect()
-                mnemonics = TON_MNEMONIC.strip().split()
-                wallet = await WalletV5R1.from_mnemonic(client, mnemonics, network_global_id=-239)
-                wallet_address = str(wallet.address.to_str(is_user_friendly=True))
-                
-                account_state = await client.get_account_state(wallet.address)
-                balance_ton = round(account_state.balance / 10**9, 4)
-                await client.close()
-
-                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                
-                text = (
-                    f"💎 <b>موجودی زنده کیف‌پول پرداختی ربات</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"💰 <b>موجودی فعلی:</b> <code>{balance_ton} TON</code>\n"
-                    f"📝 <b>آدرس ولت:</b>\n<code>{wallet_address}</code>\n\n"
-                    f"⏰ <b>آخرین بروزرسانی:</b> <code>{now_str}</code>\n"
-                    f"⚡️ <i>بروزرسانی خودکار هر ۱ دقیقه</i>\n"
-                    f"━━━━━━━━━━━━━━━━━━"
-                )
-
-                if balance_msg_id:
-                    try:
-                        await bot.edit_message_text(chat_id=REQUIRED_CHANNEL, message_id=balance_msg_id, text=text, parse_mode="HTML")
-                    except TelegramBadRequest:
-                        pass
-                    except Exception:
-                        msg = await bot.send_message(chat_id=REQUIRED_CHANNEL, text=text, parse_mode="HTML")
-                        balance_msg_id = msg.message_id
-                else:
-                    msg = await bot.send_message(chat_id=REQUIRED_CHANNEL, text=text, parse_mode="HTML")
-                    balance_msg_id = msg.message_id
-
-        except Exception as e:
-            logging.error(f"Wallet balance tracker error: {e}")
-
-        await asyncio.sleep(60) # اجرای مجدد دقیقاً سر هر ۶۰ ثانیه
-
-# ==========================================
 # مدیریت ذخیره و بازیابی داده‌ها (MongoDB Async)
 # ==========================================
 async def save_data():
     try:
-        # ۱. ذخیره قرعه‌کشی‌ها
         for msg_id, gw in active_giveaways.items():
             participants_data = {
                 str(u_id): {
@@ -226,7 +201,6 @@ async def save_data():
             }
             await giveaways_col.update_one({"msg_id": msg_id}, {"$set": gw_doc}, upsert=True)
 
-        # ۲. ذخیره کاربران
         for u_id, info in user_data.items():
             user_doc = {
                 "user_id": u_id,
@@ -238,7 +212,6 @@ async def save_data():
             }
             await users_col.update_one({"user_id": u_id}, {"$set": user_doc}, upsert=True)
 
-        # ۳. ذخیره تنظیمات ربات
         settings_doc = {
             "setting_id": "global_config",
             "all_time_users": list(all_time_users),
@@ -248,8 +221,7 @@ async def save_data():
             "min_withdraw_amount": min_withdraw_amount,
             "max_withdraw_amount": max_withdraw_amount,
             "referral_reward": referral_reward,
-            "ton_gas_fee": ton_gas_fee,
-            "balance_msg_id": balance_msg_id
+            "ton_gas_fee": ton_gas_fee
         }
         await settings_col.update_one({"setting_id": "global_config"}, {"$set": settings_doc}, upsert=True)
 
@@ -257,9 +229,8 @@ async def save_data():
         logging.error(f"Error saving data to MongoDB: {e}")
 
 async def load_data():
-    global active_giveaways, user_data, all_time_users, banned_users, bot_active, auto_payout_enabled, min_withdraw_amount, max_withdraw_amount, referral_reward, ton_gas_fee, balance_msg_id
+    global active_giveaways, user_data, all_time_users, banned_users, bot_active, auto_payout_enabled, min_withdraw_amount, max_withdraw_amount, referral_reward, ton_gas_fee
     try:
-        # ۱. بازیابی تنظیمات
         settings_doc = await settings_col.find_one({"setting_id": "global_config"})
         if settings_doc:
             all_time_users = set(settings_doc.get("all_time_users", []))
@@ -270,9 +241,7 @@ async def load_data():
             max_withdraw_amount = settings_doc.get("max_withdraw_amount", 10.0)
             referral_reward = settings_doc.get("referral_reward", 0.048)
             ton_gas_fee = settings_doc.get("ton_gas_fee", 0.005)
-            balance_msg_id = settings_doc.get("balance_msg_id", None)
 
-        # ۲. بازیابی کاربران
         async for user_doc in users_col.find():
             u_id = int(user_doc["user_id"])
             user_data[u_id] = {
@@ -283,7 +252,6 @@ async def load_data():
                 "first_name": user_doc.get("first_name", "User")
             }
 
-        # ۳. بازیابی قرعه‌کشی‌ها
         async for gw_doc in giveaways_col.find():
             msg_id = int(gw_doc["msg_id"])
             participants = {}
@@ -536,7 +504,7 @@ async def check_join_btn_callback(call: types.CallbackQuery, state: FSMContext):
         await call.message.delete()
         await call.message.answer(
             f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-            f"📌 <b>نسخه ربات:</b> <code>v4.6.0</code> 💎\n\n"
+            f"📌 <b>نسخه ربات:</b> <code>v4.5.0</code> 💎\n\n"
             f"🎁 <b>به ازای هر رفرال واقعی {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
             f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
             parse_mode="HTML",
@@ -580,7 +548,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v4.6.0</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v4.5.0</code> 💎\n\n"
         f"🎁 <b>به ازای هر رفرال واقعی {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
         f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
         parse_mode="HTML",
@@ -966,7 +934,7 @@ async def show_help(message: types.Message):
     await message.answer(text, parse_mode="HTML")
 
 # ==========================================
-# پنل مدیریت پیشرفته ادمین
+# پنل مدیریت پیشرفته ادمین (با نمایش موجودی ولت اصلی)
 # ==========================================
 @dp.message(F.text == "⚙️ پنل مدیریت ادمین 👑")
 async def open_admin_panel(message: types.Message):
@@ -979,8 +947,17 @@ async def open_admin_panel(message: types.Message):
     active_gw = sum(1 for gw in active_giveaways.values() if not gw["ended"])
     total_balance = sum(u.get("balance", 0.0) for u in user_data.values())
     
+    # گرفتن موجودی لحظه‌ای ولت سورس ربات
+    sys_balance, wallet_addr = await get_system_wallet_balance()
+    if sys_balance is not None:
+        wallet_str = f"<code>{sys_balance:.4f} TON</code>\n💳 <b>آدرس ولت:</b> <code>{wallet_addr}</code>"
+    else:
+        wallet_str = f"⚠️ <b>خطا در استعلام:</b> {wallet_addr}"
+
     admin_text = (
-        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.6.0)</b>\n"
+        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.5.0)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💎 <b>موجودی واقعى ولت اصلی ربات:</b> {wallet_str}\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🤖 <b>وضعیت ربات:</b> {'روشن ✅' if bot_active else 'خاموش/تعمیرات 🛑'}\n"
         f"⚡️ <b>سیستم واریز:</b> {'خودکار اتوماتیک 🚀' if auto_payout_enabled else 'دستی (تایید کانال) 📝'}\n"
@@ -988,7 +965,7 @@ async def open_admin_panel(message: types.Message):
         f"👥 <b>کاربران فعال فعلی:</b> <code>{total_users}</code> نفر\n"
         f"📜 <b>کل کاربران تاریخی:</b> <code>{total_all_time}</code> نفر\n"
         f"🚫 <b>کاربران بن شده:</b> <code>{banned_count}</code> نفر\n"
-        f"💎 <b>مجموع موجودی ولت کاربران:</b> <code>{total_balance:.4f} TON</code>\n"
+        f"💰 <b>مجموع موجودی ولت کاربران:</b> <code>{total_balance:.4f} TON</code>\n"
         f"🎁 <b>پاداش هر رفرال:</b> <code>{referral_reward} TON</code>\n"
         f"⛽️ <b>گس‌فی شبکه TON:</b> <code>{ton_gas_fee} TON</code>\n"
         f"🔻 <b>حداقل برداشت:</b> <code>{min_withdraw_amount} TON</code>\n"
@@ -1028,7 +1005,7 @@ async def toggle_auto_payout_callback(call: types.CallbackQuery):
 
 @dp.callback_query(F.data == "admin_stats")
 async def show_stats_callback(call: types.CallbackQuery):
-    await call.answer("🔄 اطلاعات به‌روزرسانی شد", show_alert=False)
+    await call.answer("🔄 اطلاعات و موجودی ولت به‌روزرسانی شد", show_alert=False)
     if not is_admin(call.from_user.id):
         return
     await open_admin_panel(call.message)
@@ -1675,8 +1652,7 @@ async def run_giveaway_timer(chat_id, message_id):
         else:
             await update_post_text(chat_id, message_id)
             
-        # بهینه‌سازی: تغییر از ۱۰ ثانیه به ۶۰ ثانیه جهت رفع کندی و محدودیت تلگرام
-        await asyncio.sleep(60)
+        await asyncio.sleep(10)
 
 @dp.callback_query(F.data == "cancel_launch")
 async def cancel_launch(call: types.CallbackQuery, state: FSMContext):
@@ -1686,14 +1662,9 @@ async def cancel_launch(call: types.CallbackQuery, state: FSMContext):
 
 async def main():
     await load_data()
-    
-    # ۱. راه‌اندازی تایمرهای قرعه‌کشی‌های فعال
     for msg_id, gw in list(active_giveaways.items()):
         if not gw["ended"]:
             asyncio.create_task(run_giveaway_timer(gw["channel"], msg_id))
-
-    # ۲. راه‌اندازی تاسک به‌روزرسانی خودکار موجودی ولت در کانال هر ۱ دقیقه
-    asyncio.create_task(auto_update_wallet_balance_loop())
 
     keep_alive()
     await dp.start_polling(bot)
