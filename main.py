@@ -1,6 +1,6 @@
 # ==========================================
-# Void Giveaway Bot - Version 4.3.0
-# (Referral Only, Forced Join Channel, Bot On/Off Switch + MongoDB Integrated)
+# Void Giveaway Bot - Version 4.4.0
+# (Referral Only, Forced Join Channel, Bot On/Off Switch, Auto/Manual Payouts + MongoDB Integrated)
 # ==========================================
 
 import asyncio
@@ -31,7 +31,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v4.3.0) is running!"
+    return "⚡ Void Giveaway Bot (v4.4.0) is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -64,6 +64,7 @@ active_giveaways = {}
 user_data = {}
 all_time_users = set()  # برای جلوگیری از باگ رفرال فیک
 bot_active = True        # وضعیت روشن/خاموش بودن ربات
+auto_payout_enabled = False # حالت واریز خودکار (غیرفعال = دستی از کانال)
 min_withdraw_amount = 0.1  # حداقل کفی برداشت TON
 max_withdraw_amount = 10.0 # حداکثر سقف برداشت TON
 referral_reward = 0.048    # پاداش هر رفرال
@@ -169,6 +170,7 @@ async def save_data():
             "setting_id": "global_config",
             "all_time_users": list(all_time_users),
             "bot_active": bot_active,
+            "auto_payout_enabled": auto_payout_enabled,
             "min_withdraw_amount": min_withdraw_amount,
             "max_withdraw_amount": max_withdraw_amount,
             "referral_reward": referral_reward,
@@ -180,13 +182,14 @@ async def save_data():
         logging.error(f"Error saving data to MongoDB: {e}")
 
 async def load_data():
-    global active_giveaways, user_data, all_time_users, bot_active, min_withdraw_amount, max_withdraw_amount, referral_reward, ton_gas_fee
+    global active_giveaways, user_data, all_time_users, bot_active, auto_payout_enabled, min_withdraw_amount, max_withdraw_amount, referral_reward, ton_gas_fee
     try:
         # ۱. بازیابی تنظیمات
         settings_doc = await settings_col.find_one({"setting_id": "global_config"})
         if settings_doc:
             all_time_users = set(settings_doc.get("all_time_users", []))
             bot_active = settings_doc.get("bot_active", True)
+            auto_payout_enabled = settings_doc.get("auto_payout_enabled", False)
             min_withdraw_amount = settings_doc.get("min_withdraw_amount", 0.1)
             max_withdraw_amount = settings_doc.get("max_withdraw_amount", 10.0)
             referral_reward = settings_doc.get("referral_reward", 0.048)
@@ -292,12 +295,14 @@ def get_main_keyboard(user_id: int):
 
 def get_admin_inline_keyboard():
     status_btn = "🛑 خاموش کردن ربات" if bot_active else "✅ روشن کردن ربات"
+    auto_btn = "⚡️ واریز خودکار: غیرفعال" if not auto_payout_enabled else "⚡️ واریز خودکار: فعال"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🎁 ایجاد قرعه‌کشی جدید", callback_data="admin_new_gw"), InlineKeyboardButton(text="📊 لیست قرعه‌کشی‌ها", callback_data="admin_list_gw")],
             [InlineKeyboardButton(text="👥 مدیریت و جستجوی کاربر", callback_data="admin_search_user"), InlineKeyboardButton(text="➕/➖ تغییر موجودی", callback_data="admin_edit_balance")],
             [InlineKeyboardButton(text="⚙️ حداقل برداشت", callback_data="admin_set_min_wd"), InlineKeyboardButton(text="🔝 حداکثر برداشت", callback_data="admin_set_max_wd")],
             [InlineKeyboardButton(text="💎 تنظیم پاداش رفرال", callback_data="admin_set_ref_reward"), InlineKeyboardButton(text="⛽️ تنظیم گس‌فی شبکه", callback_data="admin_set_gas_fee")],
+            [InlineKeyboardButton(text=auto_btn, callback_data="admin_toggle_auto_payout")],
             [InlineKeyboardButton(text=status_btn, callback_data="admin_toggle_bot"), InlineKeyboardButton(text="📢 همه‌فرستی (Broadcast)", callback_data="admin_broadcast")],
             [InlineKeyboardButton(text="🔄 بروزرسانی آمار", callback_data="admin_stats")]
         ]
@@ -410,7 +415,7 @@ async def check_join_btn_callback(call: types.CallbackQuery, state: FSMContext):
         await call.message.delete()
         await call.message.answer(
             f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-            f"📌 <b>نسخه ربات:</b> <code>v4.3.0</code> 💎\n\n"
+            f"📌 <b>نسخه ربات:</b> <code>v4.4.0</code> 💎\n\n"
             f"🎁 <b>به ازای هر رفرال معتبر {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
             f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
             parse_mode="HTML",
@@ -451,7 +456,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v4.3.0 (Forced Join & System Switch)</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v4.4.0</code> 💎\n\n"
         f"🎁 <b>به ازای هر رفرال معتبر {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
         f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
         parse_mode="HTML",
@@ -589,11 +594,51 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
+    # کسر موجودی از حساب کاربر
     prof["balance"] = round(prof["balance"] - deduct_from_balance, 4)
     await save_data()
 
     user_mention = f"@{user.username}" if user.username else f'<a href="tg://user?id={user.id}">{html.escape(user.first_name)}</a>'
-    
+
+    # بررسی واریز خودکار یا دستی
+    if auto_payout_enabled:
+        await message.answer("⏳ در حال پردازش و واریز خودکار به ولت شما...", parse_mode="HTML")
+        success, result_msg = await send_ton_payout(wallet_addr, amount_to_send)
+        
+        if success:
+            withdraw_text = (
+                f"⚡️ <b>واریز خودکار انجام شد!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>کاربر:</b> {user_mention} (ID: <code>{user.id}</code>)\n"
+                f"💎 <b>مبلغ واریزی:</b> <code>{amount_to_send} TON</code>\n"
+                f"📝 <b>آدرس ولت:</b>\n<code>{html.escape(wallet_addr)}</code>\n"
+                f"⏰ <b>زمان:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+                f"━━━━━━━━━━━━━━━━━━"
+            )
+            try:
+                await bot.send_message(chat_id=WITHDRAW_CHANNEL, text=withdraw_text, parse_mode="HTML")
+            except Exception as e:
+                logging.error(f"Auto withdraw channel notification error: {e}")
+
+            await message.answer(
+                f"🎉 <b>تراکنش شما با موفقیت به شبکه ارسال گردید!</b>\n\n"
+                f"🚀 <b>مبلغ واریزی:</b> <code>{amount_to_send} TON</code>",
+                parse_mode="HTML",
+                reply_markup=get_main_keyboard(user.id)
+            )
+        else:
+            # در صورت بروز خطای فنی شبکه، مبلغ به حساب برمی‌گردد
+            prof["balance"] = round(prof["balance"] + deduct_from_balance, 4)
+            await save_data()
+            await message.answer(
+                f"❌ <b>خطا در واریز اتوماتیک:</b> {result_msg}\nمبلغ کسر شده به ولت شما بازگردانده شد.",
+                parse_mode="HTML",
+                reply_markup=get_main_keyboard(user.id)
+            )
+        await state.clear()
+        return
+
+    # حالت دستی (ارسال به کانال تایید ادمین)
     withdraw_text = (
         f"🔔 <b>درخواست برداشت جدید TON!</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -610,7 +655,7 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ واریز اتوماتیک TON", callback_data=f"wd_approve_{user.id}_{amount_to_send}_{deduct_from_balance}"),
-                InlineKeyboardButton(text="❌ رد و بازگشت به ولت", callback_data=f"wd_reject_{user.id}_{deduct_from_balance}")
+                InlineKeyboardButton(text="❌ رد درخواست", callback_data=f"wd_reject_{user.id}_{deduct_from_balance}")
             ]
         ]
     )
@@ -683,20 +728,16 @@ async def reject_withdraw(call: types.CallbackQuery):
 
     parts = call.data.split("_")
     target_user_id = int(parts[2])
-    deduct_from_balance = float(parts[3])
 
-    prof = get_user_profile(target_user_id)
-    prof["balance"] = round(prof["balance"] + deduct_from_balance, 4)
-    await save_data()
-
-    updated_text = call.message.text + "\n\n❌ <b>وضعیت: رد شد (مبلغ به کیف‌پول کاربر بازگشت داده شد)</b>"
+    # توجه: مبلغ به ولت بازنمی‌گردد و سوخت می‌شود.
+    updated_text = call.message.text + "\n\n❌ <b>وضعیت: رد شد (به علت ثبت رفرال فیک)</b>"
     await call.message.edit_text(updated_text, parse_mode="HTML", reply_markup=None)
-    await call.answer("❌ درخواست رد شد.", show_alert=True)
+    await call.answer("❌ درخواست رد شد و پیام فیک زدید برای کاربر ارسال گشت.", show_alert=True)
 
     try:
         await bot.send_message(
             target_user_id,
-            f"❌ <b>درخواست برداشت رد شد!</b>\n\nمبلغ <code>{deduct_from_balance} TON</code> مجدداً به موجودی کیف‌پول شما در ربات بازگشت داده شد.",
+            "❌ <b>درخواست برداشت شما رد شد!</b>\n\nعلت: شما زیرمجموعه فیک ثبت کرده‌اید.",
             parse_mode="HTML"
         )
     except Exception:
@@ -792,9 +833,10 @@ async def open_admin_panel(message: types.Message):
     total_balance = sum(u.get("balance", 0.0) for u in user_data.values())
     
     admin_text = (
-        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.3.0)</b>\n"
+        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.4.0)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🤖 <b>وضعیت ربات:</b> {'روشن ✅' if bot_active else 'خاموش/تعمیرات 🛑'}\n"
+        f"⚡️ <b>سیستم واریز:</b> {'خودکار اتوماتیک 🚀' if auto_payout_enabled else 'دستی (تایید کانال) 📝'}\n"
         f"📢 <b>کانال جوین اجباری:</b> {REQUIRED_CHANNEL}\n"
         f"👥 <b>کاربران فعال فعلی:</b> <code>{total_users}</code> نفر\n"
         f"📜 <b>کل کاربران تاریخی:</b> <code>{total_all_time}</code> نفر\n"
@@ -820,6 +862,19 @@ async def toggle_bot_callback(call: types.CallbackQuery):
     bot_active = not bot_active
     await save_data()
     status_msg = "🛑 ربات خاموش شد." if not bot_active else "✅ ربات روشن شد."
+    await call.answer(status_msg, show_alert=True)
+    await open_admin_panel(call.message)
+
+@dp.callback_query(F.data == "admin_toggle_auto_payout")
+async def toggle_auto_payout_callback(call: types.CallbackQuery):
+    global auto_payout_enabled
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+    
+    auto_payout_enabled = not auto_payout_enabled
+    await save_data()
+    status_msg = "⚡️ واریز خودکار فعال شد." if auto_payout_enabled else "📝 واریز به حالت دستی تغییر یافت."
     await call.answer(status_msg, show_alert=True)
     await open_admin_panel(call.message)
 
