@@ -59,6 +59,7 @@ db = mongo_client['void_giveaway_db']
 users_col = db['users']
 settings_col = db['settings']
 withdrawals_col = db['withdrawals']
+counters_col = db['counters']
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -196,13 +197,99 @@ def get_join_channel_keyboard():
 # ==========================================
 # واریز TON
 # ==========================================
-async def send_ton_payout(destination_address: str, amount_ton: float):
+def ton_field(value, name, default=None):
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def normalize_ton_address(value):
+    """آدرس friendly یا Address را به شکل raw قابل مقایسه تبدیل می‌کند."""
+    try:
+        if hasattr(value, "to_str"):
+            value = value.to_str(is_user_friendly=False)
+        value = str(value).strip()
+        if re.fullmatch(r"-?\d:[0-9a-fA-F]{64}", value):
+            return value.lower()
+        if not re.fullmatch(r"(?:EQ|UQ)[a-zA-Z0-9_-]{46}", value):
+            return None
+        raw = base64.urlsafe_b64decode(value + "==")
+        if len(raw) != 36:
+            return None
+        workchain = raw[1] if raw[1] < 128 else raw[1] - 256
+        return f"{workchain}:{raw[2:].hex()}"
+    except (ValueError, TypeError, base64.binascii.Error):
+        return None
+
+
+def extract_ton_comment(message):
+    """کامنت ساده تراکنش TON را از body پیام می‌خواند."""
+    body = ton_field(message, "body")
+    if body is None or not hasattr(body, "begin_parse"):
+        return None
+    try:
+        cs = body.begin_parse()
+        if cs.remaining_bits < 32 or cs.load_uint(32) != 0:
+            return None
+        return cs.load_snake_string().strip()
+    except Exception:
+        return None
+
+
+async def verify_payout_on_chain(sender_address: str, destination_address: str, amount_ton: float, memo: str) -> bool:
+    """ورودی واقعی ولت مقصد را با فرستنده، مبلغ و memo تطبیق می‌دهد."""
+    client = None
+    sender_raw = normalize_ton_address(sender_address)
+    destination_raw = normalize_ton_address(destination_address)
+    expected_nano = int(round(amount_ton * 10**9))
+    if not sender_raw or not destination_raw:
+        return False
+
+    try:
+        client = LiteClient.from_mainnet_config(ls_i=0, trust_level=2)
+        await client.connect()
+        for _ in range(6):
+            transactions = await client.get_transactions(address=destination_address, count=30)
+            for transaction in transactions or []:
+                description = ton_field(transaction, "description")
+                if ton_field(description, "aborted", False):
+                    continue
+
+                incoming = ton_field(transaction, "in_msg")
+                info = ton_field(incoming, "info")
+                source = ton_field(info, "src")
+                destination = ton_field(info, "dest")
+                value_nano = ton_field(info, "value_coins")
+                if value_nano is None:
+                    value = ton_field(info, "value", {})
+                    value_nano = ton_field(value, "grams")
+
+                if (
+                    normalize_ton_address(source) == sender_raw
+                    and normalize_ton_address(destination) == destination_raw
+                    and int(value_nano or 0) == expected_nano
+                    and extract_ton_comment(incoming) == memo
+                ):
+                    return True
+            await asyncio.sleep(2)
+        return False
+    except Exception as e:
+        logging.error(f"TON destination verification error: {e}")
+        return False
+    finally:
+        if client and client.is_connected():
+            await client.close()
+
+
+async def send_ton_payout(destination_address: str, amount_ton: float, memo: str):
     if not TON_MNEMONIC:
         return False, "کلید امنیتی ولت (TON_MNEMONIC) تنظیم نشده است!"
     if not is_valid_ton_address(destination_address):
         return False, "آدرس کیف‌پول TON معتبر نیست یا checksum آن درست نیست."
     if amount_ton <= 0:
         return False, "مبلغ واریز باید بیشتر از صفر باشد."
+    if not memo or len(memo) > 64:
+        return False, "شناسه memo برداشت معتبر نیست."
 
     # بررسی و ارسال را سریالی می‌کنیم تا برداشت‌های هم‌زمان موجودی را دوبار مصرف نکنند.
     async with payout_lock:
@@ -227,21 +314,28 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
             await wallet.transfer(
                 destination=destination_address.strip(),
                 amount=int(amount_ton * 10**9),
-                body="Payout from Void Giveaway Bot 🎉"
+                body=memo
             )
 
-            # فقط بعد از تغییر seqno، ارسال را موفق اعلام می‌کنیم.
+            # ابتدا ارسال از ولت سیستم و سپس ورود همان تراکنش به ولت مقصد تأیید می‌شود.
             for _ in range(6):
                 await asyncio.sleep(2)
                 try:
                     if await wallet.get_seqno() > seqno_before:
+                        sender_address = wallet.address.to_str(is_user_friendly=False)
                         await client.close()
-                        return True, f"تراکنش با موفقیت روی شبکه تأیید شد! (مبلغ: {amount_ton:.4f} TON) 🚀"
+                        client = None
+                        if await verify_payout_on_chain(sender_address, destination_address, amount_ton, memo):
+                            return True, f"تراکنش با memo {memo} روی شبکه و ولت مقصد تأیید شد! 🚀"
+                        return False, (
+                            f"تراکنش با memo {memo} از ولت سیستم ارسال شد، اما هنوز در ولت مقصد تأیید نشده است."
+                        )
                 except Exception as confirm_error:
                     logging.warning(f"TON payout confirmation check failed: {confirm_error}")
 
             await client.close()
-            return False, "تراکنش ارسال شد اما هنوز روی شبکه تأیید نشده است."
+            client = None
+            return False, "تراکنش ارسال شد اما ارسال از ولت سیستم روی شبکه تأیید نشده است."
 
         except Exception as e:
             logging.error(f"pytoniq W5 Payout Error: {e}")
@@ -599,12 +693,25 @@ def get_reject_withdrawal_keyboard(withdrawal_id: str):
     )
 
 
+async def get_next_withdrawal_memo() -> str:
+    """شمارنده اتمیک memo؛ gap مجاز است اما شماره تکراری نیست."""
+    counter = await counters_col.find_one_and_update(
+        {"_id": "withdrawal_memo"},
+        {"$inc": {"value": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER
+    )
+    return f"VOID-WD-{int(counter['value']):06d}"
+
+
 async def create_withdrawal_record(user_id: int, wallet_address: str, requested_amount: float,
-                                   amount_to_send: float, deducted_amount: float, status: str) -> str:
+                                   amount_to_send: float, deducted_amount: float, status: str):
     withdrawal_id = uuid.uuid4().hex[:16]
+    memo = await get_next_withdrawal_memo()
     now = datetime.utcnow().isoformat()
     await withdrawals_col.insert_one({
         "withdrawal_id": withdrawal_id,
+        "memo": memo,
         "user_id": user_id,
         "wallet_address": wallet_address,
         "requested_amount": requested_amount,
@@ -614,7 +721,7 @@ async def create_withdrawal_record(user_id: int, wallet_address: str, requested_
         "created_at": now,
         "updated_at": now
     })
-    return withdrawal_id
+    return withdrawal_id, memo
 
 
 async def set_withdrawal_status(withdrawal_id: str, status: str, **fields):
@@ -849,7 +956,7 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
             return
 
     try:
-        withdrawal_id = await create_withdrawal_record(
+        withdrawal_id, withdrawal_memo = await create_withdrawal_record(
             user.id, wallet_addr, requested_amount, amount_to_send,
             deduct_from_balance, "processing" if is_auto else "pending"
         )
@@ -864,8 +971,11 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
     user_mention = f"@{user.username}" if user.username else f'<a href="tg://user?id={user.id}">{html.escape(user.first_name)}</a>'
 
     if is_auto:
-        await message.answer("⏳ در حال بررسی موجودی ولت ربات و ارسال خودکار...", parse_mode="HTML")
-        success, result_msg = await send_ton_payout(wallet_addr, amount_to_send)
+        await message.answer(
+            f"⏳ در حال بررسی موجودی ولت ربات و ارسال خودکار...\n🏷️ تگ پرداخت: <code>{withdrawal_memo}</code>",
+            parse_mode="HTML"
+        )
+        success, result_msg = await send_ton_payout(wallet_addr, amount_to_send, withdrawal_memo)
         if success:
             await set_withdrawal_status(withdrawal_id, "paid", paid_at=datetime.utcnow().isoformat())
             wallet_preview = f"{wallet_addr[:6]}...{wallet_addr[-6:]}"
@@ -878,7 +988,8 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
                         f"👤 <b>کاربر:</b> {user_mention}\n"
                         f"💎 <b>مبلغ واریزی:</b> <code>{amount_to_send:.4f} TON</code>\n"
                         f"🏦 <b>ولت مقصد:</b> <code>{html.escape(wallet_preview)}</code>\n"
-                        f"🆔 <b>شناسه:</b> <code>{withdrawal_id}</code>"
+                        f"🆔 <b>شناسه:</b> <code>{withdrawal_id}</code>\n"
+                        f"🏷️ <b>تگ پرداخت:</b> <code>{withdrawal_memo}</code>"
                     ),
                     parse_mode="HTML"
                 )
@@ -887,7 +998,8 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
 
             await message.answer(
                 f"🎉 <b>تراکنش با موفقیت تأیید و ارسال شد!</b>\n\n"
-                f"🚀 <b>مبلغ واریزی:</b> <code>{amount_to_send:.4f} TON</code>",
+                f"🚀 <b>مبلغ واریزی:</b> <code>{amount_to_send:.4f} TON</code>\n"
+                f"🏷️ <b>تگ پرداخت:</b> <code>{withdrawal_memo}</code>",
                 parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
             )
         else:
@@ -906,6 +1018,7 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
         f"🔔 <b>درخواست برداشت جدید TON</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🆔 <b>شناسه درخواست:</b> <code>{withdrawal_id}</code>\n"
+        f"🏷️ <b>تگ پرداخت:</b> <code>{withdrawal_memo}</code>\n"
         f"👤 <b>کاربر:</b> {user_mention} (ID: <code>{user.id}</code>)\n"
         f"💎 <b>خالص واریزی:</b> <code>{amount_to_send:.4f} TON</code>\n"
         f"💰 <b>مبلغ رزروشده:</b> <code>{deduct_from_balance:.4f} TON</code>\n"
@@ -937,7 +1050,8 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
     await message.answer(
         f"✅ <b>درخواست برداشت ثبت شد و معلق است.</b>\n\n"
         f"شناسه: <code>{withdrawal_id}</code>\n"
-        f"پس از تأیید ادمین، ارسال انجام و نتیجه بررسی می‌شود.",
+        f"🏷️ تگ پرداخت: <code>{withdrawal_memo}</code>\n"
+        f"پس از تأیید ادمین، ارسال انجام و memo در ولت مقصد بررسی می‌شود.",
         parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
     )
 
@@ -959,23 +1073,25 @@ async def approve_withdraw(call: types.CallbackQuery):
         await call.answer(f"این درخواست قبلاً پردازش شده یا وضعیت آن {status} است.", show_alert=True)
         return
 
-    await call.answer("⏳ در حال بررسی موجودی و تأیید تراکنش...", show_alert=False)
+    await call.answer("⏳ در حال بررسی موجودی، memo و تأیید تراکنش...", show_alert=False)
+    withdrawal_memo = withdrawal.get("memo") or f"VOID-WD-{withdrawal_id.upper()}"
     success, result_msg = await send_ton_payout(
-        withdrawal["wallet_address"], float(withdrawal["amount_to_send"])
+        withdrawal["wallet_address"], float(withdrawal["amount_to_send"]), withdrawal_memo
     )
     base_text = call.message.text or call.message.caption or ""
 
     if success:
         await set_withdrawal_status(withdrawal_id, "paid", paid_at=datetime.utcnow().isoformat())
         await call.message.edit_text(
-            base_text + f"\n\n✅ <b>وضعیت: واریز {float(withdrawal['amount_to_send']):.4f} TON تأیید و ارسال شد.</b>",
+            base_text + f"\n\n✅ <b>وضعیت: واریز {float(withdrawal['amount_to_send']):.4f} TON با memo <code>{withdrawal_memo}</code> در ولت مقصد تأیید شد.</b>",
             parse_mode="HTML", reply_markup=None
         )
         try:
             await bot.send_message(
                 int(withdrawal["user_id"]),
                 f"🎉 <b>درخواست برداشت شما تأیید و ارسال شد!</b>\n\n"
-                f"💎 مبلغ واریزی: <code>{float(withdrawal['amount_to_send']):.4f} TON</code>",
+                f"💎 مبلغ واریزی: <code>{float(withdrawal['amount_to_send']):.4f} TON</code>\n"
+                f"🏷️ تگ پرداخت: <code>{withdrawal_memo}</code>",
                 parse_mode="HTML"
             )
         except Exception:
@@ -993,7 +1109,8 @@ async def approve_withdraw(call: types.CallbackQuery):
             await bot.send_message(
                 int(withdrawal["user_id"]),
                 "⏳ <b>درخواست برداشت شما هنوز معلق است.</b>\n"
-                "ارسال تراکنش تأیید نشد و موجودی شما محفوظ مانده است.",
+                f"🏷️ تگ پرداخت: <code>{withdrawal_memo}</code>\n"
+                "ارسال یا تأیید تراکنش کامل نشد و مبلغ رزروشده محفوظ مانده است.",
                 parse_mode="HTML"
             )
         except Exception:
