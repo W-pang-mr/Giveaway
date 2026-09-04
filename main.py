@@ -32,7 +32,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v4.5.2) is running smoothly!"
+    return "⚡ Void Giveaway Bot (v4.6.0) is running smoothly!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -521,7 +521,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-        f"📌 <b>نسخه ربات:</b> <code>v4.5.2</code> 💎\n\n"
+        f"📌 <b>نسخه ربات:</b> <code>v4.6.0</code> 💎\n\n"
         f"🎁 <b>به ازای هر رفرال {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
         f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
         parse_mode="HTML",
@@ -1028,7 +1028,7 @@ async def open_admin_panel(message: types.Message):
     ch_list_str = ", ".join(required_channels) if required_channels else "هیچ کانالی تنظیم نشده است."
 
     admin_text = (
-        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.5.2)</b>\n"
+        "👑 <b>داشبورد مدیریت ربات Void Giveaway (v4.6.0)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💎 <b>موجودی واقعی ولت اصلی ربات:</b> {wallet_str}\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
