@@ -793,6 +793,23 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
         success, result_msg = await send_ton_payout(wallet_addr, amount_to_send)
         if success:
             await set_withdrawal_status(withdrawal_id, "paid", paid_at=datetime.utcnow().isoformat())
+            wallet_preview = f"{wallet_addr[:6]}...{wallet_addr[-6:]}"
+            try:
+                await bot.send_message(
+                    chat_id=WITHDRAW_CHANNEL,
+                    text=(
+                        "🤖 <b>واریز خودکار انجام شد ✅</b>\n"
+                        "━━━━━━━━━━━━━━━━━━\n"
+                        f"👤 <b>کاربر:</b> {user_mention}\n"
+                        f"💎 <b>مبلغ واریزی:</b> <code>{amount_to_send:.4f} TON</code>\n"
+                        f"🏦 <b>ولت مقصد:</b> <code>{html.escape(wallet_preview)}</code>\n"
+                        f"🆔 <b>شناسه:</b> <code>{withdrawal_id}</code>"
+                    ),
+                    parse_mode="HTML"
+                )
+            except Exception as channel_error:
+                logging.error(f"Auto payout channel announcement error: {channel_error}")
+
             await message.answer(
                 f"🎉 <b>تراکنش با موفقیت تأیید و ارسال شد!</b>\n\n"
                 f"🚀 <b>مبلغ واریزی:</b> <code>{amount_to_send:.4f} TON</code>",
