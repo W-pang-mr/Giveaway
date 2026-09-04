@@ -862,6 +862,10 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
             payout_status, result_msg = await send_ton_payout(wallet_addr, float(amount_to_send))
             if payout_status == "sent":
                 await set_withdrawal_status(withdrawal_id, "sent", sent_at=datetime.utcnow().isoformat(), result_message=result_msg)
+                await notify_auto_withdrawal_channel(
+                    withdrawal_id, user.id, float(amount_to_send),
+                    "✅ <b>برداشت خودکار تأیید و ارسال شد.</b>", result_msg
+                )
                 await message.answer(
                     f"🎉 <b>برداشت با موفقیت از ولت سیستم ارسال شد!</b>\nمبلغ: <code>{amount_to_send:.4f} TON</code>\n"
                     "⏳ نمایش مبلغ در کیف‌پول مقصد ممکن است کمی زمان ببرد؛ تراکنش در مسیر است.", parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
@@ -869,6 +873,10 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
             else:
                 await notify_wallet_issue(float(amount_to_send), result_msg, withdrawal_id)
                 await set_withdrawal_status(withdrawal_id, "failed", last_error=result_msg)
+                await notify_auto_withdrawal_channel(
+                    withdrawal_id, user.id, float(amount_to_send),
+                    "⚠️ <b>برداشت خودکار ارسال نشد و در حال بازگشت مبلغ است.</b>", result_msg
+                )
                 refunded = await refund_withdrawal(withdrawal_id, result_msg, allowed_statuses=("failed",))
                 refund_text = "💚 مبلغ کامل به کیف‌پولت برگشت داده شد." if refunded else "🛡️ این مورد برای بررسی ایمن به ادمین گزارش شد."
                 await message.answer(
@@ -908,6 +916,57 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
             await message.answer("⚠️ درخواست به ادمین نرسید؛ مبلغ رزروشده کامل برگشت داده شد.")
 
 
+async def update_withdrawal_admin_message(message, full_text: str, withdrawal_id: str, status_text: str, reply_markup=None):
+    """نتیجه برداشت را روی پیام کانال ثبت می‌کند؛ در صورت خطای edit، fallback می‌فرستد."""
+    try:
+        await message.edit_text(full_text, parse_mode="HTML", reply_markup=reply_markup)
+        return True
+    except Exception as edit_error:
+        logging.error(f"Withdrawal channel edit error for {withdrawal_id}: {edit_error}")
+
+    # بعضی پیام‌های کانال با shortcut پیام قابل ویرایش نیستند؛ با chat/message صریح دوباره تلاش می‌کنیم.
+    try:
+        await bot.edit_message_text(
+            chat_id=message.chat.id, message_id=message.message_id,
+            text=full_text, parse_mode="HTML", reply_markup=reply_markup
+        )
+        return True
+    except Exception as direct_edit_error:
+        logging.error(f"Direct withdrawal channel edit error for {withdrawal_id}: {direct_edit_error}")
+
+    # مهم‌تر از ویرایش ظاهری: نتیجه قطعی برداشت حتماً در کانال ثبت شود.
+    try:
+        await bot.send_message(
+            chat_id=WITHDRAW_CHANNEL,
+            text=(f"📣 <b>به‌روزرسانی قطعی برداشت</b>\n"
+                  f"🆔 شناسه: <code>{html.escape(str(withdrawal_id))}</code>\n"
+                  f"{status_text}"),
+            parse_mode="HTML", reply_markup=reply_markup
+        )
+        return True
+    except Exception as fallback_error:
+        logging.error(f"Withdrawal channel fallback message error for {withdrawal_id}: {fallback_error}")
+        return False
+
+
+async def notify_auto_withdrawal_channel(withdrawal_id: str, user_id: int, amount: float, status_text: str, detail: str = ""):
+    """برای برداشت خودکار هم نتیجه در کانال ادمین قابل مشاهده باشد."""
+    try:
+        text = (
+            "🤖 <b>نتیجه برداشت خودکار</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 شناسه: <code>{html.escape(str(withdrawal_id))}</code>\n"
+            f"👤 کاربر: <code>{user_id}</code>\n"
+            f"💎 مبلغ: <code>{amount:.4f} TON</code>\n"
+            f"{status_text}"
+        )
+        if detail:
+            text += f"\n📝 جزئیات: <code>{html.escape(str(detail))}</code>"
+        await bot.send_message(chat_id=WITHDRAW_CHANNEL, text=text, parse_mode="HTML")
+    except Exception as channel_error:
+        logging.error(f"Auto withdrawal channel notification error for {withdrawal_id}: {channel_error}")
+
+
 @dp.callback_query(F.data.startswith("wd_approve_"))
 async def approve_withdraw(call: types.CallbackQuery):
     if not is_admin(call.from_user.id):
@@ -928,9 +987,12 @@ async def approve_withdraw(call: types.CallbackQuery):
         base_text = call.message.text or call.message.caption or ""
         if payout_status == "sent":
             await set_withdrawal_status(withdrawal_id, "sent", sent_at=datetime.utcnow().isoformat(), result_message=result_msg)
-            await call.message.edit_text(
-                base_text + "\n\n✅ <b>ارسال از ولت سیستم تأیید شد؛ پرداخت دوباره ممنوع است.</b>",
-                parse_mode="HTML", reply_markup=None
+            await update_withdrawal_admin_message(
+                call.message,
+                base_text + "\n\n✅ <b>برداشت تأیید و از ولت سیستم ارسال شد؛ پرداخت دوباره ممنوع است.</b>",
+                withdrawal_id,
+                "✅ <b>برداشت تأیید و ارسال شد؛ پرداخت دوباره ممنوع است.</b>",
+                reply_markup=None
             )
             try:
                 await bot.send_message(
@@ -943,11 +1005,14 @@ async def approve_withdraw(call: types.CallbackQuery):
         else:
             await set_withdrawal_status(withdrawal_id, "pending", last_error=result_msg)
             await notify_wallet_issue(float(withdrawal["amount_to_send"]), result_msg, withdrawal_id)
-            await call.message.edit_text(
+            await update_withdrawal_admin_message(
+                call.message,
                 base_text + "\n\n⚠️ <b>ارسال این بار انجام نشد؛ درخواست همچنان امن و معلق است.</b>\n"
                 f"علت: <code>{html.escape(str(result_msg))}</code>\n"
                 "ادمین می‌تواند دوباره ارسال را امتحان کند یا مبلغ را بهت برگرداند.",
-                parse_mode="HTML", reply_markup=get_withdrawal_keyboard(withdrawal_id)
+                withdrawal_id,
+                f"⚠️ <b>ارسال انجام نشد و درخواست همچنان معلق است.</b>\nعلت: <code>{html.escape(str(result_msg))}</code>",
+                reply_markup=get_withdrawal_keyboard(withdrawal_id)
             )
             try:
                 await bot.send_message(
