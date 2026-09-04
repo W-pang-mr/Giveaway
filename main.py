@@ -4,6 +4,7 @@
 # ==========================================
 
 import asyncio
+import base64
 import os
 import logging
 import html
@@ -45,7 +46,7 @@ def keep_alive():
 
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = [6879499219]
-BOT_VERSION = "4.6.0"
+BOT_VERSION = "4.6.1"
 WITHDRAW_CHANNEL = "@voidwithraw"
 WALLET_TRACKER_CHANNEL = "@Voidchanneloffical"  # کانال ارسال و بروزرسانی خودکار موجودی ولت سیستم
 TON_MNEMONIC = os.environ.get("TON_MNEMONIC")
@@ -75,6 +76,8 @@ referral_reward = 0.048
 max_referrals = 50
 ton_gas_fee = 0.005
 tracker_message_id = None
+# ارسال‌های TON باید پشت‌سرهم انجام شوند تا چند برداشت هم‌زمان از یک موجودی عبور نکند.
+payout_lock = asyncio.Lock()
 
 # ==========================================
 # استعلام موجودی ولت سیستم
@@ -197,47 +200,71 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
     if not TON_MNEMONIC:
         return False, "کلید امنیتی ولت (TON_MNEMONIC) تنظیم نشده است!"
     if not is_valid_ton_address(destination_address):
-        return False, "آدرس کیف‌پول TON معتبر نیست."
+        return False, "آدرس کیف‌پول TON معتبر نیست یا checksum آن درست نیست."
+    if amount_ton <= 0:
+        return False, "مبلغ واریز باید بیشتر از صفر باشد."
 
-    system_balance, balance_info = await get_system_wallet_balance()
-    required_balance = amount_ton + max(ton_gas_fee, 0)
-    if system_balance is None:
-        return False, f"موجودی ولت ربات قابل بررسی نیست: {balance_info}"
-    if system_balance < required_balance:
-        return False, f"موجودی ولت ربات کافی نمی‌باشد. موجودی فعلی: {system_balance:.4f} TON"
+    # بررسی و ارسال را سریالی می‌کنیم تا برداشت‌های هم‌زمان موجودی را دوبار مصرف نکنند.
+    async with payout_lock:
+        system_balance, balance_info = await get_system_wallet_balance()
+        required_balance = amount_ton + max(ton_gas_fee, 0)
+        if system_balance is None:
+            return False, f"موجودی ولت ربات قابل بررسی نیست: {balance_info}"
+        if system_balance < required_balance:
+            return False, (
+                f"موجودی ولت ربات کافی نمی‌باشد. موجودی فعلی: {system_balance:.4f} TON؛ "
+                f"مبلغ موردنیاز با کارمزد: {required_balance:.4f} TON"
+            )
 
-    client = None
-    try:
-        client = LiteClient.from_mainnet_config(ls_i=0, trust_level=2)
-        await client.connect()
+        client = None
+        try:
+            client = LiteClient.from_mainnet_config(ls_i=0, trust_level=2)
+            await client.connect()
 
-        mnemonics = TON_MNEMONIC.strip().split()
-        wallet = await WalletV5R1.from_mnemonic(client, mnemonics, network_global_id=-239)
-        seqno_before = await wallet.get_seqno()
-        await wallet.transfer(
-            destination=destination_address.strip(),
-            amount=int(amount_ton * 10**9),
-            body="Payout from Void Giveaway Bot 🎉"
-        )
+            mnemonics = TON_MNEMONIC.strip().split()
+            wallet = await WalletV5R1.from_mnemonic(client, mnemonics, network_global_id=-239)
+            seqno_before = await wallet.get_seqno()
+            await wallet.transfer(
+                destination=destination_address.strip(),
+                amount=int(amount_ton * 10**9),
+                body="Payout from Void Giveaway Bot 🎉"
+            )
 
-        # ارسال باید با تغییر seqno روی خود ولت تأیید شود؛ صرفاً بدون exception بودن کافی نیست.
-        for _ in range(6):
-            await asyncio.sleep(2)
-            try:
-                if await wallet.get_seqno() > seqno_before:
-                    await client.close()
-                    return True, f"تراکنش با موفقیت روی شبکه تأیید شد! (مبلغ: {amount_ton:.4f} TON) 🚀"
-            except Exception as confirm_error:
-                logging.warning(f"TON payout confirmation check failed: {confirm_error}")
+            # فقط بعد از تغییر seqno، ارسال را موفق اعلام می‌کنیم.
+            for _ in range(6):
+                await asyncio.sleep(2)
+                try:
+                    if await wallet.get_seqno() > seqno_before:
+                        await client.close()
+                        return True, f"تراکنش با موفقیت روی شبکه تأیید شد! (مبلغ: {amount_ton:.4f} TON) 🚀"
+                except Exception as confirm_error:
+                    logging.warning(f"TON payout confirmation check failed: {confirm_error}")
 
-        await client.close()
-        return False, "تراکنش ارسال شد اما هنوز روی شبکه تأیید نشده است."
-
-    except Exception as e:
-        logging.error(f"pytoniq W5 Payout Error: {e}")
-        if client and client.is_connected():
             await client.close()
-        return False, str(e)
+            return False, "تراکنش ارسال شد اما هنوز روی شبکه تأیید نشده است."
+
+        except Exception as e:
+            logging.error(f"pytoniq W5 Payout Error: {e}")
+            if client and client.is_connected():
+                await client.close()
+            return False, str(e)
+
+
+async def notify_wallet_issue(amount_ton: float, reason: str, withdrawal_id: str = None):
+    """هشدار قابل پیگیری برای ادمین هنگام توقف یا شکست برداشت."""
+    request_line = f"\n🆔 <b>شناسه درخواست:</b> <code>{html.escape(str(withdrawal_id))}</code>" if withdrawal_id else ""
+    alert = (
+        "🚨 <b>هشدار برداشت TON</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"💎 <b>مبلغ موردنیاز:</b> <code>{amount_ton:.4f} TON</code>\n"
+        f"⚠️ <b>علت:</b> {html.escape(str(reason))}"
+        f"{request_line}\n"
+        "لطفاً موجودی ولت سیستم و وضعیت برداشت را بررسی کنید."
+    )
+    try:
+        await bot.send_message(chat_id=WITHDRAW_CHANNEL, text=alert, parse_mode="HTML")
+    except Exception as alert_error:
+        logging.error(f"Wallet issue alert error: {alert_error}")
 
 # ==========================================
 # ذخیره و بازیابی دیتابیس MongoDB
@@ -532,7 +559,26 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 # سیستم برداشت و مدیریت موجودی
 # ==========================================
 def is_valid_ton_address(wallet_address: str) -> bool:
-    return bool(re.fullmatch(r"(?:EQ|UQ)[a-zA-Z0-9_-]{46}", wallet_address.strip()))
+    """اعتبارسنجی آدرس TON با فرمت friendly و checksum استاندارد TON."""
+    address = wallet_address.strip() if isinstance(wallet_address, str) else ""
+    if not re.fullmatch(r"(?:EQ|UQ)[a-zA-Z0-9_-]{46}", address):
+        return False
+
+    try:
+        raw = base64.urlsafe_b64decode(address + "==")
+        if len(raw) != 36:
+            return False
+
+        payload, checksum = raw[:-2], raw[-2:]
+        crc = 0
+        for byte in payload:
+            crc ^= byte << 8
+            for _ in range(8):
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+
+        return payload[0] in (0x11, 0x51) and crc.to_bytes(2, "big") == checksum
+    except (ValueError, TypeError, base64.binascii.Error):
+        return False
 
 
 def get_withdrawal_keyboard(withdrawal_id: str):
@@ -773,6 +819,35 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
         return
 
     is_auto = auto_payout_enabled
+    if is_auto:
+        # قبل از رزرو موجودی کاربر، موجودی واقعی ولت سیستم را چک می‌کنیم.
+        system_balance, balance_info = await get_system_wallet_balance()
+        required_balance = amount_to_send + max(ton_gas_fee, 0)
+        if system_balance is None:
+            reason = f"موجودی ولت سیستم قابل بررسی نیست: {balance_info}"
+            await notify_wallet_issue(amount_to_send, reason)
+            await state.clear()
+            await message.answer(
+                "⚠️ <b>برداشت خودکار موقتاً در دسترس نیست.</b>\n"
+                "موجودی ولت سیستم قابل بررسی نیست؛ لطفاً بعداً دوباره تلاش کنید.",
+                parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
+            )
+            return
+        if system_balance < required_balance:
+            reason = (
+                f"موجودی فعلی {system_balance:.4f} TON است و "
+                f"برای این برداشت حداقل {required_balance:.4f} TON لازم است."
+            )
+            await notify_wallet_issue(amount_to_send, reason)
+            await state.clear()
+            await message.answer(
+                "⚠️ <b>موجودی ولت سیستم برای این برداشت کافی نیست.</b>\n"
+                f"موجودی فعلی: <code>{system_balance:.4f} TON</code>\n"
+                "درخواست ثبت نشد و موجودی کیف‌پول شما کسر نشد.",
+                parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
+            )
+            return
+
     try:
         withdrawal_id = await create_withdrawal_record(
             user.id, wallet_addr, requested_amount, amount_to_send,
@@ -816,6 +891,7 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
                 parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
             )
         else:
+            await notify_wallet_issue(amount_to_send, str(result_msg), withdrawal_id)
             await refund_withdrawal(withdrawal_id, str(result_msg))
             await message.answer(
                 f"⚠️ <b>واریز خودکار انجام نشد.</b>\n\n"
@@ -905,6 +981,7 @@ async def approve_withdraw(call: types.CallbackQuery):
         except Exception:
             pass
     else:
+        await notify_wallet_issue(float(withdrawal["amount_to_send"]), str(result_msg), withdrawal_id)
         await set_withdrawal_status(withdrawal_id, "pending", last_error=str(result_msg))
         await call.message.edit_text(
             base_text + "\n\n⚠️ <b>وضعیت: معلق — ارسال روی شبکه تأیید نشد.</b>\n"
