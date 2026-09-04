@@ -327,7 +327,7 @@ async def send_ton_payout(destination_address: str, amount_ton: float, memo: str
                         client = None
                         if await verify_payout_on_chain(sender_address, destination_address, amount_ton, memo):
                             return True, f"تراکنش با memo {memo} روی شبکه و ولت مقصد تأیید شد! 🚀"
-                        return False, (
+                        return "pending", (
                             f"تراکنش با memo {memo} از ولت سیستم ارسال شد، اما هنوز در ولت مقصد تأیید نشده است."
                         )
                 except Exception as confirm_error:
@@ -693,6 +693,14 @@ def get_reject_withdrawal_keyboard(withdrawal_id: str):
     )
 
 
+def get_pending_verification_keyboard(withdrawal_id: str):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 بررسی دوباره memo", callback_data=f"wd_verify_{withdrawal_id}")]
+        ]
+    )
+
+
 async def get_next_withdrawal_memo() -> str:
     """شمارنده اتمیک memo؛ gap مجاز است اما شماره تکراری نیست."""
     counter = await counters_col.find_one_and_update(
@@ -1002,6 +1010,17 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
                 f"🏷️ <b>تگ پرداخت:</b> <code>{withdrawal_memo}</code>",
                 parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
             )
+        elif success == "pending":
+            await notify_wallet_issue(amount_to_send, str(result_msg), withdrawal_id)
+            await set_withdrawal_status(
+                withdrawal_id, "sent_pending_verification", last_error=str(result_msg)
+            )
+            await message.answer(
+                "⏳ <b>تراکنش از ولت سیستم ارسال شد و در انتظار تأیید ولت مقصد است.</b>\n\n"
+                f"🏷️ تگ پرداخت: <code>{withdrawal_memo}</code>\n"
+                "مبلغ شما رزرو شده و پس از تأیید memo وضعیت نهایی اعلام می‌شود.",
+                parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
+            )
         else:
             await notify_wallet_issue(amount_to_send, str(result_msg), withdrawal_id)
             await refund_withdrawal(withdrawal_id, str(result_msg))
@@ -1096,6 +1115,27 @@ async def approve_withdraw(call: types.CallbackQuery):
             )
         except Exception:
             pass
+    elif success == "pending":
+        await notify_wallet_issue(float(withdrawal["amount_to_send"]), str(result_msg), withdrawal_id)
+        await set_withdrawal_status(
+            withdrawal_id, "sent_pending_verification", last_error=str(result_msg)
+        )
+        await call.message.edit_text(
+            base_text + "\n\n⏳ <b>وضعیت: از ولت سیستم ارسال شد؛ تأیید memo ولت مقصد در انتظار است.</b>\n"
+            f"تگ پرداخت: <code>{withdrawal_memo}</code>\n"
+            "تا تأیید نهایی، درخواست را دوباره ارسال نکنید.",
+            parse_mode="HTML", reply_markup=get_pending_verification_keyboard(withdrawal_id)
+        )
+        try:
+            await bot.send_message(
+                int(withdrawal["user_id"]),
+                "⏳ <b>تراکنش برداشت ارسال شد و در انتظار تأیید ولت مقصد است.</b>\n"
+                f"🏷️ تگ پرداخت: <code>{withdrawal_memo}</code>\n"
+                "مبلغ رزرو شده و پس از پیدا شدن تراکنش با همین memo وضعیت نهایی اعلام می‌شود.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
     else:
         await notify_wallet_issue(float(withdrawal["amount_to_send"]), str(result_msg), withdrawal_id)
         await set_withdrawal_status(withdrawal_id, "pending", last_error=str(result_msg))
@@ -1110,11 +1150,59 @@ async def approve_withdraw(call: types.CallbackQuery):
                 int(withdrawal["user_id"]),
                 "⏳ <b>درخواست برداشت شما هنوز معلق است.</b>\n"
                 f"🏷️ تگ پرداخت: <code>{withdrawal_memo}</code>\n"
-                "ارسال یا تأیید تراکنش کامل نشد و مبلغ رزروشده محفوظ مانده است.",
+                "ارسال تراکنش تأیید نشد و مبلغ رزروشده محفوظ مانده است.",
                 parse_mode="HTML"
             )
         except Exception:
             pass
+
+
+@dp.callback_query(F.data.startswith("wd_verify_"))
+async def verify_pending_withdraw(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("🛑 شما ادمین نیستید!", show_alert=True)
+        return
+
+    withdrawal_id = call.data.replace("wd_verify_", "", 1)
+    withdrawal = await withdrawals_col.find_one({
+        "withdrawal_id": withdrawal_id, "status": "sent_pending_verification"
+    })
+    if not withdrawal:
+        current = await withdrawals_col.find_one({"withdrawal_id": withdrawal_id})
+        status = current.get("status", "نامشخص") if current else "پیدا نشد"
+        await call.answer(f"این درخواست در انتظار تأیید نیست؛ وضعیت: {status}", show_alert=True)
+        return
+
+    await call.answer("🔄 در حال بررسی دوباره memo در ولت مقصد...", show_alert=False)
+    _, sender_address = await get_system_wallet_balance()
+    memo = withdrawal.get("memo") or f"VOID-WD-{withdrawal_id.upper()}"
+    verified = await verify_payout_on_chain(
+        sender_address, withdrawal["wallet_address"], float(withdrawal["amount_to_send"]), memo
+    )
+    base_text = call.message.text or call.message.caption or ""
+    if verified:
+        await set_withdrawal_status(
+            withdrawal_id, "paid", paid_at=datetime.utcnow().isoformat(),
+            verified_at=datetime.utcnow().isoformat()
+        )
+        await call.message.edit_text(
+            base_text + "\n\n✅ <b>memo و واریز در ولت مقصد تأیید شد.</b>",
+            parse_mode="HTML", reply_markup=None
+        )
+        try:
+            await bot.send_message(
+                int(withdrawal["user_id"]),
+                f"✅ <b>برداشت شما تأیید شد.</b>\n🏷️ تگ پرداخت: <code>{memo}</code>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+    else:
+        await call.answer("هنوز تراکنشی با این memo پیدا نشد.", show_alert=True)
+        await call.message.edit_text(
+            base_text + "\n\n⏳ <b>هنوز memo در ولت مقصد پیدا نشد.</b>",
+            parse_mode="HTML", reply_markup=get_pending_verification_keyboard(withdrawal_id)
+        )
 
 
 @dp.callback_query(F.data.startswith("wd_reject_menu_"))
