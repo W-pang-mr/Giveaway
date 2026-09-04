@@ -8,6 +8,7 @@ import os
 import logging
 import html
 import re
+import uuid
 from datetime import datetime
 from flask import Flask
 from threading import Thread
@@ -21,6 +22,7 @@ from aiogram.exceptions import TelegramBadRequest
 
 import motor.motor_asyncio
 from pytoniq import LiteClient, WalletV5R1
+from pymongo import ReturnDocument
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("pytoniq").setLevel(logging.WARNING)
@@ -43,6 +45,7 @@ def keep_alive():
 
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = [6879499219]
+BOT_VERSION = "4.6.0"
 WITHDRAW_CHANNEL = "@voidwithraw"
 WALLET_TRACKER_CHANNEL = "@Voidchanneloffical"  # کانال ارسال و بروزرسانی خودکار موجودی ولت سیستم
 TON_MNEMONIC = os.environ.get("TON_MNEMONIC")
@@ -54,6 +57,7 @@ db = mongo_client['void_giveaway_db']
 
 users_col = db['users']
 settings_col = db['settings']
+withdrawals_col = db['withdrawals']
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -163,24 +167,6 @@ async def wallet_balance_tracker_loop():
 # ==========================================
 # تابع بررسی اکانت واقعی
 # ==========================================
-async def is_real_user(user: types.User) -> bool:
-    try:
-        if not user.username or not user.first_name:
-            return False
-
-        photos = await bot.get_user_profile_photos(user.id, limit=1)
-        if photos.total_count == 0:
-            return False
-
-        chat = await bot.get_chat(user.id)
-        if not chat.bio or chat.bio.strip() == "":
-            return False
-
-        return True
-    except Exception as e:
-        logging.error(f"Anti-Fake Validation Error: {e}")
-        return False
-
 # ==========================================
 # تابع بررسی عضویت اجباری (چندکاناله)
 # ==========================================
@@ -210,7 +196,16 @@ def get_join_channel_keyboard():
 async def send_ton_payout(destination_address: str, amount_ton: float):
     if not TON_MNEMONIC:
         return False, "کلید امنیتی ولت (TON_MNEMONIC) تنظیم نشده است!"
-    
+    if not is_valid_ton_address(destination_address):
+        return False, "آدرس کیف‌پول TON معتبر نیست."
+
+    system_balance, balance_info = await get_system_wallet_balance()
+    required_balance = amount_ton + max(ton_gas_fee, 0)
+    if system_balance is None:
+        return False, f"موجودی ولت ربات قابل بررسی نیست: {balance_info}"
+    if system_balance < required_balance:
+        return False, f"موجودی ولت ربات کافی نمی‌باشد. موجودی فعلی: {system_balance:.4f} TON"
+
     client = None
     try:
         client = LiteClient.from_mainnet_config(ls_i=0, trust_level=2)
@@ -218,17 +213,25 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
 
         mnemonics = TON_MNEMONIC.strip().split()
         wallet = await WalletV5R1.from_mnemonic(client, mnemonics, network_global_id=-239)
-
-        amount_nano = int(amount_ton * 10**9)
-
+        seqno_before = await wallet.get_seqno()
         await wallet.transfer(
             destination=destination_address.strip(),
-            amount=amount_nano,
+            amount=int(amount_ton * 10**9),
             body="Payout from Void Giveaway Bot 🎉"
         )
 
+        # ارسال باید با تغییر seqno روی خود ولت تأیید شود؛ صرفاً بدون exception بودن کافی نیست.
+        for _ in range(6):
+            await asyncio.sleep(2)
+            try:
+                if await wallet.get_seqno() > seqno_before:
+                    await client.close()
+                    return True, f"تراکنش با موفقیت روی شبکه تأیید شد! (مبلغ: {amount_ton:.4f} TON) 🚀"
+            except Exception as confirm_error:
+                logging.warning(f"TON payout confirmation check failed: {confirm_error}")
+
         await client.close()
-        return True, f"تراکنش انجام شد! (مبلغ: {amount_ton:.4f} TON) 🚀"
+        return False, "تراکنش ارسال شد اما هنوز روی شبکه تأیید نشده است."
 
     except Exception as e:
         logging.error(f"pytoniq W5 Payout Error: {e}")
@@ -410,55 +413,43 @@ async def process_referral_logic(user: types.User, args: str, state: FSMContext)
     if is_new_user:
         all_time_users.add(u_id)
 
-    if args and is_new_user:
-        real = await is_real_user(user)
+    if args and is_new_user and args.startswith("ref_"):
+        try:
+            referrer_id = int(args.replace("ref_", ""))
+            if referrer_id != u_id and referrer_id in user_data:
+                prof["referred_by"] = referrer_id
+                ref_prof = get_user_profile(referrer_id)
 
-        if args.startswith("ref_"):
-            try:
-                referrer_id = int(args.replace("ref_", ""))
-                if referrer_id != u_id and referrer_id in user_data:
-                    prof["referred_by"] = referrer_id
-                    ref_prof = get_user_profile(referrer_id)
-
-                    if real:
-                        if ref_prof["referrals_count"] < max_referrals:
-                            ref_prof["balance"] = round(ref_prof["balance"] + referral_reward, 4)
-                            ref_prof["referrals_count"] += 1
-                            
-                            await users_col.update_one({"user_id": referrer_id}, {"$set": user_data[referrer_id]}, upsert=True)
-
-                            try:
-                                await bot.send_message(
-                                    referrer_id,
-                                    f"🎉 <b>یک کاربر واقعی جدید با لینک شما وارد ربات شد!</b>\n"
-                                    f"💎 <b>+{referral_reward} TON</b> مستقیماً به ولت شما اضافه شد!\n"
-                                    f"📊 رفرال‌های معتبر شما: <code>{ref_prof['referrals_count']}/{max_referrals}</code>",
-                                    parse_mode="HTML"
-                                )
-                            except Exception:
-                                pass
-                        else:
-                            try:
-                                await bot.send_message(
-                                    referrer_id,
-                                    f"⚠️ <b>یک کاربر با لینک شما وارد شد اما پاداشی محاسبه نگردید!</b>\n"
-                                    f"علت: شما به حداکثر سقف مجاز رفرال (<code>{max_referrals}</code> نفر) رسیده‌اید.",
-                                    parse_mode="HTML"
-                                )
-                            except Exception:
-                                pass
-                    else:
-                        try:
-                            await bot.send_message(
-                                referrer_id,
-                                f"⚠️ <b>یک کاربر با لینک شما وارد شد اما پاداش تعلق نگرفت!</b>\n"
-                                f"علت: کاربر فیک است (فاقد عکس پروفایل، بیوگرافی، یوزرنیم یا نام معتبر).",
-                                parse_mode="HTML"
-                            )
-                        except Exception:
-                            pass
-            except Exception as e:
-                logging.error(f"Direct Referral Error: {e}")
+                if ref_prof["referrals_count"] < max_referrals:
+                    ref_prof["balance"] = round(ref_prof["balance"] + referral_reward, 4)
+                    ref_prof["referrals_count"] += 1
+                    await users_col.update_one(
+                        {"user_id": referrer_id},
+                        {"$set": user_data[referrer_id]},
+                        upsert=True
+                    )
+                    try:
+                        await bot.send_message(
+                            referrer_id,
+                            f"🎉 <b>یک کاربر جدید با لینک شما وارد ربات شد!</b>\n"
+                            f"💎 <b>+{referral_reward} TON</b> مستقیماً به کیف‌پول شما اضافه شد!\n"
+                            f"📊 رفرال‌های شما: <code>{ref_prof['referrals_count']}/{max_referrals}</code>",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        await bot.send_message(
+                            referrer_id,
+                            f"⚠️ <b>یک کاربر با لینک شما وارد شد، اما سقف رفرال شما پر است.</b>\n"
+                            f"سقف مجاز: <code>{max_referrals}</code> نفر",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            logging.error(f"Direct Referral Error: {e}")
 
     await save_data()
 
@@ -490,8 +481,8 @@ async def check_join_btn_callback(call: types.CallbackQuery, state: FSMContext):
         await call.message.delete()
         await call.message.answer(
             f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
-            f"📌 <b>نسخه ربات:</b> <code>v4.5.2</code> 💎\n\n"
-            f"🎁 <b>به ازای هر رفرال واقعی {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
+            f"📌 <b>نسخه ربات:</b> <code>{BOT_VERSION}</code> 💎\n\n"
+            f"🎁 <b>به ازای هر رفرال {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
             f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
             parse_mode="HTML",
             reply_markup=get_main_keyboard(u_id)
@@ -531,7 +522,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
     await message.answer(
         f"⚡️ <b>به ربات Void Giveaway خوش آمدید!</b>\n"
         f"📌 <b>نسخه ربات:</b> <code>v4.5.2</code> 💎\n\n"
-        f"🎁 <b>به ازای هر رفرال واقعی {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
+        f"🎁 <b>به ازای هر رفرال {referral_reward} TON مستقیماً به کیف‌پول شما اضافه می‌شود!</b>\n\n"
         f"از منوی زیر جهت مدیریت موجودی، برداشت و دریافت لینک دعوت استفاده کنید 👇",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
@@ -540,6 +531,76 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 # ==========================================
 # سیستم برداشت و مدیریت موجودی
 # ==========================================
+def is_valid_ton_address(wallet_address: str) -> bool:
+    return bool(re.fullmatch(r"(?:EQ|UQ)[a-zA-Z0-9_-]{46}", wallet_address.strip()))
+
+
+def get_withdrawal_keyboard(withdrawal_id: str):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ بررسی و واریز TON", callback_data=f"wd_approve_{withdrawal_id}"),
+                InlineKeyboardButton(text="↩️ رد و بازگشت مبلغ", callback_data=f"wd_reject_{withdrawal_id}")
+            ]
+        ]
+    )
+
+
+async def create_withdrawal_record(user_id: int, wallet_address: str, requested_amount: float,
+                                   amount_to_send: float, deducted_amount: float, status: str) -> str:
+    withdrawal_id = uuid.uuid4().hex[:16]
+    now = datetime.utcnow().isoformat()
+    await withdrawals_col.insert_one({
+        "withdrawal_id": withdrawal_id,
+        "user_id": user_id,
+        "wallet_address": wallet_address,
+        "requested_amount": requested_amount,
+        "amount_to_send": amount_to_send,
+        "deducted_amount": deducted_amount,
+        "status": status,
+        "created_at": now,
+        "updated_at": now
+    })
+    return withdrawal_id
+
+
+async def set_withdrawal_status(withdrawal_id: str, status: str, **fields):
+    fields["status"] = status
+    fields["updated_at"] = datetime.utcnow().isoformat()
+    await withdrawals_col.update_one(
+        {"withdrawal_id": withdrawal_id},
+        {"$set": fields}
+    )
+
+
+async def claim_withdrawal(withdrawal_id: str):
+    return await withdrawals_col.find_one_and_update(
+        {"withdrawal_id": withdrawal_id, "status": "pending"},
+        {"$set": {"status": "processing", "updated_at": datetime.utcnow().isoformat()}},
+        return_document=ReturnDocument.AFTER
+    )
+
+
+async def refund_withdrawal(withdrawal_id: str, reason: str, allowed_statuses=("pending", "processing")) -> bool:
+    status_filter = allowed_statuses[0] if len(allowed_statuses) == 1 else {"$in": list(allowed_statuses)}
+    withdrawal = await withdrawals_col.find_one_and_update(
+        {"withdrawal_id": withdrawal_id, "status": status_filter},
+        {"$set": {
+            "status": "refunded",
+            "refund_reason": reason,
+            "updated_at": datetime.utcnow().isoformat()
+        }},
+        return_document=ReturnDocument.BEFORE
+    )
+    if not withdrawal:
+        return False
+
+    prof = get_user_profile(int(withdrawal["user_id"]))
+    prof["balance"] = round(prof.get("balance", 0.0) + float(withdrawal["deducted_amount"]), 4)
+    await save_data()
+    return True
+
+
 @dp.message(F.text == "💎 کیف‌پول من (Wallet)")
 async def show_wallet(message: types.Message):
     u_id = message.from_user.id
@@ -569,7 +630,7 @@ async def show_wallet(message: types.Message):
         f"🔝 <b>حداکثر برداشت:</b> <code>{max_withdraw_amount} TON</code>\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
-    
+
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📤 ثبت درخواست برداشت (Withdraw)", callback_data="start_withdraw")]
@@ -577,9 +638,9 @@ async def show_wallet(message: types.Message):
     )
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
+
 @dp.callback_query(F.data == "start_withdraw")
 async def start_withdraw_callback(call: types.CallbackQuery, state: FSMContext):
-    await call.answer()
     u_id = call.from_user.id
 
     if is_banned(u_id):
@@ -603,6 +664,7 @@ async def start_withdraw_callback(call: types.CallbackQuery, state: FSMContext):
         )
         return
 
+    await call.answer()
     await state.set_state(WithdrawForm.amount)
     await call.message.answer(
         f"💰 <b>موجودی قابل برداشت شما:</b> <code>{prof['balance']:.4f} TON</code>\n"
@@ -613,6 +675,7 @@ async def start_withdraw_callback(call: types.CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
 
+
 @dp.message(WithdrawForm.amount)
 async def process_withdraw_amount(message: types.Message, state: FSMContext):
     u_id = message.from_user.id
@@ -620,48 +683,47 @@ async def process_withdraw_amount(message: types.Message, state: FSMContext):
         return
 
     prof = get_user_profile(u_id, message.from_user)
-    
     try:
         req_amount = float(message.text.strip())
-    except ValueError:
+    except (ValueError, AttributeError):
         await message.answer("⚠️ لطفاً یک عدد معتبر وارد کنید!")
         return
 
+    if req_amount <= 0:
+        await message.answer("⚠️ مقدار برداشت باید بیشتر از صفر باشد!")
+        return
     if req_amount < min_withdraw_amount:
-        await message.answer(f"⚠️ حداقل مقدار برداشت <code>{min_withdraw_amount} TON</code> می‌باشد!")
+        await message.answer(f"⚠️ حداقل مقدار برداشت <code>{min_withdraw_amount} TON</code> می‌باشد!", parse_mode="HTML")
         return
-
     if req_amount > max_withdraw_amount:
-        await message.answer(f"⚠️ حداکثر سقف برداشت در هر بار <code>{max_withdraw_amount} TON</code> می‌باشد!")
+        await message.answer(f"⚠️ حداکثر سقف برداشت در هر بار <code>{max_withdraw_amount} TON</code> می‌باشد!", parse_mode="HTML")
         return
-
     if req_amount > prof["balance"]:
-        await message.answer("⚠️ مقدار درخواستی بیشتر از موجودی ولت شما است!")
+        await message.answer("⚠️ مقدار درخواستی بیشتر از موجودی کیف‌پول شما است!")
         return
 
-    deduct_from_balance = req_amount
-    amount_to_send = req_amount - ton_gas_fee
-
+    deduct_from_balance = round(req_amount, 4)
+    amount_to_send = round(req_amount - ton_gas_fee, 4)
     if amount_to_send <= 0:
         await message.answer(f"❌ مبلغ درخواستی شما باید بیشتر از کارمزد شبکه ({ton_gas_fee} TON) باشد!")
         return
 
     await state.update_data(
         requested_amount=req_amount,
-        amount_to_send=round(amount_to_send, 4),
-        deduct_from_balance=round(deduct_from_balance, 4)
+        amount_to_send=amount_to_send,
+        deduct_from_balance=deduct_from_balance
     )
     await state.set_state(WithdrawForm.wallet_address)
-    
     await message.answer(
         f"📊 <b>جزئیات تراکنش شما:</b>\n"
         f"🔹 <b>مبلغ درخواستی:</b> <code>{req_amount:.4f} TON</code>\n"
         f"⛽️ <b>گس‌فی کسر شده:</b> <code>{ton_gas_fee} TON</code>\n"
-        f"🚀 <b>خالص دریافتی به ولت شما:</b> <code>{amount_to_send:.4f} TON</code>\n"
-        f"💰 <b>مبلغ کسر شده از موجودی:</b> <code>{deduct_from_balance:.4f} TON</code>\n\n"
-        f"📝 لطفاً <b>آدرس ولت TON (مانند EQ... یا UQ...)</b> خود را جهت واریز بفرستید:",
+        f"🚀 <b>خالص دریافتی به کیف‌پول شما:</b> <code>{amount_to_send:.4f} TON</code>\n"
+        f"💰 <b>مبلغ رزروشده از موجودی:</b> <code>{deduct_from_balance:.4f} TON</code>\n\n"
+        f"📝 لطفاً <b>آدرس کیف‌پول TON</b> خود را بفرستید:",
         parse_mode="HTML"
     )
+
 
 @dp.message(WithdrawForm.wallet_address)
 async def process_withdraw_address(message: types.Message, state: FSMContext):
@@ -670,162 +732,192 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
         return
 
     wallet_addr = message.text.strip()
+    if not is_valid_ton_address(wallet_addr):
+        await message.answer("⚠️ آدرس TON معتبر نیست. آدرس باید با EQ یا UQ شروع شود و کامل باشد.")
+        return
+
     data = await state.get_data()
-    
     amount_to_send = data.get("amount_to_send")
     deduct_from_balance = data.get("deduct_from_balance")
-    
+    requested_amount = data.get("requested_amount")
+    if amount_to_send is None or deduct_from_balance is None or requested_amount is None:
+        await state.clear()
+        await message.answer("❌ نشست برداشت منقضی شد؛ لطفاً دوباره درخواست برداشت ثبت کنید.")
+        return
+
     user = message.from_user
     prof = get_user_profile(user.id, user)
-
     if deduct_from_balance > prof["balance"]:
-        await message.answer("❌ خطا: موجودی حساب شما تغییر کرده است.")
         await state.clear()
+        await message.answer("❌ موجودی حساب شما تغییر کرده است؛ درخواست برداشت لغو شد.")
+        return
+
+    is_auto = auto_payout_enabled
+    try:
+        withdrawal_id = await create_withdrawal_record(
+            user.id, wallet_addr, requested_amount, amount_to_send,
+            deduct_from_balance, "processing" if is_auto else "pending"
+        )
+    except Exception as e:
+        logging.error(f"Withdrawal record creation error: {e}")
+        await state.clear()
+        await message.answer("❌ ثبت درخواست برداشت ممکن نشد؛ موجودی شما کسر نشده است.")
         return
 
     prof["balance"] = round(prof["balance"] - deduct_from_balance, 4)
     await save_data()
-
     user_mention = f"@{user.username}" if user.username else f'<a href="tg://user?id={user.id}">{html.escape(user.first_name)}</a>'
 
-    if auto_payout_enabled:
-        await message.answer("⏳ در حال پردازش و واریز خودکار به ولت شما...", parse_mode="HTML")
+    if is_auto:
+        await message.answer("⏳ در حال بررسی موجودی ولت ربات و ارسال خودکار...", parse_mode="HTML")
         success, result_msg = await send_ton_payout(wallet_addr, amount_to_send)
-        
         if success:
-            withdraw_text = (
-                f"⚡️ <b>واریز خودکار انجام شد!</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"👤 <b>کاربر:</b> {user_mention} (ID: <code>{user.id}</code>)\n"
-                f"💎 <b>مبلغ واریزی:</b> <code>{amount_to_send} TON</code>\n"
-                f"📝 <b>آدرس ولت:</b>\n<code>{html.escape(wallet_addr)}</code>\n"
-                f"⏰ <b>زمان:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-                f"━━━━━━━━━━━━━━━━━━"
-            )
-            try:
-                await bot.send_message(chat_id=WITHDRAW_CHANNEL, text=withdraw_text, parse_mode="HTML")
-            except Exception as e:
-                logging.error(f"Auto withdraw channel notification error: {e}")
-
+            await set_withdrawal_status(withdrawal_id, "paid", paid_at=datetime.utcnow().isoformat())
             await message.answer(
-                f"🎉 <b>تراکنش شما با موفقیت به شبکه ارسال گردید!</b>\n\n"
-                f"🚀 <b>مبلغ واریزی:</b> <code>{amount_to_send} TON</code>",
-                parse_mode="HTML",
-                reply_markup=get_main_keyboard(user.id)
+                f"🎉 <b>تراکنش با موفقیت تأیید و ارسال شد!</b>\n\n"
+                f"🚀 <b>مبلغ واریزی:</b> <code>{amount_to_send:.4f} TON</code>",
+                parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
             )
         else:
-            prof["balance"] = round(prof["balance"] + deduct_from_balance, 4)
-            await save_data()
+            await refund_withdrawal(withdrawal_id, str(result_msg))
             await message.answer(
-                f"❌ <b>خطا در واریز اتوماتیک:</b> {result_msg}\nمبلغ کسر شده به ولت شما بازگردانده شد.",
-                parse_mode="HTML",
-                reply_markup=get_main_keyboard(user.id)
+                f"⚠️ <b>واریز خودکار انجام نشد.</b>\n\n"
+                f"علت: {html.escape(str(result_msg))}\n"
+                f"💰 مبلغ <code>{deduct_from_balance:.4f} TON</code> به کیف‌پول شما برگشت داده شد.",
+                parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
             )
         await state.clear()
         return
 
     withdraw_text = (
-        f"🔔 <b>درخواست برداشت جدید TON!</b>\n"
+        f"🔔 <b>درخواست برداشت جدید TON</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 <b>شناسه درخواست:</b> <code>{withdrawal_id}</code>\n"
         f"👤 <b>کاربر:</b> {user_mention} (ID: <code>{user.id}</code>)\n"
-        f"💎 <b>خالص واریزی به ولت:</b> <code>{amount_to_send} TON</code>\n"
-        f"⛽️ <b>گس‌فی شبکه:</b> <code>{ton_gas_fee} TON</code>\n"
-        f"💰 <b>کل کسر شده از حساب:</b> <code>{deduct_from_balance} TON</code>\n\n"
-        f"📝 <b>آدرس ولت:</b>\n<code>{html.escape(wallet_addr)}</code>\n\n"
-        f"⏰ <b>زمان ثبت:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        f"💎 <b>خالص واریزی:</b> <code>{amount_to_send:.4f} TON</code>\n"
+        f"💰 <b>مبلغ رزروشده:</b> <code>{deduct_from_balance:.4f} TON</code>\n"
+        f"📝 <b>آدرس کیف‌پول:</b>\n<code>{html.escape(wallet_addr)}</code>\n"
+        f"⏳ <b>وضعیت:</b> معلق تا بررسی و تأیید ادمین\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
-    
-    admin_action_kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ واریز اتوماتیک TON", callback_data=f"wd_approve_{user.id}_{amount_to_send}_{deduct_from_balance}"),
-                InlineKeyboardButton(text="❌ رد درخواست", callback_data=f"wd_reject_{user.id}_{deduct_from_balance}")
-            ]
-        ]
-    )
-    
+
     try:
-        await bot.send_message(chat_id=WITHDRAW_CHANNEL, text=withdraw_text, parse_mode="HTML", reply_markup=admin_action_kb)
+        admin_message = await bot.send_message(
+            chat_id=WITHDRAW_CHANNEL,
+            text=withdraw_text,
+            parse_mode="HTML",
+            reply_markup=get_withdrawal_keyboard(withdrawal_id)
+        )
+        await set_withdrawal_status(
+            withdrawal_id, "pending",
+            admin_message_id=admin_message.message_id,
+            admin_channel=WITHDRAW_CHANNEL
+        )
     except Exception as e:
         logging.error(f"Withdraw channel send error: {e}")
-        prof["balance"] = round(prof["balance"] + deduct_from_balance, 4)
-        await save_data()
-        await message.answer("❌ خطایی در ارسال درخواست به کانال پشتیبانی رخ داد.")
+        await refund_withdrawal(withdrawal_id, "ارسال درخواست به کانال ادمین انجام نشد")
         await state.clear()
+        await message.answer("❌ درخواست به کانال ادمین ارسال نشد؛ مبلغ به کیف‌پول شما برگشت داده شد.")
         return
 
     await state.clear()
     await message.answer(
-        f"✅ <b>درخواست برداشت با موفقیت ثبت شد!</b>\n\n"
-        f"🚀 <b>مبلغ خالص واریزی:</b> <code>{amount_to_send} TON</code>\n"
-        f"اطلاعات به کانال پشتیبانی ارسال شد و به زودی پردازش می‌گردد 🔥",
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard(user.id)
+        f"✅ <b>درخواست برداشت ثبت شد و معلق است.</b>\n\n"
+        f"شناسه: <code>{withdrawal_id}</code>\n"
+        f"پس از تأیید ادمین، ارسال انجام و نتیجه بررسی می‌شود.",
+        parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
     )
 
+
 # ==========================================
-# تایید/رد واریزها توسط ادمین
+# تایید، معلق‌کردن و بازگرداندن واریزها توسط ادمین
 # ==========================================
 @dp.callback_query(F.data.startswith("wd_approve_"))
 async def approve_withdraw(call: types.CallbackQuery):
-    await call.answer()
     if not is_admin(call.from_user.id):
         await call.answer("🛑 شما ادمین نیستید!", show_alert=True)
         return
 
-    parts = call.data.split("_")
-    target_user_id = int(parts[2])
-    amount_to_send = float(parts[3])
-
-    message_text = call.message.text or call.message.caption or ""
-    match = re.search(r'(EQ[a-zA-Z0-9_-]{46}|UQ[a-zA-Z0-9_-]{46})', message_text)
-    
-    if not match:
-        await call.answer("❌ آدرس ولت معتبری در متن پیام یافت نشد!", show_alert=True)
+    withdrawal_id = call.data.replace("wd_approve_", "", 1)
+    withdrawal = await claim_withdrawal(withdrawal_id)
+    if not withdrawal:
+        current = await withdrawals_col.find_one({"withdrawal_id": withdrawal_id})
+        status = current.get("status", "نامشخص") if current else "پیدا نشد"
+        await call.answer(f"این درخواست قبلاً پردازش شده یا وضعیت آن {status} است.", show_alert=True)
         return
 
-    dest_addr = match.group(1)
-    await call.answer("⏳ در حال ارسال تراکنش به شبکه TON...", show_alert=False)
+    await call.answer("⏳ در حال بررسی موجودی و تأیید تراکنش...", show_alert=False)
+    success, result_msg = await send_ton_payout(
+        withdrawal["wallet_address"], float(withdrawal["amount_to_send"])
+    )
+    base_text = call.message.text or call.message.caption or ""
 
-    success, result_msg = await send_ton_payout(dest_addr, amount_to_send)
     if success:
-        updated_text = call.message.text + f"\n\n✅ <b>وضعیت: واریز {amount_to_send} TON با موفقیت انجام شد! 💎</b>"
-        await call.message.edit_text(updated_text, parse_mode="HTML", reply_markup=None)
-        await call.answer(f"✅ {amount_to_send} TON با موفقیت منتقل شد!", show_alert=True)
+        await set_withdrawal_status(withdrawal_id, "paid", paid_at=datetime.utcnow().isoformat())
+        await call.message.edit_text(
+            base_text + f"\n\n✅ <b>وضعیت: واریز {float(withdrawal['amount_to_send']):.4f} TON تأیید و ارسال شد.</b>",
+            parse_mode="HTML", reply_markup=None
+        )
         try:
             await bot.send_message(
-                target_user_id,
-                f"🎉 <b>درخواست برداشت شما تایید و واریز شد!</b>\n\n🎁 مقدار <b>{amount_to_send} TON</b> به ولت شما منتقل گردید.",
+                int(withdrawal["user_id"]),
+                f"🎉 <b>درخواست برداشت شما تأیید و ارسال شد!</b>\n\n"
+                f"💎 مبلغ واریزی: <code>{float(withdrawal['amount_to_send']):.4f} TON</code>",
                 parse_mode="HTML"
             )
         except Exception:
             pass
     else:
-        await call.answer(f"❌ خطا در واریز: {result_msg}", show_alert=True)
+        await set_withdrawal_status(withdrawal_id, "pending", last_error=str(result_msg))
+        await call.message.edit_text(
+            base_text + "\n\n⚠️ <b>وضعیت: معلق — ارسال روی شبکه تأیید نشد.</b>\n"
+            f"علت: <code>{html.escape(str(result_msg))}</code>\n"
+            "می‌توانی دوباره بررسی/واریز را بزنید یا مبلغ را برگردانید.",
+            parse_mode="HTML", reply_markup=get_withdrawal_keyboard(withdrawal_id)
+        )
+        try:
+            await bot.send_message(
+                int(withdrawal["user_id"]),
+                "⏳ <b>درخواست برداشت شما هنوز معلق است.</b>\n"
+                "ارسال تراکنش تأیید نشد و موجودی شما محفوظ مانده است.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
 
 @dp.callback_query(F.data.startswith("wd_reject_"))
 async def reject_withdraw(call: types.CallbackQuery):
-    await call.answer()
     if not is_admin(call.from_user.id):
         await call.answer("🛑 شما ادمین نیستید!", show_alert=True)
         return
 
-    parts = call.data.split("_")
-    target_user_id = int(parts[2])
+    withdrawal_id = call.data.replace("wd_reject_", "", 1)
+    withdrawal = await withdrawals_col.find_one({"withdrawal_id": withdrawal_id})
+    if not withdrawal:
+        await call.answer("❌ درخواست برداشت پیدا نشد.", show_alert=True)
+        return
 
-    updated_text = call.message.text + "\n\n❌ <b>وضعیت: رد شد (به علت ثبت رفرال فیک)</b>"
-    await call.message.edit_text(updated_text, parse_mode="HTML", reply_markup=None)
-    await call.answer("❌ درخواست رد شد.", show_alert=True)
+    refunded = await refund_withdrawal(withdrawal_id, "رد درخواست توسط ادمین", allowed_statuses=("pending",))
+    if not refunded:
+        await call.answer("⚠️ این درخواست قبلاً پردازش شده است.", show_alert=True)
+        return
 
+    await call.answer("✅ درخواست رد شد و مبلغ به کاربر برگشت.", show_alert=True)
+    base_text = call.message.text or call.message.caption or ""
+    await call.message.edit_text(
+        base_text + "\n\n↩️ <b>وضعیت: رد شد و مبلغ به کیف‌پول کاربر برگشت داده شد.</b>",
+        parse_mode="HTML", reply_markup=None
+    )
     try:
         await bot.send_message(
-            target_user_id,
-            "❌ <b>درخواست برداشت شما رد شد!</b>\n\nعلت: شما زیرمجموعه فیک ثبت کرده‌اید.",
+            int(withdrawal["user_id"]),
+            "↩️ <b>درخواست برداشت شما رد شد.</b>\nمبلغ رزروشده به کیف‌پول شما برگشت داده شد.",
             parse_mode="HTML"
         )
     except Exception:
         pass
+
 
 # ==========================================
 # گزینه‌های پروفایل و راهنما
@@ -855,10 +947,9 @@ async def send_referral_link_menu(message: types.Message):
     text = (
         f"🚀 <b>لینک دعوت اختصاصی شما:</b>\n\n"
         f"🔗 <code>{general_ref_link}</code>\n\n"
-        f"💎 <b>پاداش دعوت:</b> به ازای هر کاربر واقعی <b>{referral_reward} TON</b>\n"
+        f"💎 <b>پاداش دعوت:</b> به ازای هر کاربر جدید <b>{referral_reward} TON</b>\n"
         f"👥 <b>مجموع دعوت‌های معتبر شما:</b> {prof['referrals_count']} از {max_referrals} نفر\n\n"
-        f"⚠️ <i>توجه: کاربران حتما باید دارای عکس پروفایل، یوزرنیم، نام و بیوگرافی باشند تا رفرال واقعی محاسبه شوند.</i>"
-    )
+            )
     await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
 
 @dp.message(F.text == "👤 پروفایل من")
@@ -908,11 +999,10 @@ async def show_help(message: types.Message):
 
     text = (
         f"ℹ️ <b>راهنمای ربات Void Giveaway:</b>\n\n"
-        f"1️⃣ با دعوت هر کاربر جدید و واقعی از طریق لینک رفرال خود <b>{referral_reward} TON</b> پاداش دریافت می‌کنید.\n"
-        f"2️⃣ کاربر جدید جهت تایید رفرال واقعی حتماً باید عکس، بیوگرافی، یوزرنیم و اسم داشته باشد.\n"
-        f"3️⃣ سقف مجاز دریافت رفرال برای هر کاربر برابر با <b>{max_referrals} نفر</b> می‌باشد.\n"
-        f"4️⃣ پاداش‌ها مستقیماً وارد «کیف‌پول من» می‌شوند.\n"
-        f"5️⃣ پس از رسیدن به حداقل کف برداشت (<code>{min_withdraw_amount} TON</code>) می‌توانید درخواست واریز ثبت کنید."
+        f"1️⃣ با دعوت هر کاربر جدید از طریق لینک رفرال خود <b>{referral_reward} TON</b> پاداش دریافت می‌کنید.\n"
+        f"2️⃣ سقف مجاز دریافت رفرال برای هر کاربر برابر با <b>{max_referrals} نفر</b> می‌باشد.\n"
+        f"3️⃣ پاداش‌ها مستقیماً وارد «کیف‌پول من» می‌شوند.\n"
+        f"4️⃣ پس از رسیدن به حداقل کف برداشت (<code>{min_withdraw_amount} TON</code>) می‌توانید درخواست واریز ثبت کنید."
     )
     await message.answer(text, parse_mode="HTML")
 
