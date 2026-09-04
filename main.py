@@ -101,12 +101,12 @@ async def get_system_wallet_balance():
         balance_nano = account_state.balance
         balance_ton = balance_nano / 10**9
 
-        await client.close()
+        await close_lite_client(client)
+        client = None
         return balance_ton, wallet.address.to_str(is_user_friendly=True, is_bounceable=False)
     except Exception as e:
         logging.error(f"Error fetching wallet balance: {e}")
-        if client and client.is_connected():
-            await client.close()
+        await close_lite_client(client)
         return None, str(e)
 
 # ==========================================
@@ -830,11 +830,14 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
                 )
                 return
 
+        withdrawal_id = None
+        reserved = False
         try:
             withdrawal_id = await create_withdrawal_record(
                 user.id, wallet_addr, float(requested_amount), float(amount_to_send), float(deducted_amount)
             )
-            if not await reserve_user_balance(user.id, float(deducted_amount)):
+            reserved = await reserve_user_balance(user.id, float(deducted_amount))
+            if not reserved:
                 await set_withdrawal_status(withdrawal_id, "failed", last_error="موجودی کافی نبود")
                 await state.clear()
                 await message.answer("❌ موجودی شما برای رزرو برداشت کافی نیست.")
@@ -845,8 +848,13 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
             )
         except Exception as e:
             logging.error(f"Withdrawal reservation error: {e}")
+            if withdrawal_id:
+                if reserved:
+                    await refund_withdrawal(withdrawal_id, "خطا بعد از رزرو موجودی", allowed_statuses=("created", "reserved", "processing", "pending"))
+                else:
+                    await set_withdrawal_status(withdrawal_id, "failed", last_error=str(e))
             await state.clear()
-            await message.answer("❌ ثبت و رزرو برداشت انجام نشد؛ موجودی شما کسر نشده است.")
+            await message.answer("❌ ثبت و رزرو برداشت انجام نشد؛ اگر مبلغی رزرو شده بود، rollback شد.")
             return
 
         if auto_payout_enabled:
