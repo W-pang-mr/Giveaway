@@ -538,10 +538,17 @@ def is_valid_ton_address(wallet_address: str) -> bool:
 def get_withdrawal_keyboard(withdrawal_id: str):
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ بررسی و واریز TON", callback_data=f"wd_approve_{withdrawal_id}"),
-                InlineKeyboardButton(text="↩️ رد و بازگشت مبلغ", callback_data=f"wd_reject_{withdrawal_id}")
-            ]
+            [InlineKeyboardButton(text="✅ بررسی و واریز TON", callback_data=f"wd_approve_{withdrawal_id}")],
+            [InlineKeyboardButton(text="🚫 رد برداشت", callback_data=f"wd_reject_menu_{withdrawal_id}")]
+        ]
+    )
+
+
+def get_reject_withdrawal_keyboard(withdrawal_id: str):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="↩️ رد و بازگشت مبلغ به ولت کاربر", callback_data=f"wd_reject_refund_{withdrawal_id}")],
+            [InlineKeyboardButton(text="🚫 رد بدون بازگشت مبلغ", callback_data=f"wd_reject_no_refund_{withdrawal_id}")]
         ]
     )
 
@@ -579,6 +586,19 @@ async def claim_withdrawal(withdrawal_id: str):
         {"$set": {"status": "processing", "updated_at": datetime.utcnow().isoformat()}},
         return_document=ReturnDocument.AFTER
     )
+
+
+async def reject_withdrawal_without_refund(withdrawal_id: str, reason: str) -> bool:
+    rejected = await withdrawals_col.find_one_and_update(
+        {"withdrawal_id": withdrawal_id, "status": "pending"},
+        {"$set": {
+            "status": "rejected",
+            "reject_reason": reason,
+            "updated_at": datetime.utcnow().isoformat()
+        }},
+        return_document=ReturnDocument.BEFORE
+    )
+    return bool(rejected)
 
 
 async def refund_withdrawal(withdrawal_id: str, reason: str, allowed_statuses=("pending", "processing")) -> bool:
@@ -886,21 +906,69 @@ async def approve_withdraw(call: types.CallbackQuery):
             pass
 
 
-@dp.callback_query(F.data.startswith("wd_reject_"))
-async def reject_withdraw(call: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("wd_reject_menu_"))
+async def reject_withdraw_menu(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("🛑 شما ادمین نیستید!", show_alert=True)
+        return
+
+    withdrawal_id = call.data.replace("wd_reject_menu_", "", 1)
+    withdrawal = await withdrawals_col.find_one({"withdrawal_id": withdrawal_id})
+    if not withdrawal or withdrawal.get("status") != "pending":
+        status = withdrawal.get("status", "نامشخص") if withdrawal else "پیدا نشد"
+        await call.answer(f"این درخواست قابل رد نیست؛ وضعیت فعلی: {status}", show_alert=True)
+        return
+
+    await call.answer("نوع رد برداشت را انتخاب کنید.", show_alert=True)
+    base_text = call.message.text or call.message.caption or ""
+    await call.message.edit_text(
+        base_text + "\n\n⚠️ <b>نوع رد برداشت را انتخاب کنید:</b>\n"
+        "• بازگشت مبلغ به ولت کاربر\n"
+        "• رد بدون بازگشت مبلغ",
+        parse_mode="HTML", reply_markup=get_reject_withdrawal_keyboard(withdrawal_id)
+    )
+
+
+@dp.callback_query(F.data.regexp(r"^wd_reject_[0-9a-f]+$"))
+async def reject_withdraw_legacy(call: types.CallbackQuery):
     if not is_admin(call.from_user.id):
         await call.answer("🛑 شما ادمین نیستید!", show_alert=True)
         return
 
     withdrawal_id = call.data.replace("wd_reject_", "", 1)
     withdrawal = await withdrawals_col.find_one({"withdrawal_id": withdrawal_id})
+    if not withdrawal or withdrawal.get("status") != "pending":
+        status = withdrawal.get("status", "نامشخص") if withdrawal else "پیدا نشد"
+        await call.answer(f"این درخواست قابل رد نیست؛ وضعیت فعلی: {status}", show_alert=True)
+        return
+
+    await call.answer("نوع رد برداشت را انتخاب کنید.", show_alert=True)
+    base_text = call.message.text or call.message.caption or ""
+    await call.message.edit_text(
+        base_text + "\n\n⚠️ <b>نوع رد برداشت را انتخاب کنید:</b>\n"
+        "• بازگشت مبلغ به ولت کاربر\n"
+        "• رد بدون بازگشت مبلغ",
+        parse_mode="HTML", reply_markup=get_reject_withdrawal_keyboard(withdrawal_id)
+    )
+
+
+@dp.callback_query(F.data.startswith("wd_reject_refund_"))
+async def reject_withdraw_refund(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("🛑 شما ادمین نیستید!", show_alert=True)
+        return
+
+    withdrawal_id = call.data.replace("wd_reject_refund_", "", 1)
+    withdrawal = await withdrawals_col.find_one({"withdrawal_id": withdrawal_id})
     if not withdrawal:
         await call.answer("❌ درخواست برداشت پیدا نشد.", show_alert=True)
         return
 
-    refunded = await refund_withdrawal(withdrawal_id, "رد درخواست توسط ادمین", allowed_statuses=("pending",))
+    refunded = await refund_withdrawal(withdrawal_id, "رد درخواست توسط ادمین و بازگشت مبلغ", allowed_statuses=("pending",))
     if not refunded:
-        await call.answer("⚠️ این درخواست قبلاً پردازش شده است.", show_alert=True)
+        current = await withdrawals_col.find_one({"withdrawal_id": withdrawal_id})
+        status = current.get("status", "نامشخص") if current else "پیدا نشد"
+        await call.answer(f"این درخواست قبلاً پردازش شده؛ وضعیت: {status}", show_alert=True)
         return
 
     await call.answer("✅ درخواست رد شد و مبلغ به کاربر برگشت.", show_alert=True)
@@ -913,6 +981,41 @@ async def reject_withdraw(call: types.CallbackQuery):
         await bot.send_message(
             int(withdrawal["user_id"]),
             "↩️ <b>درخواست برداشت شما رد شد.</b>\nمبلغ رزروشده به کیف‌پول شما برگشت داده شد.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("wd_reject_no_refund_"))
+async def reject_withdraw_no_refund(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("🛑 شما ادمین نیستید!", show_alert=True)
+        return
+
+    withdrawal_id = call.data.replace("wd_reject_no_refund_", "", 1)
+    withdrawal = await withdrawals_col.find_one({"withdrawal_id": withdrawal_id})
+    if not withdrawal:
+        await call.answer("❌ درخواست برداشت پیدا نشد.", show_alert=True)
+        return
+
+    rejected = await reject_withdrawal_without_refund(withdrawal_id, "رد درخواست توسط ادمین بدون بازگشت مبلغ")
+    if not rejected:
+        current = await withdrawals_col.find_one({"withdrawal_id": withdrawal_id})
+        status = current.get("status", "نامشخص") if current else "پیدا نشد"
+        await call.answer(f"این درخواست قبلاً پردازش شده؛ وضعیت: {status}", show_alert=True)
+        return
+
+    await call.answer("✅ درخواست بدون بازگشت مبلغ رد شد.", show_alert=True)
+    base_text = call.message.text or call.message.caption or ""
+    await call.message.edit_text(
+        base_text + "\n\n🚫 <b>وضعیت: رد شد و مبلغ به کاربر بازگردانده نشد.</b>",
+        parse_mode="HTML", reply_markup=None
+    )
+    try:
+        await bot.send_message(
+            int(withdrawal["user_id"]),
+            "🚫 <b>درخواست برداشت شما رد شد.</b>\nمبلغ رزروشده طبق تصمیم ادمین به کیف‌پول شما بازگردانده نشد.",
             parse_mode="HTML"
         )
     except Exception:
