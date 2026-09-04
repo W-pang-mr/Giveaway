@@ -80,6 +80,17 @@ tracker_message_id = None
 # ارسال‌های TON باید پشت‌سرهم انجام شوند تا چند برداشت هم‌زمان از یک موجودی عبور نکند.
 payout_lock = asyncio.Lock()
 
+async def close_lite_client(client):
+    """بستن امن اتصال LiteClient در همه مسیرهای موفق و خطا."""
+    if client is None:
+        return
+    try:
+        if client.is_connected():
+            await client.close()
+    except Exception as close_error:
+        logging.warning(f"LiteClient close warning: {close_error}")
+
+
 # ==========================================
 # استعلام موجودی ولت سیستم
 # ==========================================
@@ -99,12 +110,12 @@ async def get_system_wallet_balance():
         balance_nano = account_state.balance
         balance_ton = balance_nano / 10**9
 
-        await client.close()
+        await close_lite_client(client)
+        client = None
         return balance_ton, wallet.address.to_str(is_user_friendly=True, is_bounceable=False)
     except Exception as e:
         logging.error(f"Error fetching wallet balance: {e}")
-        if client and client.is_connected():
-            await client.close()
+        await close_lite_client(client)
         return None, str(e)
 
 # ==========================================
@@ -277,8 +288,7 @@ async def verify_payout_on_chain(sender_address: str, destination_address: str, 
         logging.error(f"TON destination verification error: {e}")
         return False
     finally:
-        if client and client.is_connected():
-            await client.close()
+        await close_lite_client(client)
 
 
 async def send_ton_payout(destination_address: str, amount_ton: float, memo: str):
@@ -323,9 +333,16 @@ async def send_ton_payout(destination_address: str, amount_ton: float, memo: str
                 try:
                     if await wallet.get_seqno() > seqno_before:
                         sender_address = wallet.address.to_str(is_user_friendly=False)
-                        await client.close()
+                        await close_lite_client(client)
                         client = None
-                        if await verify_payout_on_chain(sender_address, destination_address, amount_ton, memo):
+                        try:
+                            destination_verified = await verify_payout_on_chain(
+                                sender_address, destination_address, amount_ton, memo
+                            )
+                        except Exception as verification_error:
+                            logging.error(f"TON destination verification exception: {verification_error}")
+                            destination_verified = False
+                        if destination_verified:
                             return True, f"تراکنش با memo {memo} روی شبکه و ولت مقصد تأیید شد! 🚀"
                         return "pending", (
                             f"تراکنش با memo {memo} از ولت سیستم ارسال شد، اما هنوز در ولت مقصد تأیید نشده است."
@@ -333,14 +350,13 @@ async def send_ton_payout(destination_address: str, amount_ton: float, memo: str
                 except Exception as confirm_error:
                     logging.warning(f"TON payout confirmation check failed: {confirm_error}")
 
-            await client.close()
+            await close_lite_client(client)
             client = None
             return False, "تراکنش ارسال شد اما ارسال از ولت سیستم روی شبکه تأیید نشده است."
 
         except Exception as e:
             logging.error(f"pytoniq W5 Payout Error: {e}")
-            if client and client.is_connected():
-                await client.close()
+            await close_lite_client(client)
             return False, str(e)
 
 
