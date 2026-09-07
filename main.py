@@ -1,5 +1,5 @@
 # ==========================================
-# Void Giveaway Bot - Version 4.5.2 (Updated Release)
+# Void Giveaway Bot - Version 6.0.0 (Fully Automatic TON Withdrawals)
 # (Multi-Channel Forced Join, Live Wallet Tracker, Direct Admin DM, Ban System, MongoDB Integrated)
 # ==========================================
 
@@ -11,7 +11,7 @@ import html
 import math
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote
 from flask import Flask
 from threading import Thread
@@ -35,7 +35,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v5.0.0) is running smoothly!"
+    return "⚡ Void Giveaway Bot (v6.0.0) is running smoothly!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -48,7 +48,7 @@ def keep_alive():
 
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = [6879499219]
-BOT_VERSION = "5.0.0"
+BOT_VERSION = "6.0.0"
 WITHDRAW_CHANNEL = "@voidwithraw"
 WALLET_TRACKER_CHANNEL = "@Voidchanneloffical"  # کانال ارسال و بروزرسانی خودکار موجودی ولت سیستم
 TON_MNEMONIC = os.environ.get("TON_MNEMONIC")
@@ -72,7 +72,7 @@ banned_users = set()
 required_channels = ["@Voidchanneloffical"]  # پشتیبانی از چند کانال جوین اجباری
 
 bot_active = True
-auto_payout_enabled = False
+withdrawals_enabled = True
 min_withdraw_amount = 0.1
 max_withdraw_amount = 10.0
 min_deposit_amount = 0.01
@@ -214,7 +214,7 @@ async def close_lite_client(client):
 
 
 async def send_ton_payout(destination_address: str, amount_ton: float):
-    """ارسال امن؛ نتیجه فقط یکی از failed یا sent است."""
+    """ارسال امن؛ نتیجه می‌تواند sent، failed یا uncertain باشد."""
     if not TON_MNEMONIC:
         return "failed", "کلید امنیتی ولت (TON_MNEMONIC) تنظیم نشده است!"
     if not is_valid_ton_address(destination_address):
@@ -234,6 +234,7 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
             )
 
         client = None
+        transfer_started = False
         try:
             client = LiteClient.from_mainnet_config(ls_i=0, trust_level=2)
             await client.connect()
@@ -241,6 +242,8 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
                 client, TON_MNEMONIC.strip().split(), network_global_id=-239
             )
             seqno_before = await wallet.get_seqno()
+            # From this point the network result can be ambiguous; never auto-refund blindly.
+            transfer_started = True
             await wallet.transfer(
                 destination=destination_address.strip(),
                 amount=int(round(amount_ton * 10**9)),
@@ -263,11 +266,13 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
 
             await close_lite_client(client)
             client = None
-            return "failed", "پیام برداشت از ولت سیستم تأیید نشد؛ هیچ مبلغی به‌عنوان پرداخت موفق ثبت نشد."
+            return "uncertain", "ارسال به شبکه انجام شد اما تأیید نهایی هنوز دریافت نشده است؛ برای جلوگیری از پرداخت دوباره، مبلغ فعلاً رزرو می‌ماند."
 
         except Exception as e:
             logging.error(f"pytoniq W5 Payout Error: {e}")
             await close_lite_client(client)
+            if transfer_started:
+                return "uncertain", "نتیجه ارسال به شبکه قطعی نیست؛ مبلغ برای بررسی بیشتر رزرو می‌ماند."
             return "failed", str(e)
 
 
@@ -426,6 +431,35 @@ async def deposit_tracker_loop():
         await asyncio.sleep(30)
 
 
+async def withdrawal_recovery_loop():
+    """وضعیت‌های پردازش‌نشده را بعد از restart به بررسی شبکه منتقل می‌کند."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            cutoff = (datetime.utcnow() - timedelta(minutes=10)).isoformat()
+            async for withdrawal in withdrawals_col.find({
+                "status": "processing", "updated_at": {"$lt": cutoff}
+            }).limit(100):
+                withdrawal_id = withdrawal.get("withdrawal_id")
+                updated = await withdrawals_col.find_one_and_update(
+                    {"withdrawal_id": withdrawal_id, "status": "processing"},
+                    {"$set": {
+                        "status": "pending_verification",
+                        "last_error": "پردازش پس از restart نیاز به بررسی وضعیت شبکه دارد.",
+                        "updated_at": datetime.utcnow().isoformat()
+                    }},
+                    return_document=ReturnDocument.AFTER
+                )
+                if updated:
+                    await notify_wallet_issue(
+                        float(updated.get("amount_to_send", 0)),
+                        "پردازش برداشت بیش از حد طول کشید؛ مبلغ تا بررسی وضعیت شبکه رزرو می‌ماند.",
+                        withdrawal_id
+                    )
+        except Exception as e:
+            logging.error(f"Withdrawal recovery loop exception: {e}")
+        await asyncio.sleep(60)
+
 # ==========================================
 # ذخیره و بازیابی دیتابیس MongoDB
 # ==========================================
@@ -446,7 +480,7 @@ async def save_data():
             "banned_users": list(banned_users),
             "required_channels": required_channels,
             "bot_active": bot_active,
-            "auto_payout_enabled": auto_payout_enabled,
+            "withdrawals_enabled": withdrawals_enabled,
             "min_withdraw_amount": min_withdraw_amount,
             "max_withdraw_amount": max_withdraw_amount,
             "ton_gas_fee": ton_gas_fee,
@@ -458,7 +492,7 @@ async def save_data():
         logging.error(f"Error saving data to MongoDB: {e}")
 
 async def load_data():
-    global user_data, all_time_users, banned_users, required_channels, bot_active, auto_payout_enabled, min_withdraw_amount, max_withdraw_amount, ton_gas_fee, tracker_message_id
+    global user_data, all_time_users, banned_users, required_channels, bot_active, withdrawals_enabled, min_withdraw_amount, max_withdraw_amount, ton_gas_fee, tracker_message_id
     try:
         for collection, field in ((users_col, "user_id"), (withdrawals_col, "withdrawal_id"), (deposits_col, "tx_id")):
             try:
@@ -471,7 +505,7 @@ async def load_data():
             banned_users = set(settings_doc.get("banned_users", []))
             required_channels = settings_doc.get("required_channels", ["@Voidchanneloffical"])
             bot_active = settings_doc.get("bot_active", True)
-            auto_payout_enabled = settings_doc.get("auto_payout_enabled", False)
+            withdrawals_enabled = settings_doc.get("withdrawals_enabled", True)
             min_withdraw_amount = settings_doc.get("min_withdraw_amount", 0.1)
             max_withdraw_amount = settings_doc.get("max_withdraw_amount", 10.0)
             ton_gas_fee = settings_doc.get("ton_gas_fee", 0.005)
@@ -564,7 +598,7 @@ def get_main_keyboard(user_id: int):
 
 def get_admin_inline_keyboard():
     status_btn = "🛑 خاموش کردن ربات" if bot_active else "✅ روشن کردن ربات"
-    auto_btn = "⚡️ واریز خودکار: غیرفعال" if not auto_payout_enabled else "⚡️ واریز خودکار: فعال"
+    withdrawals_btn = "🛑 خاموش کردن برداشت‌ها" if withdrawals_enabled else "✅ روشن کردن برداشت‌ها"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="➕ افزودن کانال اجباری", callback_data="admin_add_channel"), InlineKeyboardButton(text="➖ حذف کانال اجباری", callback_data="admin_remove_channel")],
@@ -574,7 +608,7 @@ def get_admin_inline_keyboard():
             [InlineKeyboardButton(text="⚙️ حداقل برداشت", callback_data="admin_set_min_wd"), InlineKeyboardButton(text="🔝 حداکثر برداشت", callback_data="admin_set_max_wd")],
             [InlineKeyboardButton(text="⛽️ تنظیم گس‌فی شبکه", callback_data="admin_set_gas_fee")],
             [InlineKeyboardButton(text="🧹 صفر کردن موجودی کل کاربران", callback_data="admin_reset_balances")],
-            [InlineKeyboardButton(text=auto_btn, callback_data="admin_toggle_auto_payout")],
+            [InlineKeyboardButton(text=withdrawals_btn, callback_data="admin_toggle_withdrawals")],
             [InlineKeyboardButton(text=status_btn, callback_data="admin_toggle_bot"), InlineKeyboardButton(text="📢 همه‌فرستی (Broadcast)", callback_data="admin_broadcast")],
         ]
     )
@@ -634,7 +668,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"🔥 <b>به Void Giveaway خوش اومدی!</b> آماده‌ای جایزه جمع کنی؟\n"
-        f"🧩 <b>نسخه فعال:</b> <code>v5.0.0</code> 💎\n\n"
+        f"🧩 <b>نسخه فعال:</b> <code>v6.0.0</code> 💎\n\n"
 
         f"از منوی زیر استفاده کن و موجودی، برداشت و دعوت‌هات رو مدیریت کن 👇",
         parse_mode="HTML",
@@ -662,24 +696,6 @@ def is_valid_ton_address(wallet_address: str) -> bool:
         return payload[0] in (0x11, 0x51) and crc.to_bytes(2, "big") == checksum
     except (ValueError, TypeError, base64.binascii.Error):
         return False
-
-
-def get_withdrawal_keyboard(withdrawal_id: str):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✅ بررسی و واریز TON", callback_data=f"wd_approve_{withdrawal_id}")],
-            [InlineKeyboardButton(text="🚫 رد برداشت", callback_data=f"wd_reject_menu_{withdrawal_id}")]
-        ]
-    )
-
-
-def get_reject_withdrawal_keyboard(withdrawal_id: str):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="↩️ رد و بازگشت مبلغ به ولت کاربر", callback_data=f"wd_reject_refund_{withdrawal_id}")],
-            [InlineKeyboardButton(text="🚫 رد بدون بازگشت مبلغ", callback_data=f"wd_reject_no_refund_{withdrawal_id}")]
-        ]
-    )
 
 
 async def create_withdrawal_record(user_id: int, wallet_address: str, requested_amount: float,
@@ -808,6 +824,9 @@ async def start_withdraw_callback(call: types.CallbackQuery, state: FSMContext):
     if not bot_active and not is_admin(u_id):
         await call.answer("🛠️ ربات موقتاً در حال ارتقاست.", show_alert=True)
         return
+    if not withdrawals_enabled and not is_admin(u_id):
+        await call.answer("🛑 برداشت‌ها موقتاً خاموش هستند.", show_alert=True)
+        return
     if not await check_user_subscription(u_id):
         await call.answer("🔐 برای برداشت، عضویت در همه کانال‌ها الزامی است!", show_alert=True)
         return
@@ -864,11 +883,18 @@ async def process_withdraw_amount(message: types.Message, state: FSMContext):
 async def process_withdraw_address(message: types.Message, state: FSMContext):
     user = message.from_user
     if is_banned(user.id):
+        await state.clear()
         return
+    if not withdrawals_enabled and not is_admin(user.id):
+        await state.clear()
+        await message.answer("🛑 برداشت‌ها موقتاً خاموش هستند؛ موجودی شما محفوظ است.", reply_markup=get_main_keyboard(user.id))
+        return
+
     wallet_addr = (message.text or "").strip()
     if not is_valid_ton_address(wallet_addr):
         await message.answer("⚠️ این آدرس TON معتبر نیست؛ یک آدرس کامل EQ یا UQ با checksum صحیح بفرست.")
         return
+
     data = await state.get_data()
     amount_to_send = data.get("amount_to_send")
     deducted_amount = data.get("deducted_amount")
@@ -878,30 +904,9 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
         await message.answer("⏱️ نشست برداشت منقضی شد؛ دوباره از کیف‌پول شروع کن.")
         return
 
-    async with withdrawal_flow_lock:
-        prof = get_user_profile(user.id, user)
-        if float(deducted_amount) > float(prof.get("balance", 0.0)):
-            await state.clear()
-            await message.answer("⚠️ موجودی‌ات تغییر کرده و برای حفظ امنیت، این درخواست لغو شد.")
-            return
-
-        if auto_payout_enabled:
-            system_balance, balance_info = await get_system_wallet_balance()
-            required_balance = float(amount_to_send) + max(ton_gas_fee, 0)
-            if system_balance is None or system_balance < required_balance:
-                reason = (f"موجودی قابل بررسی نیست: {balance_info}" if system_balance is None else
-                          f"موجودی {system_balance:.4f} TON و نیاز {required_balance:.4f} TON است.")
-                await notify_wallet_issue(float(amount_to_send), reason)
-                await state.clear()
-                await message.answer(
-                    "⚠️ <b>برداشت خودکار فعلاً در دسترس نیست.</b>\nخیالت راحت؛ هیچ مبلغی از کیف‌پولت کسر نشد.",
-                    parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
-                )
-                return
-
-        withdrawal_id = None
-        reserved = False
-        try:
+    withdrawal_id = None
+    try:
+        async with withdrawal_flow_lock:
             withdrawal_id = await create_withdrawal_record(
                 user.id, wallet_addr, float(requested_amount), float(amount_to_send), float(deducted_amount)
             )
@@ -909,120 +914,76 @@ async def process_withdraw_address(message: types.Message, state: FSMContext):
             if not reserved:
                 await set_withdrawal_status(withdrawal_id, "failed", last_error="موجودی کافی نبود")
                 await state.clear()
-                await message.answer("💰 موجودی برای رزرو این برداشت کافی نیست؛ مبلغی از کیف‌پولت کم نشد.")
+                await message.answer("💰 موجودی برای ثبت این برداشت کافی نیست؛ مبلغی از کیف‌پولت کم نشد.", reply_markup=get_main_keyboard(user.id))
                 return
             await set_withdrawal_status(
-                withdrawal_id, "processing" if auto_payout_enabled else "pending",
-                reserved_at=datetime.utcnow().isoformat()
+                withdrawal_id, "processing", reserved_at=datetime.utcnow().isoformat()
             )
-        except Exception as e:
-            logging.error(f"Withdrawal reservation error: {e}")
-            if withdrawal_id:
-                if reserved:
-                    await refund_withdrawal(withdrawal_id, "خطا بعد از رزرو موجودی", allowed_statuses=("created", "reserved", "processing", "pending"))
-                else:
-                    await set_withdrawal_status(withdrawal_id, "failed", last_error=str(e))
-            await state.clear()
-            await message.answer("⚠️ ثبت برداشت کامل نشد؛ اگر مبلغی رزرو شده بود، خودکار به کیف‌پولت برگشت.")
-            return
+    except Exception as e:
+        logging.error(f"Automatic withdrawal reservation error: {e}")
+        if withdrawal_id:
+            try:
+                await refund_withdrawal(withdrawal_id, "خطا هنگام رزرو برداشت")
+            except Exception as refund_error:
+                logging.error(f"Automatic withdrawal reservation refund error: {refund_error}")
+        await state.clear()
+        await message.answer("⚠️ ثبت برداشت کامل نشد؛ اگر مبلغی رزرو شده بود، خودکار بررسی می‌شود.", reply_markup=get_main_keyboard(user.id))
+        return
 
-        if auto_payout_enabled:
-            await message.answer("🚀 درخواستت ثبت شد! در حال ارسال امن TON هستیم...", parse_mode="HTML")
-            payout_status, result_msg = await send_ton_payout(wallet_addr, float(amount_to_send))
-            if payout_status == "sent":
-                await set_withdrawal_status(withdrawal_id, "sent", sent_at=datetime.utcnow().isoformat(), result_message=result_msg)
-                await notify_auto_withdrawal_channel(
-                    withdrawal_id, user.id, float(amount_to_send),
-                    "✅ <b>برداشت خودکار تأیید و ارسال شد.</b>", result_msg
-                )
-                await message.answer(
-                    f"🎉 <b>برداشت با موفقیت از ولت سیستم ارسال شد!</b>\nمبلغ: <code>{amount_to_send:.4f} TON</code>\n"
-                    "⏳ نمایش مبلغ در کیف‌پول مقصد ممکن است کمی زمان ببرد؛ تراکنش در مسیر است.", parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
-                )
-            else:
-                await notify_wallet_issue(float(amount_to_send), result_msg, withdrawal_id)
-                await set_withdrawal_status(withdrawal_id, "failed", last_error=result_msg)
-                await notify_auto_withdrawal_channel(
-                    withdrawal_id, user.id, float(amount_to_send),
-                    "⚠️ <b>برداشت خودکار ارسال نشد و در حال بازگشت مبلغ است.</b>", result_msg
-                )
-                refunded = await refund_withdrawal(withdrawal_id, result_msg, allowed_statuses=("failed",))
-                refund_text = "💚 مبلغ کامل به کیف‌پولت برگشت داده شد." if refunded else "🛡️ این مورد برای بررسی ایمن به ادمین گزارش شد."
-                await message.answer(
-                    f"⚠️ <b>این برداشت ارسال نشد.</b>\nعلت: {html.escape(str(result_msg))}\n{refund_text}",
-                    parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
-                )
-            await state.clear()
-            return
+    await state.clear()
+    await message.answer(
+        f"🚀 <b>برداشت خودکار ثبت شد.</b>\nشناسه: <code>{withdrawal_id}</code>\n"
+        f"مبلغ دریافتی: <code>{float(amount_to_send):.4f} TON</code>\n"
+        "در حال ارسال امن به شبکه TON...", parse_mode="HTML"
+    )
 
-        user_mention = f"@{user.username}" if user.username else f'<a href="tg://user?id={user.id}">{html.escape(user.first_name)}</a>'
-        admin_text = (
-            "🚨 <b>درخواست برداشت جدید TON رسید!</b>\n━━━━━━━━━━━━━━━━━━\n"
-            f"🆔 شناسه: <code>{withdrawal_id}</code>\n"
-            f"👤 کاربر: {user_mention} (ID: <code>{user.id}</code>)\n"
-            f"💎 مبلغ واریز: <code>{float(amount_to_send):.4f} TON</code>\n"
-            f"💰 مبلغ رزرو: <code>{float(deducted_amount):.4f} TON</code>\n"
-            f"📝 ولت مقصد:\n<code>{html.escape(wallet_addr)}</code>\n"
-            "⏳ وضعیت: منتظر تأیید و ارسال ادمین"
+    payout_status, result_msg = await send_ton_payout(wallet_addr, float(amount_to_send))
+    if payout_status == "sent":
+        await set_withdrawal_status(
+            withdrawal_id, "sent", sent_at=datetime.utcnow().isoformat(), result_message=result_msg
         )
-        try:
-            admin_message = await bot.send_message(
-                chat_id=WITHDRAW_CHANNEL, text=admin_text, parse_mode="HTML",
-                reply_markup=get_withdrawal_keyboard(withdrawal_id)
-            )
-            await set_withdrawal_status(
-                withdrawal_id, "pending", admin_message_id=admin_message.message_id, admin_channel=WITHDRAW_CHANNEL
-            )
-            await state.clear()
-            await message.answer(
-                f"🎉 <b>درخواست برداشتت با موفقیت ثبت شد!</b>\nشناسه: <code>{withdrawal_id}</code>\n"
-                "بعد از تأیید ادمین، مبلغ برایت ارسال می‌شود 🚀", parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
-            )
-        except Exception as e:
-            logging.error(f"Withdraw channel send error: {e}")
-            await refund_withdrawal(withdrawal_id, "ارسال درخواست برای ادمین انجام نشد")
-            await state.clear()
-            await message.answer("⚠️ درخواست به ادمین نرسید؛ مبلغ رزروشده کامل برگشت داده شد.")
-
-
-async def update_withdrawal_admin_message(message, full_text: str, withdrawal_id: str, status_text: str, reply_markup=None):
-    """نتیجه برداشت را روی پیام کانال ثبت می‌کند؛ در صورت خطای edit، fallback می‌فرستد."""
-    try:
-        await message.edit_text(full_text, parse_mode="HTML", reply_markup=reply_markup)
-        return True
-    except Exception as edit_error:
-        logging.error(f"Withdrawal channel edit error for {withdrawal_id}: {edit_error}")
-
-    # بعضی پیام‌های کانال با shortcut پیام قابل ویرایش نیستند؛ با chat/message صریح دوباره تلاش می‌کنیم.
-    try:
-        await bot.edit_message_text(
-            chat_id=message.chat.id, message_id=message.message_id,
-            text=full_text, parse_mode="HTML", reply_markup=reply_markup
+        await notify_withdrawal_result(
+            withdrawal_id, user.id, float(amount_to_send), "✅ برداشت خودکار ارسال شد.", result_msg
         )
-        return True
-    except Exception as direct_edit_error:
-        logging.error(f"Direct withdrawal channel edit error for {withdrawal_id}: {direct_edit_error}")
-
-    # مهم‌تر از ویرایش ظاهری: نتیجه قطعی برداشت حتماً در کانال ثبت شود.
-    try:
-        await bot.send_message(
-            chat_id=WITHDRAW_CHANNEL,
-            text=(f"📣 <b>به‌روزرسانی قطعی برداشت</b>\n"
-                  f"🆔 شناسه: <code>{html.escape(str(withdrawal_id))}</code>\n"
-                  f"{status_text}"),
-            parse_mode="HTML", reply_markup=reply_markup
+        await message.answer(
+            f"🎉 <b>برداشت با موفقیت ارسال شد!</b>\nشناسه: <code>{withdrawal_id}</code>\n"
+            f"مبلغ: <code>{float(amount_to_send):.4f} TON</code>\n"
+            "نمایش تراکنش در کیف‌پول مقصد ممکن است کمی زمان ببرد.",
+            parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
         )
-        return True
-    except Exception as fallback_error:
-        logging.error(f"Withdrawal channel fallback message error for {withdrawal_id}: {fallback_error}")
-        return False
+    elif payout_status == "uncertain":
+        await set_withdrawal_status(
+            withdrawal_id, "pending_verification", last_error=result_msg,
+            verification_required_at=datetime.utcnow().isoformat()
+        )
+        await notify_wallet_issue(float(amount_to_send), result_msg, withdrawal_id)
+        await notify_withdrawal_result(
+            withdrawal_id, user.id, float(amount_to_send), "⏳ نتیجه برداشت نیاز به بررسی شبکه دارد.", result_msg
+        )
+        await message.answer(
+            f"⏳ <b>برداشت در حال بررسی شبکه است.</b>\nشناسه: <code>{withdrawal_id}</code>\n"
+            "برای جلوگیری از پرداخت دوباره، تا مشخص‌شدن نتیجه مبلغ در حالت رزرو می‌ماند.",
+            parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
+        )
+    else:
+        await set_withdrawal_status(withdrawal_id, "failed", last_error=result_msg)
+        refunded = await refund_withdrawal(withdrawal_id, result_msg, allowed_statuses=("failed",))
+        refund_text = "مبلغ رزروشده خودکار برگشت داده شد." if refunded else "وضعیت برای بررسی ایمن ثبت شده است."
+        await notify_wallet_issue(float(amount_to_send), result_msg, withdrawal_id)
+        await notify_withdrawal_result(
+            withdrawal_id, user.id, float(amount_to_send), "⚠️ برداشت ارسال نشد و refund انجام شد.", result_msg
+        )
+        await message.answer(
+            f"⚠️ <b>برداشت ارسال نشد.</b>\nشناسه: <code>{withdrawal_id}</code>\n"
+            f"علت: {html.escape(str(result_msg))}\n{refund_text}",
+            parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
+        )
 
-
-async def notify_auto_withdrawal_channel(withdrawal_id: str, user_id: int, amount: float, status_text: str, detail: str = ""):
-    """برای برداشت خودکار هم نتیجه در کانال ادمین قابل مشاهده باشد."""
+async def notify_withdrawal_result(withdrawal_id: str, user_id: int, amount: float, status_text: str, detail: str = ""):
+    """ثبت نتیجه‌ی هر برداشت خودکار در کانال عملیاتی با شناسه‌ی یکتا."""
     try:
         text = (
-            "🤖 <b>نتیجه برداشت خودکار</b>\n"
+            "🤖 <b>گزارش برداشت خودکار</b>\n"
             "━━━━━━━━━━━━━━━━━━\n"
             f"🆔 شناسه: <code>{html.escape(str(withdrawal_id))}</code>\n"
             f"👤 کاربر: <code>{user_id}</code>\n"
@@ -1033,126 +994,7 @@ async def notify_auto_withdrawal_channel(withdrawal_id: str, user_id: int, amoun
             text += f"\n📝 جزئیات: <code>{html.escape(str(detail))}</code>"
         await bot.send_message(chat_id=WITHDRAW_CHANNEL, text=text, parse_mode="HTML")
     except Exception as channel_error:
-        logging.error(f"Auto withdrawal channel notification error for {withdrawal_id}: {channel_error}")
-
-
-@dp.callback_query(F.data.startswith("wd_approve_"))
-async def approve_withdraw(call: types.CallbackQuery):
-    if not is_admin(call.from_user.id):
-        await call.answer("🛑 شما ادمین نیستید!", show_alert=True)
-        return
-    withdrawal_id = call.data.replace("wd_approve_", "", 1)
-    async with withdrawal_flow_lock:
-        withdrawal = await claim_withdrawal(withdrawal_id)
-        if not withdrawal:
-            current = await withdrawals_col.find_one({"withdrawal_id": withdrawal_id})
-            status = current.get("status", "نامشخص") if current else "پیدا نشد"
-            await call.answer(f"این درخواست قبلاً پردازش شده؛ وضعیت: {status}", show_alert=True)
-            return
-        await call.answer("⏳ در حال بررسی موجودی و ارسال...", show_alert=False)
-        payout_status, result_msg = await send_ton_payout(
-            withdrawal["wallet_address"], float(withdrawal["amount_to_send"])
-        )
-        base_text = call.message.text or call.message.caption or ""
-        if payout_status == "sent":
-            await set_withdrawal_status(withdrawal_id, "sent", sent_at=datetime.utcnow().isoformat(), result_message=result_msg)
-            await update_withdrawal_admin_message(
-                call.message,
-                base_text + "\n\n✅ <b>برداشت تأیید و از ولت سیستم ارسال شد؛ پرداخت دوباره ممنوع است.</b>",
-                withdrawal_id,
-                "✅ <b>برداشت تأیید و ارسال شد؛ پرداخت دوباره ممنوع است.</b>",
-                reply_markup=None
-            )
-            try:
-                await bot.send_message(
-                    int(withdrawal["user_id"]),
-                    f"🎉 <b>برداشتت از ولت سیستم ارسال شد!</b>\nمبلغ: <code>{float(withdrawal['amount_to_send']):.4f} TON</code>\n"
-                    "ممکن است نمایش در ولت مقصد کمی زمان ببرد.", parse_mode="HTML"
-                )
-            except Exception:
-                pass
-        else:
-            await set_withdrawal_status(withdrawal_id, "pending", last_error=result_msg)
-            await notify_wallet_issue(float(withdrawal["amount_to_send"]), result_msg, withdrawal_id)
-            await update_withdrawal_admin_message(
-                call.message,
-                base_text + "\n\n⚠️ <b>ارسال این بار انجام نشد؛ درخواست همچنان امن و معلق است.</b>\n"
-                f"علت: <code>{html.escape(str(result_msg))}</code>\n"
-                "ادمین می‌تواند دوباره ارسال را امتحان کند یا مبلغ را بهت برگرداند.",
-                withdrawal_id,
-                f"⚠️ <b>ارسال انجام نشد و درخواست همچنان معلق است.</b>\nعلت: <code>{html.escape(str(result_msg))}</code>",
-                reply_markup=get_withdrawal_keyboard(withdrawal_id)
-            )
-            try:
-                await bot.send_message(
-                    int(withdrawal["user_id"]),
-                    "⏳ <b>برداشتت هنوز ارسال نشده است.</b>\nمبلغت امن و رزرو شده؛ بعد از رفع مشکل دوباره بررسی می‌کنیم.",
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass
-
-
-@dp.callback_query(F.data.startswith("wd_reject_menu_"))
-async def reject_withdraw_menu(call: types.CallbackQuery):
-    if not is_admin(call.from_user.id):
-        await call.answer("🛑 شما ادمین نیستید!", show_alert=True)
-        return
-    withdrawal_id = call.data.replace("wd_reject_menu_", "", 1)
-    withdrawal = await withdrawals_col.find_one({"withdrawal_id": withdrawal_id, "status": "pending"})
-    if not withdrawal:
-        await call.answer("این درخواست دیگر قابل رد نیست یا پیدا نشد.", show_alert=True)
-        return
-    await call.answer("⚠️ نوع تصمیم برای این برداشت را انتخاب کنید:", show_alert=True)
-    base_text = call.message.text or call.message.caption or ""
-    await call.message.edit_text(
-        base_text + "\n\n⚠️ <b>نوع رد برداشت را انتخاب کنید:</b>",
-        parse_mode="HTML", reply_markup=get_reject_withdrawal_keyboard(withdrawal_id)
-    )
-
-
-@dp.callback_query(F.data.startswith("wd_reject_refund_"))
-async def reject_withdraw_refund(call: types.CallbackQuery):
-    if not is_admin(call.from_user.id):
-        await call.answer("🛑 شما ادمین نیستید!", show_alert=True)
-        return
-    withdrawal_id = call.data.replace("wd_reject_refund_", "", 1)
-    async with withdrawal_flow_lock:
-        withdrawal = await withdrawals_col.find_one({"withdrawal_id": withdrawal_id, "status": "pending"})
-        if not withdrawal:
-            await call.answer("این درخواست قبلاً پردازش شده است.", show_alert=True)
-            return
-        if not await refund_withdrawal(withdrawal_id, "رد درخواست توسط ادمین و بازگشت کامل مبلغ", allowed_statuses=("pending",)):
-            await call.answer("بازگشت مبلغ انجام نشد؛ وضعیت را بررسی کنید.", show_alert=True)
-            return
-    await call.answer("💚 مبلغ با موفقیت به کیف‌پول کاربر برگشت داده شد.", show_alert=True)
-    base_text = call.message.text or call.message.caption or ""
-    await call.message.edit_text(base_text + "\n\n↩️ <b>درخواست رد شد؛ مبلغ کامل برگشت داده شد.</b>", parse_mode="HTML", reply_markup=None)
-    try:
-        await bot.send_message(int(withdrawal["user_id"]), "↩️ <b>درخواست برداشت رد شد.</b>\nمبلغ رزروشده به کیف‌پول شما برگشت داده شد.", parse_mode="HTML")
-    except Exception:
-        pass
-
-
-@dp.callback_query(F.data.startswith("wd_reject_no_refund_"))
-async def reject_withdraw_no_refund(call: types.CallbackQuery):
-    if not is_admin(call.from_user.id):
-        await call.answer("🛑 شما ادمین نیستید!", show_alert=True)
-        return
-    withdrawal_id = call.data.replace("wd_reject_no_refund_", "", 1)
-    async with withdrawal_flow_lock:
-        withdrawal = await withdrawals_col.find_one({"withdrawal_id": withdrawal_id, "status": "pending"})
-        if not withdrawal or not await reject_withdrawal_without_refund(withdrawal_id, "رد توسط ادمین بدون بازگشت مبلغ به کاربر"):
-            await call.answer("این درخواست قبلاً پردازش شده است.", show_alert=True)
-            return
-    await call.answer("🛑 درخواست با موفقیت رد شد.", show_alert=True)
-    base_text = call.message.text or call.message.caption or ""
-    await call.message.edit_text(base_text + "\n\n🚫 <b>درخواست رد شد و مبلغ بازگردانده نشد.</b>", parse_mode="HTML", reply_markup=None)
-    try:
-        await bot.send_message(int(withdrawal["user_id"]), "🚫 <b>درخواست برداشت شما رد شد.</b>", parse_mode="HTML")
-    except Exception:
-        pass
-
+        logging.error(f"Automatic withdrawal notification error for {withdrawal_id}: {channel_error}")
 
 # ==========================================
 # رابط واریز TON
@@ -1234,12 +1076,12 @@ async def open_admin_panel(message: types.Message):
     ch_list_str = ", ".join(required_channels) if required_channels else "هیچ کانالی تنظیم نشده است."
 
     admin_text = (
-        "👑 <b>مرکز فرماندهی Void Giveaway</b> 🚀\n<code>v5.0.0</code>\n"
+        "👑 <b>مرکز فرماندهی Void Giveaway</b> 🚀\n<code>v6.0.0</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💎 <b>موجودی واقعی ولت اصلی ربات:</b> {wallet_str}\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🤖 <b>وضعیت ربات:</b> {'روشن ✅' if bot_active else 'خاموش/تعمیرات 🛑'}\n"
-        f"⚡️ <b>سیستم واریز:</b> {'خودکار اتوماتیک 🚀' if auto_payout_enabled else 'دستی (تایید کانال) 📝'}\n"
+        f"🚀 <b>برداشت خودکار:</b> {'فعال ✅' if withdrawals_enabled else 'خاموش 🛑'}\n"
         f"📢 <b>کانال‌های جوین اجباری ({len(required_channels)}):</b> {ch_list_str}\n"
         f"👥 <b>کاربران فعال فعلی:</b> <code>{total_users}</code> نفر\n"
         f"📜 <b>کل کاربران تاریخی:</b> <code>{total_all_time}</code> نفر\n"
@@ -1336,18 +1178,18 @@ async def toggle_bot_callback(call: types.CallbackQuery):
     await call.answer(status_msg, show_alert=True)
     await open_admin_panel(call.message)
 
-@dp.callback_query(F.data == "admin_toggle_auto_payout")
-async def toggle_auto_payout_callback(call: types.CallbackQuery):
-    global auto_payout_enabled
-    await call.answer()
+@dp.callback_query(F.data == "admin_toggle_withdrawals")
+async def toggle_withdrawals_callback(call: types.CallbackQuery):
+    global withdrawals_enabled
     if not is_admin(call.from_user.id):
+        await call.answer("🛑 شما ادمین نیستید!", show_alert=True)
         return
-    
-    auto_payout_enabled = not auto_payout_enabled
+    withdrawals_enabled = not withdrawals_enabled
     await save_data()
-    status_msg = "⚡️ واریز خودکار فعال شد." if auto_payout_enabled else "📝 واریز به حالت دستی تغییر یافت."
+    status_msg = "✅ برداشت خودکار روشن شد." if withdrawals_enabled else "🛑 برداشت خودکار خاموش شد."
     await call.answer(status_msg, show_alert=True)
     await open_admin_panel(call.message)
+
 
 @dp.callback_query(F.data == "admin_back_panel")
 async def admin_back_panel_callback(call: types.CallbackQuery):
@@ -1664,6 +1506,7 @@ async def main():
     keep_alive()
     asyncio.create_task(wallet_balance_tracker_loop())
     asyncio.create_task(deposit_tracker_loop())
+    asyncio.create_task(withdrawal_recovery_loop())
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
