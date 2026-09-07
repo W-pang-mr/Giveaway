@@ -52,6 +52,9 @@ BOT_VERSION = "6.1.0"
 WITHDRAW_CHANNEL = "@voidwithraw"
 WALLET_TRACKER_CHANNEL = "@Voidchanneloffical"  # کانال ارسال و بروزرسانی خودکار موجودی ولت سیستم
 TON_MNEMONIC = os.environ.get("TON_MNEMONIC")
+# DOGS Jetton روی شبکه اصلی TON؛ decimals رسمی این توکن ۹ است.
+DOGS_JETTON_MASTER = "EQCvxJy4eG8hyHBFsZ7eePxrRsUQSFE_jpptRAYBmcG_DOGS"
+DOGS_DECIMALS = 9
 
 # تنظیمات اتصال به MongoDB
 MONGO_URI = os.environ.get("MONGO_URI", "")
@@ -78,6 +81,11 @@ min_withdraw_amount = 0.1
 max_withdraw_amount = 10.0
 min_deposit_amount = 0.01
 ton_gas_fee = 0.005
+# تنظیمات مستقل DOGS؛ کارمزد شبکه برای برداشت DOGS با TON پرداخت می‌شود.
+dogs_gas_fee_ton = 0.05
+dogs_min_withdraw_amount = 1000.0
+dogs_max_withdraw_amount = 1000000.0
+dogs_withdrawals_enabled = True
 tracker_message_id = None
 system_wallet_address = None
 # ارسال‌های TON باید پشت‌سرهم انجام شوند تا چند برداشت هم‌زمان از یک موجودی عبور نکند.
@@ -487,6 +495,10 @@ async def save_data():
             "min_withdraw_amount": min_withdraw_amount,
             "max_withdraw_amount": max_withdraw_amount,
             "ton_gas_fee": ton_gas_fee,
+            "dogs_gas_fee_ton": dogs_gas_fee_ton,
+            "dogs_min_withdraw_amount": dogs_min_withdraw_amount,
+            "dogs_max_withdraw_amount": dogs_max_withdraw_amount,
+            "dogs_withdrawals_enabled": dogs_withdrawals_enabled,
             "tracker_message_id": tracker_message_id
         }
         await settings_col.update_one({"setting_id": "global_config"}, {"$set": settings_doc}, upsert=True)
@@ -495,7 +507,7 @@ async def save_data():
         logging.error(f"Error saving data to MongoDB: {e}")
 
 async def load_data():
-    global user_data, all_time_users, banned_users, required_channels, bot_active, withdrawals_enabled, min_withdraw_amount, max_withdraw_amount, ton_gas_fee, tracker_message_id
+    global user_data, all_time_users, banned_users, required_channels, bot_active, withdrawals_enabled, min_withdraw_amount, max_withdraw_amount, ton_gas_fee, dogs_gas_fee_ton, dogs_min_withdraw_amount, dogs_max_withdraw_amount, dogs_withdrawals_enabled, tracker_message_id
     try:
         for collection, field in ((users_col, "user_id"), (withdrawals_col, "withdrawal_id"), (deposits_col, "tx_id"), (transfers_col, "transfer_id")):
             try:
@@ -512,6 +524,10 @@ async def load_data():
             min_withdraw_amount = settings_doc.get("min_withdraw_amount", 0.1)
             max_withdraw_amount = settings_doc.get("max_withdraw_amount", 10.0)
             ton_gas_fee = settings_doc.get("ton_gas_fee", 0.005)
+            dogs_gas_fee_ton = settings_doc.get("dogs_gas_fee_ton", 0.05)
+            dogs_min_withdraw_amount = settings_doc.get("dogs_min_withdraw_amount", 1000.0)
+            dogs_max_withdraw_amount = settings_doc.get("dogs_max_withdraw_amount", 1000000.0)
+            dogs_withdrawals_enabled = settings_doc.get("dogs_withdrawals_enabled", True)
             tracker_message_id = settings_doc.get("tracker_message_id", None)
 
         async for user_doc in users_col.find():
@@ -565,6 +581,15 @@ class AdminSetMaxWithdrawForm(StatesGroup):
 class AdminSetGasFeeForm(StatesGroup):
     amount = State()
 
+class AdminSetDogsGasFeeForm(StatesGroup):
+    amount = State()
+
+class AdminSetMinDogsWithdrawForm(StatesGroup):
+    amount = State()
+
+class AdminSetMaxDogsWithdrawForm(StatesGroup):
+    amount = State()
+
 class AdminAddChannelForm(StatesGroup):
     channel = State()
 
@@ -610,7 +635,10 @@ def get_admin_inline_keyboard():
             [InlineKeyboardButton(text="💬 ارسال پیام مستقیم", callback_data="admin_direct_msg")],
             [InlineKeyboardButton(text="🚫 بن کردن کاربر", callback_data="admin_ban_user"), InlineKeyboardButton(text="🟢 آن‌بن کاربر", callback_data="admin_unban_user")],
             [InlineKeyboardButton(text="⚙️ حداقل برداشت", callback_data="admin_set_min_wd"), InlineKeyboardButton(text="🔝 حداکثر برداشت", callback_data="admin_set_max_wd")],
-            [InlineKeyboardButton(text="⛽️ تنظیم گس‌فی شبکه", callback_data="admin_set_gas_fee")],
+            [InlineKeyboardButton(text="⛽️ تنظیم گس‌فی شبکه TON", callback_data="admin_set_gas_fee")],
+            [InlineKeyboardButton(text="🐶 گس‌فی برداشت DOGS", callback_data="admin_set_dogs_gas_fee")],
+            [InlineKeyboardButton(text="🐶 حداقل برداشت DOGS", callback_data="admin_set_min_dogs_wd"), InlineKeyboardButton(text="🐶 حداکثر برداشت DOGS", callback_data="admin_set_max_dogs_wd")],
+            [InlineKeyboardButton(text=("🛑 خاموش‌کردن برداشت DOGS" if dogs_withdrawals_enabled else "✅ روشن‌کردن برداشت DOGS"), callback_data="admin_toggle_dogs_withdrawals")],
             [InlineKeyboardButton(text="🧹 صفر کردن موجودی کل کاربران", callback_data="admin_reset_balances")],
             [InlineKeyboardButton(text=withdrawals_btn, callback_data="admin_toggle_withdrawals")],
             [InlineKeyboardButton(text=status_btn, callback_data="admin_toggle_bot"), InlineKeyboardButton(text="📢 همه‌فرستی (Broadcast)", callback_data="admin_broadcast")],
@@ -1240,8 +1268,14 @@ async def open_admin_panel(message: types.Message):
         f"🚫 <b>کاربران بن شده:</b> <code>{banned_count}</code> نفر\n"
         f"💰 <b>مجموع موجودی ولت کاربران:</b> <code>{total_balance:.4f} TON</code>\n"
         f"⛽️ <b>گس‌فی شبکه TON:</b> <code>{ton_gas_fee} TON</code>\n"
-        f"🔻 <b>حداقل برداشت:</b> <code>{min_withdraw_amount} TON</code>\n"
-        f"🔝 <b>حداکثر برداشت:</b> <code>{max_withdraw_amount} TON</code>\n"
+        f"🔻 <b>حداقل برداشت TON:</b> <code>{min_withdraw_amount} TON</code>\n"
+        f"🔝 <b>حداکثر برداشت TON:</b> <code>{max_withdraw_amount} TON</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🐶 <b>تنظیمات DOGS:</b> {'فعال ✅' if dogs_withdrawals_enabled else 'خاموش 🛑'}\n"
+        f"⛽️ <b>گس‌فی برداشت DOGS:</b> <code>{dogs_gas_fee_ton} TON</code>\n"
+        f"🔻 <b>حداقل برداشت DOGS:</b> <code>{dogs_min_withdraw_amount} DOGS</code>\n"
+        f"🔝 <b>حداکثر برداشت DOGS:</b> <code>{dogs_max_withdraw_amount} DOGS</code>\n"
+        f"🧾 <b>قرارداد DOGS:</b> <code>{DOGS_JETTON_MASTER}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "از دکمه‌های زیر برای مدیریت حرفه‌ای ربات استفاده کنید 👇"
     )
@@ -1575,6 +1609,94 @@ async def process_set_gas_fee(message: types.Message, state: FSMContext):
         await message.answer(f"⚡️ کارمزد شبکه TON روی <code>{ton_gas_fee} TON</code> تنظیم شد 🚀", parse_mode="HTML")
     except ValueError:
         await message.answer("⚠️ لطفاً یک عدد معتبر و قابل قبول وارد کن!")
+
+@dp.callback_query(F.data == "admin_set_dogs_gas_fee")
+async def start_set_dogs_gas_fee(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminSetDogsGasFeeForm.amount)
+    await call.message.edit_text(
+        f"🐶 <b>گس‌فی برداشت DOGS را به TON وارد کن</b>\nمقدار فعلی: <code>{dogs_gas_fee_ton} TON</code>",
+        parse_mode="HTML"
+    )
+
+@dp.message(AdminSetDogsGasFeeForm.amount)
+async def process_set_dogs_gas_fee(message: types.Message, state: FSMContext):
+    global dogs_gas_fee_ton
+    try:
+        amount = float(message.text.strip())
+        if not math.isfinite(amount) or amount <= 0:
+            raise ValueError
+        dogs_gas_fee_ton = amount
+        await save_data()
+        await state.clear()
+        await message.answer(f"✅ گس‌فی برداشت DOGS روی <code>{dogs_gas_fee_ton} TON</code> تنظیم شد.", parse_mode="HTML")
+    except (ValueError, AttributeError):
+        await message.answer("⚠️ یک مقدار مثبت و معتبر به TON وارد کن.")
+
+@dp.callback_query(F.data == "admin_set_min_dogs_wd")
+async def start_set_min_dogs_wd(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminSetMinDogsWithdrawForm.amount)
+    await call.message.edit_text(
+        f"🐶 <b>حداقل برداشت DOGS را وارد کن</b>\nمقدار فعلی: <code>{dogs_min_withdraw_amount} DOGS</code>",
+        parse_mode="HTML"
+    )
+
+@dp.message(AdminSetMinDogsWithdrawForm.amount)
+async def process_set_min_dogs_wd(message: types.Message, state: FSMContext):
+    global dogs_min_withdraw_amount
+    try:
+        amount = float(message.text.strip())
+        if not math.isfinite(amount) or amount <= 0 or amount >= dogs_max_withdraw_amount:
+            raise ValueError
+        dogs_min_withdraw_amount = amount
+        await save_data()
+        await state.clear()
+        await message.answer(f"✅ حداقل برداشت DOGS روی <code>{dogs_min_withdraw_amount}</code> تنظیم شد.", parse_mode="HTML")
+    except (ValueError, AttributeError):
+        await message.answer("⚠️ مقدار باید مثبت و کمتر از سقف برداشت DOGS باشد.")
+
+@dp.callback_query(F.data == "admin_set_max_dogs_wd")
+async def start_set_max_dogs_wd(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminSetMaxDogsWithdrawForm.amount)
+    await call.message.edit_text(
+        f"🐶 <b>حداکثر برداشت DOGS را وارد کن</b>\nمقدار فعلی: <code>{dogs_max_withdraw_amount} DOGS</code>",
+        parse_mode="HTML"
+    )
+
+@dp.message(AdminSetMaxDogsWithdrawForm.amount)
+async def process_set_max_dogs_wd(message: types.Message, state: FSMContext):
+    global dogs_max_withdraw_amount
+    try:
+        amount = float(message.text.strip())
+        if not math.isfinite(amount) or amount <= dogs_min_withdraw_amount:
+            raise ValueError
+        dogs_max_withdraw_amount = amount
+        await save_data()
+        await state.clear()
+        await message.answer(f"✅ حداکثر برداشت DOGS روی <code>{dogs_max_withdraw_amount}</code> تنظیم شد.", parse_mode="HTML")
+    except (ValueError, AttributeError):
+        await message.answer("⚠️ مقدار باید بیشتر از حداقل برداشت DOGS باشد.")
+
+@dp.callback_query(F.data == "admin_toggle_dogs_withdrawals")
+async def toggle_dogs_withdrawals_callback(call: types.CallbackQuery):
+    global dogs_withdrawals_enabled
+    if not is_admin(call.from_user.id):
+        await call.answer("🛑 شما ادمین نیستید!", show_alert=True)
+        return
+    dogs_withdrawals_enabled = not dogs_withdrawals_enabled
+    await save_data()
+    status_msg = "✅ برداشت DOGS روشن شد." if dogs_withdrawals_enabled else "🛑 برداشت DOGS خاموش شد."
+    await call.answer(status_msg, show_alert=True)
+    await open_admin_panel(call.message)
+
 
 @dp.callback_query(F.data == "admin_edit_balance")
 async def start_edit_balance(call: types.CallbackQuery, state: FSMContext):
