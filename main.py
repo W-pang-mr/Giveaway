@@ -1,5 +1,5 @@
 # ==========================================
-# Void Giveaway Bot - Version 6.0.0 (Fully Automatic TON Withdrawals)
+# Void Giveaway Bot - Version 6.1.0 (Fully Automatic TON Withdrawals)
 # (Multi-Channel Forced Join, Live Wallet Tracker, Direct Admin DM, Ban System, MongoDB Integrated)
 # ==========================================
 
@@ -35,7 +35,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v6.0.0) is running smoothly!"
+    return "⚡ Void Giveaway Bot (v6.1.0) is running smoothly!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -48,7 +48,7 @@ def keep_alive():
 
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = [6879499219]
-BOT_VERSION = "6.0.0"
+BOT_VERSION = "6.1.0"
 WITHDRAW_CHANNEL = "@voidwithraw"
 WALLET_TRACKER_CHANNEL = "@Voidchanneloffical"  # کانال ارسال و بروزرسانی خودکار موجودی ولت سیستم
 TON_MNEMONIC = os.environ.get("TON_MNEMONIC")
@@ -62,6 +62,7 @@ users_col = db['users']
 settings_col = db['settings']
 withdrawals_col = db['withdrawals']
 deposits_col = db['deposits']
+transfers_col = db['transfers']
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -472,6 +473,8 @@ async def save_data():
                 "username": info.get("username", ""),
                 "first_name": info.get("first_name", "User")
             }
+            if info.get("started_at"):
+                user_doc["started_at"] = info["started_at"]
             await users_col.update_one({"user_id": u_id}, {"$set": user_doc}, upsert=True)
 
         settings_doc = {
@@ -494,7 +497,7 @@ async def save_data():
 async def load_data():
     global user_data, all_time_users, banned_users, required_channels, bot_active, withdrawals_enabled, min_withdraw_amount, max_withdraw_amount, ton_gas_fee, tracker_message_id
     try:
-        for collection, field in ((users_col, "user_id"), (withdrawals_col, "withdrawal_id"), (deposits_col, "tx_id")):
+        for collection, field in ((users_col, "user_id"), (withdrawals_col, "withdrawal_id"), (deposits_col, "tx_id"), (transfers_col, "transfer_id")):
             try:
                 await collection.create_index(field, unique=True)
             except Exception as index_error:
@@ -516,7 +519,8 @@ async def load_data():
             user_data[u_id] = {
                 "balance": round(user_doc.get("balance", 0.0), 4),
                 "username": user_doc.get("username", ""),
-                "first_name": user_doc.get("first_name", "User")
+                "first_name": user_doc.get("first_name", "User"),
+                "started_at": user_doc.get("started_at")
             }
 
     except Exception as e:
@@ -652,6 +656,11 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
         await message.answer("🚫 <b>دسترسی این حساب متوقف شده است.</b>\nاگر فکر می‌کنی اشتباهی رخ داده، با پشتیبانی تماس بگیر.", parse_mode="HTML")
         return
 
+    profile = get_user_profile(u_id, message.from_user)
+    profile["started_at"] = profile.get("started_at") or datetime.utcnow().isoformat()
+    all_time_users.add(u_id)
+    await save_data()
+
     if not bot_active and not is_admin(u_id):
         await message.answer("🛠️ <b>ربات موقتاً در حالت تعمیر و ارتقاست.</b>\nخیلی زود برمی‌گردیم؛ موجودی شما کاملاً محفوظ است.", parse_mode="HTML")
         return
@@ -668,12 +677,149 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     await message.answer(
         f"🔥 <b>به Void Giveaway خوش اومدی!</b> آماده‌ای جایزه جمع کنی؟\n"
-        f"🧩 <b>نسخه فعال:</b> <code>v6.0.0</code> 💎\n\n"
+        f"🧩 <b>نسخه فعال:</b> <code>v6.1.0</code> 💎\n\n"
 
         f"از منوی زیر استفاده کن و موجودی، برداشت و دعوت‌هات رو مدیریت کن 👇",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
     )
+
+# ==========================================
+# انتقال موجودی بین کاربران در گروه
+# ==========================================
+async def has_started_bot(user_id: int) -> bool:
+    if user_id in all_time_users:
+        return True
+    profile = user_data.get(user_id)
+    if profile and profile.get("started_at"):
+        return True
+    try:
+        user_doc = await users_col.find_one({"user_id": user_id, "started_at": {"$exists": True}}, {"user_id": 1})
+        return bool(user_doc)
+    except Exception as e:
+        logging.error(f"Started-user lookup failed for {user_id}: {e}")
+        return False
+
+
+async def transfer_user_balance(sender_id: int, recipient_id: int, amount: float, recipient: types.User):
+    transfer_id = "TR-" + uuid.uuid4().hex[:16].upper()
+    now = datetime.utcnow().isoformat()
+    session = None
+    try:
+        session = await mongo_client.start_session()
+        async with session.start_transaction():
+            sender_after = await users_col.find_one_and_update(
+                {"user_id": sender_id, "balance": {"$gte": amount}},
+                {"$inc": {"balance": -amount}},
+                return_document=ReturnDocument.AFTER, session=session
+            )
+            if not sender_after:
+                return None, "insufficient_balance"
+
+            recipient_after = await users_col.find_one_and_update(
+                {"user_id": recipient_id},
+                {"$inc": {"balance": amount}, "$setOnInsert": {
+                    "user_id": recipient_id,
+                    "username": recipient.username or "",
+                    "first_name": recipient.first_name or "User",
+                    "started_at": now
+                }},
+                upsert=True, return_document=ReturnDocument.AFTER, session=session
+            )
+            await transfers_col.insert_one({
+                "transfer_id": transfer_id,
+                "sender_id": sender_id,
+                "recipient_id": recipient_id,
+                "amount": round(amount, 4),
+                "status": "completed",
+                "created_at": now
+            }, session=session)
+
+        sender_profile = get_user_profile(sender_id)
+        sender_profile["balance"] = round(float(sender_after.get("balance", 0.0)), 4)
+        recipient_profile = get_user_profile(recipient_id, recipient)
+        recipient_profile["balance"] = round(float(recipient_after.get("balance", 0.0)), 4)
+        return transfer_id, "ok"
+    except Exception as e:
+        logging.error(f"Balance transfer failed from {sender_id} to {recipient_id}: {e}")
+        return None, "error"
+    finally:
+        if session:
+            await session.end_session()
+
+
+@dp.message(F.text.regexp(r"(?i)^/?wallet(?:@[A-Za-z0-9_]+)?(?:\s|$)"))
+async def wallet_transfer_handler(message: types.Message):
+    sender = message.from_user
+    if not sender or is_banned(sender.id):
+        return
+    if message.chat.type not in ("group", "supergroup"):
+        await message.answer("ℹ️ انتقال موجودی فقط با reply به یک کاربر در گروه انجام می‌شود.")
+        return
+    if not bot_active and not is_admin(sender.id):
+        await message.answer("🛠️ ربات موقتاً در حال ارتقاست؛ انتقالی انجام نشد.")
+        return
+
+    reply = message.reply_to_message
+    recipient = reply.from_user if reply else None
+    if not recipient or recipient.is_bot:
+        await message.answer("⚠️ روی پیام کاربر مقصد reply کن و بعد بنویس: <code>wallet 0.01</code>", parse_mode="HTML")
+        return
+    if recipient.id == sender.id:
+        await message.answer("⚠️ انتقال موجودی به خودت امکان‌پذیر نیست.")
+        return
+
+    parts = re.split(r"\s+", (message.text or "").strip())
+    if len(parts) != 2:
+        await message.answer("⚠️ فرمت صحیح: <code>wallet 0.01</code> یا <code>/wallet 0.01</code>", parse_mode="HTML")
+        return
+    try:
+        amount = round(float(parts[1]), 4)
+    except (TypeError, ValueError):
+        amount = 0
+    if not math.isfinite(amount) or amount <= 0:
+        await message.answer("⚠️ مقدار انتقال باید یک عدد مثبت باشد.")
+        return
+
+    if not await has_started_bot(recipient.id):
+        target_name = html.escape(recipient.full_name or "کاربر")
+        await message.answer(
+            f"⚠️ <a href=\"tg://user?id={recipient.id}\">{target_name}</a> هنوز ربات را Start نکرده است.\n"
+            "ابتدا در خصوصی ربات دستور /start را بفرستد؛ هیچ مبلغی از موجودی تو کم نشد.",
+            parse_mode="HTML"
+        )
+        return
+
+    transfer_id, result = await transfer_user_balance(sender.id, recipient.id, amount, recipient)
+    if result == "insufficient_balance":
+        await message.answer("💰 موجودی تو برای این انتقال کافی نیست؛ هیچ مبلغی کم نشد.")
+        return
+    if result != "ok":
+        await message.answer("⚠️ انتقال انجام نشد و موجودی‌ها تغییر نکردند. دوباره تلاش کن.")
+        return
+
+    sender_name = html.escape(sender.full_name or "کاربر")
+    recipient_name = html.escape(recipient.full_name or "کاربر")
+    group_text = (
+        "✅ <b>انتقال موجودی با موفقیت انجام شد.</b>\n"
+        f"🆔 شناسه انتقال: <code>{transfer_id}</code>\n"
+        f"👤 فرستنده: {sender_name}\n"
+        f"🎁 گیرنده: {recipient_name}\n"
+        f"💎 مبلغ: <code>{amount:.4f} TON</code>"
+    )
+    await message.answer(group_text, parse_mode="HTML")
+    try:
+        await bot.send_message(
+            recipient.id,
+            "✅ <b>یک انتقال موجودی برایت انجام شد.</b>\n"
+            f"👤 از طرف: {sender_name}\n"
+            f"💎 مبلغ دریافت‌شده: <code>{amount:.4f} TON</code>\n"
+            f"🆔 شناسه انتقال: <code>{transfer_id}</code>\n"
+            "موجودی جدیدت را از بخش کیف‌پول بررسی کن.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.warning(f"Transfer confirmation DM failed for {recipient.id}: {e}")
 
 # ==========================================
 # سیستم برداشت و مدیریت موجودی - بازنویسی پایدار
@@ -1076,7 +1222,7 @@ async def open_admin_panel(message: types.Message):
     ch_list_str = ", ".join(required_channels) if required_channels else "هیچ کانالی تنظیم نشده است."
 
     admin_text = (
-        "👑 <b>مرکز فرماندهی Void Giveaway</b> 🚀\n<code>v6.0.0</code>\n"
+        "👑 <b>مرکز فرماندهی Void Giveaway</b> 🚀\n<code>v6.1.0</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💎 <b>موجودی واقعی ولت اصلی ربات:</b> {wallet_str}\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
