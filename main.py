@@ -1108,7 +1108,6 @@ async def transfer_user_balance(sender_id: int, recipient_id: int, amount: float
                     "$inc": {balance_field: amount},
                     "$setOnInsert": {
                         "user_id": recipient_id,
-                        "balance": 0.0,
                         "username": recipient.username or "",
                         "first_name": recipient.first_name or "User",
                         "started_at": now
