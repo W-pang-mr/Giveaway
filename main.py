@@ -232,8 +232,29 @@ async def close_lite_client(client):
         logging.warning(f"LiteClient close warning: {close_error}")
 
 
+async def wait_for_wallet_seqno(previous_seqno: int, attempts: int = 20, interval: int = 3) -> bool:
+    """Poll a fresh TON LiteClient so confirmation is not based on a stale connection."""
+    for attempt in range(attempts):
+        probe = None
+        try:
+            probe = LiteClient.from_mainnet_config(ls_i=0, trust_level=2)
+            await probe.connect()
+            probe_wallet = await WalletV5R1.from_mnemonic(
+                probe, TON_MNEMONIC.strip().split(), network_global_id=-239
+            )
+            if await probe_wallet.get_seqno() > previous_seqno:
+                return True
+        except Exception as confirm_error:
+            logging.warning(f"Wallet seqno confirmation attempt {attempt + 1} failed: {confirm_error}")
+        finally:
+            await close_lite_client(probe)
+        if attempt < attempts - 1:
+            await asyncio.sleep(interval)
+    return False
+
+
 async def send_ton_payout(destination_address: str, amount_ton: float):
-    """ارسال امن؛ نتیجه می‌تواند sent، failed یا uncertain باشد."""
+    """Send TON and confirm the wallet message through a fresh network query."""
     if not TON_MNEMONIC:
         return "failed", "کلید امنیتی ولت (TON_MNEMONIC) تنظیم نشده است!"
     if not is_valid_ton_address(destination_address):
@@ -261,40 +282,27 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
                 client, TON_MNEMONIC.strip().split(), network_global_id=-239
             )
             seqno_before = await wallet.get_seqno()
-            # From this point the network result can be ambiguous; never auto-refund blindly.
             transfer_started = True
             await wallet.transfer(
                 destination=destination_address.strip(),
                 amount=int(round(amount_ton * 10**9)),
                 body="Payout from Void Giveaway Bot 🎉"
             )
-
-            # تغییر seqno یعنی پیام از ولت سیستم ارسال شده؛ بعد از این مرحله refund ممنوع است.
-            for _ in range(6):
-                await asyncio.sleep(2)
-                try:
-                    if await wallet.get_seqno() > seqno_before:
-                        await close_lite_client(client)
-                        client = None
-                        return "sent", (
-                            f"ارسال {amount_ton:.4f} TON از ولت سیستم تأیید شد؛ "
-                            "وضعیت شبکه ممکن است چند ثانیه دیرتر به‌روزرسانی شود."
-                        )
-                except Exception as confirm_error:
-                    logging.warning(f"TON payout confirmation check failed: {confirm_error}")
-
             await close_lite_client(client)
             client = None
-            return "uncertain", "ارسال به شبکه انجام شد اما تأیید نهایی هنوز دریافت نشده است؛ برای جلوگیری از پرداخت دوباره، مبلغ فعلاً رزرو می‌ماند."
 
+            if await wait_for_wallet_seqno(seqno_before):
+                return "sent", (
+                    f"ارسال {amount_ton:.4f} TON روی شبکه ثبت و تأیید شد؛ "
+                    "نمایش تراکنش در کیف‌پول مقصد ممکن است کمی زمان ببرد."
+                )
+            return "uncertain", "پیام TON ارسال شده اما تأیید شبکه هنوز دریافت نشده است؛ مبلغ رزرو می‌ماند."
         except Exception as e:
             logging.error(f"pytoniq W5 Payout Error: {e}")
             await close_lite_client(client)
             if transfer_started:
-                return "uncertain", "نتیجه ارسال به شبکه قطعی نیست؛ مبلغ برای بررسی بیشتر رزرو می‌ماند."
+                return "uncertain", "نتیجه ارسال TON قطعی نیست؛ مبلغ برای بررسی بیشتر رزرو می‌ماند."
             return "failed", str(e)
-
-
 
 def build_dogs_transfer_body(amount_units: int, destination_address: str,
                              response_address: str, comment: str):
@@ -320,7 +328,7 @@ def build_dogs_transfer_body(amount_units: int, destination_address: str,
     )
 
 async def send_dogs_payout(destination_address: str, amount_dogs: float):
-    """Send DOGS and distinguish failed, sent and network-uncertain outcomes."""
+    """Send DOGS and confirm the central wallet seqno through a fresh connection."""
     if not TON_MNEMONIC:
         return "failed", "کلید امنیتی ولت (TON_MNEMONIC) تنظیم نشده است!"
     if not is_valid_ton_address(destination_address):
@@ -376,28 +384,20 @@ async def send_dogs_payout(destination_address: str, amount_dogs: float):
                 amount=int(round(required_balance * 10 ** 9)),
                 body=body
             )
-
-            for _ in range(8):
-                await asyncio.sleep(2)
-                try:
-                    if await wallet.get_seqno() > seqno_before:
-                        await close_lite_client(client)
-                        client = None
-                        return "sent", (
-                            f"ارسال {amount_dogs:.4f} DOGS از Jetton Wallet مرکزی ثبت شد؛ "
-                            "نمایش تراکنش ممکن است چند ثانیه زمان ببرد."
-                        )
-                except Exception as confirm_error:
-                    logging.warning(f"DOGS payout confirmation check failed: {confirm_error}")
-
             await close_lite_client(client)
             client = None
-            return "uncertain", "پیام DOGS ارسال شد اما تأیید نهایی دریافت نشده است؛ مبلغ رزرو می‌ماند."
+
+            if await wait_for_wallet_seqno(seqno_before):
+                return "sent", (
+                    f"ارسال {amount_dogs:.4f} DOGS روی شبکه ثبت و تأیید شد؛ "
+                    "نمایش تراکنش ممکن است چند ثانیه زمان ببرد."
+                )
+            return "uncertain", "پیام DOGS ارسال شده اما تأیید شبکه هنوز دریافت نشده است؛ مبلغ رزرو می‌ماند."
         except Exception as e:
             logging.error(f"DOGS payout error: {e}")
             await close_lite_client(client)
             if transfer_started:
-                return "uncertain", "نتیجه ارسال DOGS به شبکه قطعی نیست؛ مبلغ رزرو می‌ماند."
+                return "uncertain", "نتیجه ارسال DOGS قطعی نیست؛ مبلغ برای بررسی بیشتر رزرو می‌ماند."
             return "failed", str(e)
 
 async def notify_wallet_issue(amount: float, reason: str, withdrawal_id: str = None, asset: str = "TON"):
@@ -1082,7 +1082,11 @@ async def has_started_bot(user_id: int) -> bool:
         return False
 
 
-async def transfer_user_balance(sender_id: int, recipient_id: int, amount: float, recipient: types.User):
+async def transfer_user_balance(sender_id: int, recipient_id: int, amount: float,
+                                recipient: types.User, asset: str = "TON"):
+    """Atomically transfer either TON or DOGS between two started users."""
+    asset = "DOGS" if str(asset).upper() == "DOGS" else "TON"
+    balance_field = "dogs_balance" if asset == "DOGS" else "balance"
     transfer_id = "TR-" + uuid.uuid4().hex[:16].upper()
     now = datetime.utcnow().isoformat()
     session = None
@@ -1090,44 +1094,51 @@ async def transfer_user_balance(sender_id: int, recipient_id: int, amount: float
         session = await mongo_client.start_session()
         async with session.start_transaction():
             sender_after = await users_col.find_one_and_update(
-                {"user_id": sender_id, "balance": {"$gte": amount}},
-                {"$inc": {"balance": -amount}},
-                return_document=ReturnDocument.AFTER, session=session
+                {"user_id": sender_id, balance_field: {"$gte": amount}},
+                {"$inc": {balance_field: -amount}},
+                return_document=ReturnDocument.AFTER,
+                session=session
             )
             if not sender_after:
                 return None, "insufficient_balance"
 
             recipient_after = await users_col.find_one_and_update(
                 {"user_id": recipient_id},
-                {"$inc": {"balance": amount}, "$setOnInsert": {
-                    "user_id": recipient_id,
-                    "username": recipient.username or "",
-                    "first_name": recipient.first_name or "User",
-                    "started_at": now
-                }},
-                upsert=True, return_document=ReturnDocument.AFTER, session=session
+                {
+                    "$inc": {balance_field: amount},
+                    "$setOnInsert": {
+                        "user_id": recipient_id,
+                        "balance": 0.0,
+                        "username": recipient.username or "",
+                        "first_name": recipient.first_name or "User",
+                        "started_at": now
+                    }
+                },
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+                session=session
             )
             await transfers_col.insert_one({
                 "transfer_id": transfer_id,
                 "sender_id": sender_id,
                 "recipient_id": recipient_id,
+                "asset": asset,
                 "amount": round(amount, 4),
                 "status": "completed",
                 "created_at": now
             }, session=session)
 
         sender_profile = get_user_profile(sender_id)
-        sender_profile["balance"] = round(float(sender_after.get("balance", 0.0)), 4)
+        sender_profile[balance_field] = round(float(sender_after.get(balance_field, 0.0)), 4)
         recipient_profile = get_user_profile(recipient_id, recipient)
-        recipient_profile["balance"] = round(float(recipient_after.get("balance", 0.0)), 4)
+        recipient_profile[balance_field] = round(float(recipient_after.get(balance_field, 0.0)), 4)
         return transfer_id, "ok"
     except Exception as e:
-        logging.error(f"Balance transfer failed from {sender_id} to {recipient_id}: {e}")
+        logging.error(f"{asset} balance transfer failed from {sender_id} to {recipient_id}: {e}")
         return None, "error"
     finally:
         if session:
             await session.end_session()
-
 
 @dp.message(F.text.regexp(r"(?i)^/?wallet(?:@[A-Za-z0-9_]+)?(?:\s|$)"))
 async def wallet_transfer_handler(message: types.Message):
@@ -1144,20 +1155,38 @@ async def wallet_transfer_handler(message: types.Message):
     reply = message.reply_to_message
     recipient = reply.from_user if reply else None
     if not recipient or recipient.is_bot:
-        await message.answer("⚠️ روی پیام کاربر مقصد reply کن و بعد بنویس: <code>wallet 0.01</code>", parse_mode="HTML")
+        await message.answer(
+            "⚠️ روی پیام کاربر مقصد reply کن و بنویس: <code>wallet 100 dogs</code> یا <code>wallet 0.01 ton</code>",
+            parse_mode="HTML"
+        )
         return
     if recipient.id == sender.id:
         await message.answer("⚠️ انتقال موجودی به خودت امکان‌پذیر نیست.")
         return
 
     parts = re.split(r"\s+", (message.text or "").strip())
-    if len(parts) != 2:
-        await message.answer("⚠️ فرمت صحیح: <code>wallet 0.01</code> یا <code>/wallet 0.01</code>", parse_mode="HTML")
+    if len(parts) not in (2, 3):
+        await message.answer(
+            "⚠️ فرمت صحیح: <code>wallet 100 dogs</code> یا <code>wallet 0.01 ton</code>",
+            parse_mode="HTML"
+        )
         return
+
     try:
-        amount = round(float(parts[1]), 4)
+        amount = float(parts[1])
     except (TypeError, ValueError):
         amount = 0
+    asset_text = parts[2].lower() if len(parts) == 3 else "ton"
+    if asset_text in ("dog", "dogs"):
+        asset = "DOGS"
+        amount = round(amount, 4)
+    elif asset_text in ("ton", "t"):
+        asset = "TON"
+        amount = round(amount, 4)
+    else:
+        await message.answer("⚠️ واحد معتبر فقط TON یا DOGS است.")
+        return
+
     if not math.isfinite(amount) or amount <= 0:
         await message.answer("⚠️ مقدار انتقال باید یک عدد مثبت باشد.")
         return
@@ -1166,14 +1195,17 @@ async def wallet_transfer_handler(message: types.Message):
         target_name = html.escape(recipient.full_name or "کاربر")
         await message.answer(
             f"⚠️ <a href=\"tg://user?id={recipient.id}\">{target_name}</a> هنوز ربات را Start نکرده است.\n"
-            "ابتدا در خصوصی ربات دستور /start را بفرستد؛ هیچ مبلغی از موجودی تو کم نشد.",
+            "ابتدا در خصوصی ربات دستور /start را بفرستد؛ هیچ مبلغی کم نشد.",
             parse_mode="HTML"
         )
         return
 
-    transfer_id, result = await transfer_user_balance(sender.id, recipient.id, amount, recipient)
+    transfer_id, result = await transfer_user_balance(
+        sender.id, recipient.id, amount, recipient, asset=asset
+    )
+    unit = asset
     if result == "insufficient_balance":
-        await message.answer("💰 موجودی تو برای این انتقال کافی نیست؛ هیچ مبلغی کم نشد.")
+        await message.answer(f"💰 موجودی {unit} برای این انتقال کافی نیست؛ هیچ مبلغی کم نشد.")
         return
     if result != "ok":
         await message.answer("⚠️ انتقال انجام نشد و موجودی‌ها تغییر نکردند. دوباره تلاش کن.")
@@ -1186,7 +1218,7 @@ async def wallet_transfer_handler(message: types.Message):
         f"🆔 شناسه انتقال: <code>{transfer_id}</code>\n"
         f"👤 فرستنده: {sender_name}\n"
         f"🎁 گیرنده: {recipient_name}\n"
-        f"💎 مبلغ: <code>{amount:.4f} TON</code>"
+        f"💎 مبلغ: <code>{amount:.4f} {unit}</code>"
     )
     await message.answer(group_text, parse_mode="HTML")
     try:
@@ -1194,7 +1226,7 @@ async def wallet_transfer_handler(message: types.Message):
             recipient.id,
             "✅ <b>یک انتقال موجودی برایت انجام شد.</b>\n"
             f"👤 از طرف: {sender_name}\n"
-            f"💎 مبلغ دریافت‌شده: <code>{amount:.4f} TON</code>\n"
+            f"💎 مبلغ دریافت‌شده: <code>{amount:.4f} {unit}</code>\n"
             f"🆔 شناسه انتقال: <code>{transfer_id}</code>\n"
             "موجودی جدیدت را از بخش کیف‌پول بررسی کن.",
             parse_mode="HTML"
