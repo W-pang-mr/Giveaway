@@ -12,6 +12,7 @@ import math
 import re
 import uuid
 from datetime import datetime
+from urllib.parse import quote
 from flask import Flask
 from threading import Thread
 from aiogram import Bot, Dispatcher, F, types
@@ -34,7 +35,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v4.6.0) is running smoothly!"
+    return "⚡ Void Giveaway Bot (v5.0.0) is running smoothly!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -47,7 +48,7 @@ def keep_alive():
 
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = [6879499219]
-BOT_VERSION = "4.6.1"
+BOT_VERSION = "5.0.0"
 WITHDRAW_CHANNEL = "@voidwithraw"
 WALLET_TRACKER_CHANNEL = "@Voidchanneloffical"  # کانال ارسال و بروزرسانی خودکار موجودی ولت سیستم
 TON_MNEMONIC = os.environ.get("TON_MNEMONIC")
@@ -60,6 +61,7 @@ db = mongo_client['void_giveaway_db']
 users_col = db['users']
 settings_col = db['settings']
 withdrawals_col = db['withdrawals']
+deposits_col = db['deposits']
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -73,10 +75,10 @@ bot_active = True
 auto_payout_enabled = False
 min_withdraw_amount = 0.1
 max_withdraw_amount = 10.0
-referral_reward = 0.048
-max_referrals = 50
+min_deposit_amount = 0.01
 ton_gas_fee = 0.005
 tracker_message_id = None
+system_wallet_address = None
 # ارسال‌های TON باید پشت‌سرهم انجام شوند تا چند برداشت هم‌زمان از یک موجودی عبور نکند.
 payout_lock = asyncio.Lock()
 # کل مسیر رزرو/بازگشت موجودی و برداشت در یک پردازش سریالی انجام می‌شود.
@@ -186,6 +188,7 @@ async def check_user_subscription(user_id: int) -> bool:
                 return False
         except Exception as e:
             logging.error(f"Subscription Check Error for {ch}: {e}")
+            return False
     return True
 
 def get_join_channel_keyboard():
@@ -285,6 +288,145 @@ async def notify_wallet_issue(amount_ton: float, reason: str, withdrawal_id: str
         logging.error(f"Wallet issue alert error: {alert_error}")
 
 # ==========================================
+# واریز TON به ولت مرکزی
+# ==========================================
+def get_object_field(value, name, default=None):
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def get_deposit_memo(user_id: int) -> str:
+    return f"VG-{int(user_id)}"
+
+
+async def get_system_wallet_address():
+    global system_wallet_address
+    if system_wallet_address:
+        return system_wallet_address
+    _, address_or_error = await get_system_wallet_balance()
+    if address_or_error and is_valid_ton_address(address_or_error):
+        system_wallet_address = address_or_error
+        return system_wallet_address
+    return None
+
+
+def extract_ton_comment(in_msg) -> str:
+    try:
+        body = get_object_field(in_msg, "body")
+        if not body:
+            return ""
+        parser = body.begin_parse()
+        if parser.remaining_bits < 32 or parser.load_uint(32) != 0:
+            return ""
+        return parser.load_snake_string().strip()
+    except Exception as e:
+        logging.debug(f"TON comment parse skipped: {e}")
+        return ""
+
+
+async def credit_deposit_transaction(tx_id: str, user_id: int, amount_nano: int, memo: str, lt):
+    amount_ton = round(amount_nano / 10**9, 4)
+    if amount_ton < min_deposit_amount:
+        return False
+
+    now = datetime.utcnow().isoformat()
+    session = None
+    try:
+        session = await mongo_client.start_session()
+        async with session.start_transaction():
+            existing = await deposits_col.find_one({"tx_id": tx_id}, session=session)
+            if existing:
+                return False
+            await deposits_col.insert_one({
+                "tx_id": tx_id,
+                "user_id": user_id,
+                "memo": memo,
+                "amount_nano": amount_nano,
+                "amount_ton": amount_ton,
+                "lt": lt,
+                "status": "credited",
+                "created_at": now,
+                "credited_at": now
+            }, session=session)
+            await users_col.update_one(
+                {"user_id": user_id},
+                {"$inc": {"balance": amount_ton}, "$setOnInsert": {
+                    "user_id": user_id, "username": "", "first_name": "User"
+                }},
+                upsert=True, session=session
+            )
+    except Exception as e:
+        logging.error(f"Deposit credit failed for {tx_id}: {e}")
+        return False
+    finally:
+        if session:
+            await session.end_session()
+
+    prof = get_user_profile(user_id)
+    prof["balance"] = round(float(prof.get("balance", 0.0)) + amount_ton, 4)
+    try:
+        await bot.send_message(
+            user_id,
+            f"✅ <b>واریز شما تأیید شد.</b>\n💎 مبلغ افزوده‌شده: <code>{amount_ton:.4f} TON</code>\n"
+            f"💰 موجودی جدید: <code>{prof['balance']:.4f} TON</code>",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+    return True
+
+
+async def scan_incoming_deposits():
+    wallet_address = await get_system_wallet_address()
+    if not wallet_address:
+        return
+
+    client = None
+    try:
+        client = LiteClient.from_mainnet_config(ls_i=0, trust_level=2)
+        await client.connect()
+        transactions = await client.get_transactions(address=wallet_address, count=50)
+        for tx in transactions:
+            in_msg = get_object_field(tx, "in_msg")
+            info = get_object_field(in_msg, "info")
+            value = get_object_field(info, "value")
+            amount_nano = get_object_field(value, "grams", get_object_field(info, "value_coins", 0))
+            if not amount_nano or int(amount_nano) <= 0:
+                continue
+            if get_object_field(info, "bounced", False):
+                continue
+            description = get_object_field(tx, "description")
+            if get_object_field(description, "aborted", False):
+                continue
+            credit_phase = get_object_field(description, "credit_ph")
+            credit = get_object_field(credit_phase, "credit")
+            credited_nano = get_object_field(credit, "grams")
+            if credited_nano:
+                amount_nano = credited_nano
+            memo = extract_ton_comment(in_msg)
+            match = re.fullmatch(r"VG-(\d+)", memo)
+            if not match:
+                continue
+            tx_id = f"{get_object_field(tx, 'account_addr', wallet_address)}:{get_object_field(tx, 'lt', '')}"
+            await credit_deposit_transaction(tx_id, int(match.group(1)), int(amount_nano), memo, get_object_field(tx, "lt"))
+    except Exception as e:
+        logging.error(f"Incoming TON deposit scan failed: {e}")
+    finally:
+        await close_lite_client(client)
+
+
+async def deposit_tracker_loop():
+    await asyncio.sleep(12)
+    while True:
+        try:
+            await scan_incoming_deposits()
+        except Exception as e:
+            logging.error(f"Deposit tracker loop exception: {e}")
+        await asyncio.sleep(30)
+
+
+# ==========================================
 # ذخیره و بازیابی دیتابیس MongoDB
 # ==========================================
 async def save_data():
@@ -293,8 +435,6 @@ async def save_data():
             user_doc = {
                 "user_id": u_id,
                 "balance": info.get("balance", 0.0),
-                "referrals_count": info.get("referrals_count", 0),
-                "referred_by": info.get("referred_by", None),
                 "username": info.get("username", ""),
                 "first_name": info.get("first_name", "User")
             }
@@ -309,8 +449,6 @@ async def save_data():
             "auto_payout_enabled": auto_payout_enabled,
             "min_withdraw_amount": min_withdraw_amount,
             "max_withdraw_amount": max_withdraw_amount,
-            "referral_reward": referral_reward,
-            "max_referrals": max_referrals,
             "ton_gas_fee": ton_gas_fee,
             "tracker_message_id": tracker_message_id
         }
@@ -320,8 +458,13 @@ async def save_data():
         logging.error(f"Error saving data to MongoDB: {e}")
 
 async def load_data():
-    global user_data, all_time_users, banned_users, required_channels, bot_active, auto_payout_enabled, min_withdraw_amount, max_withdraw_amount, referral_reward, max_referrals, ton_gas_fee, tracker_message_id
+    global user_data, all_time_users, banned_users, required_channels, bot_active, auto_payout_enabled, min_withdraw_amount, max_withdraw_amount, ton_gas_fee, tracker_message_id
     try:
+        for collection, field in ((users_col, "user_id"), (withdrawals_col, "withdrawal_id"), (deposits_col, "tx_id")):
+            try:
+                await collection.create_index(field, unique=True)
+            except Exception as index_error:
+                logging.warning(f"Index setup skipped for {field}: {index_error}")
         settings_doc = await settings_col.find_one({"setting_id": "global_config"})
         if settings_doc:
             all_time_users = set(settings_doc.get("all_time_users", []))
@@ -331,8 +474,6 @@ async def load_data():
             auto_payout_enabled = settings_doc.get("auto_payout_enabled", False)
             min_withdraw_amount = settings_doc.get("min_withdraw_amount", 0.1)
             max_withdraw_amount = settings_doc.get("max_withdraw_amount", 10.0)
-            referral_reward = settings_doc.get("referral_reward", 0.048)
-            max_referrals = settings_doc.get("max_referrals", 50)
             ton_gas_fee = settings_doc.get("ton_gas_fee", 0.005)
             tracker_message_id = settings_doc.get("tracker_message_id", None)
 
@@ -340,8 +481,6 @@ async def load_data():
             u_id = int(user_doc["user_id"])
             user_data[u_id] = {
                 "balance": round(user_doc.get("balance", 0.0), 4),
-                "referrals_count": user_doc.get("referrals_count", 0),
-                "referred_by": user_doc.get("referred_by", None),
                 "username": user_doc.get("username", ""),
                 "first_name": user_doc.get("first_name", "User")
             }
@@ -355,6 +494,9 @@ async def load_data():
 class WithdrawForm(StatesGroup):
     amount = State()
     wallet_address = State()
+
+class DepositForm(StatesGroup):
+    amount = State()
 
 class AdminBroadcastForm(StatesGroup):
     message = State()
@@ -382,12 +524,6 @@ class AdminSetMinWithdrawForm(StatesGroup):
 class AdminSetMaxWithdrawForm(StatesGroup):
     amount = State()
 
-class AdminSetRefRewardForm(StatesGroup):
-    amount = State()
-
-class AdminSetMaxRefForm(StatesGroup):
-    amount = State()
-
 class AdminSetGasFeeForm(StatesGroup):
     amount = State()
 
@@ -410,8 +546,6 @@ def get_user_profile(user_id: int, user_obj: types.User = None):
     if user_id not in user_data:
         user_data[user_id] = {
             "balance": 0.0,
-            "referrals_count": 0,
-            "referred_by": None,
             "username": "",
             "first_name": "User"
         }
@@ -422,8 +556,7 @@ def get_user_profile(user_id: int, user_obj: types.User = None):
 
 def get_main_keyboard(user_id: int):
     kb = [
-        [KeyboardButton(text="💎 کیف‌پول من (Wallet)"), KeyboardButton(text="🔗 دریافت لینک رفرال 🚀")],
-        [KeyboardButton(text="👤 پروفایل من")]
+        [KeyboardButton(text="💎 کیف‌پول من (Wallet)")]
     ]
     if is_admin(user_id):
         kb.insert(0, [KeyboardButton(text="⚙️ پنل مدیریت ادمین 👑")])
@@ -439,63 +572,12 @@ def get_admin_inline_keyboard():
             [InlineKeyboardButton(text="💬 ارسال پیام مستقیم", callback_data="admin_direct_msg")],
             [InlineKeyboardButton(text="🚫 بن کردن کاربر", callback_data="admin_ban_user"), InlineKeyboardButton(text="🟢 آن‌بن کاربر", callback_data="admin_unban_user")],
             [InlineKeyboardButton(text="⚙️ حداقل برداشت", callback_data="admin_set_min_wd"), InlineKeyboardButton(text="🔝 حداکثر برداشت", callback_data="admin_set_max_wd")],
-            [InlineKeyboardButton(text="💎 تنظیم پاداش رفرال", callback_data="admin_set_ref_reward"), InlineKeyboardButton(text="👥 تنظیم سقف رفرال", callback_data="admin_set_max_ref")],
             [InlineKeyboardButton(text="⛽️ تنظیم گس‌فی شبکه", callback_data="admin_set_gas_fee")],
+            [InlineKeyboardButton(text="🧹 صفر کردن موجودی کل کاربران", callback_data="admin_reset_balances")],
             [InlineKeyboardButton(text=auto_btn, callback_data="admin_toggle_auto_payout")],
             [InlineKeyboardButton(text=status_btn, callback_data="admin_toggle_bot"), InlineKeyboardButton(text="📢 همه‌فرستی (Broadcast)", callback_data="admin_broadcast")],
         ]
     )
-
-# ==========================================
-# پردازش رفرال و آنتی‌فیک
-# ==========================================
-async def process_referral_logic(user: types.User, args: str, state: FSMContext):
-    u_id = user.id
-    prof = get_user_profile(u_id, user)
-
-    is_new_user = u_id not in all_time_users
-    if is_new_user:
-        all_time_users.add(u_id)
-
-    if args and is_new_user and args.startswith("ref_"):
-        try:
-            referrer_id = int(args.replace("ref_", ""))
-            if referrer_id != u_id and referrer_id in user_data:
-                prof["referred_by"] = referrer_id
-                ref_prof = get_user_profile(referrer_id)
-
-                if ref_prof["referrals_count"] < max_referrals:
-                    ref_prof["balance"] = round(ref_prof["balance"] + referral_reward, 4)
-                    ref_prof["referrals_count"] += 1
-                    await users_col.update_one(
-                        {"user_id": referrer_id},
-                        {"$set": user_data[referrer_id]},
-                        upsert=True
-                    )
-                    try:
-                        await bot.send_message(
-                            referrer_id,
-                            f"🎉 <b>یک کاربر جدید با لینک شما وارد ربات شد!</b>\n"
-                            f"💎 <b>+{referral_reward} TON</b> مستقیماً به کیف‌پول شما اضافه شد!\n"
-                            f"📊 رفرال‌های شما: <code>{ref_prof['referrals_count']}/{max_referrals}</code>",
-                            parse_mode="HTML"
-                        )
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        await bot.send_message(
-                            referrer_id,
-                            f"⚠️ <b>یک کاربر با لینک شما وارد شد، اما سقف رفرال شما پر است.</b>\n"
-                            f"سقف مجاز: <code>{max_referrals}</code> نفر",
-                            parse_mode="HTML"
-                        )
-                    except Exception:
-                        pass
-        except Exception as e:
-            logging.error(f"Direct Referral Error: {e}")
-
-    await save_data()
 
 # ==========================================
 # دکمه‌های مربوط به استارت و جوین اجباری
@@ -516,17 +598,11 @@ async def check_join_btn_callback(call: types.CallbackQuery, state: FSMContext):
     if is_subscribed:
         await call.answer("🎉 عضویتت با موفقیت تأیید شد! حالا آماده دریافت جایزه‌ای 🚀", show_alert=True)
         
-        state_data = await state.get_data()
-        pending_args = state_data.get("pending_ref_args", None)
-
-        await process_referral_logic(call.from_user, pending_args, state)
-        await state.clear()
-
         await call.message.delete()
         await call.message.answer(
             f"🔥 <b>به Void Giveaway خوش اومدی!</b> آماده‌ای جایزه جمع کنی؟\n"
             f"🧩 <b>نسخه فعال:</b> <code>{BOT_VERSION}</code> 💎\n\n"
-            f"🎁 <b>هر دعوت موفق = {referral_reward} TON جایزه مستقیم داخل کیف‌پولت!</b>\n\n"
+
             f"از منوی زیر استفاده کن و موجودی، برداشت و دعوت‌هات رو مدیریت کن 👇",
             parse_mode="HTML",
             reply_markup=get_main_keyboard(u_id)
@@ -546,10 +622,6 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
         await message.answer("🛠️ <b>ربات موقتاً در حالت تعمیر و ارتقاست.</b>\nخیلی زود برمی‌گردیم؛ موجودی شما کاملاً محفوظ است.", parse_mode="HTML")
         return
 
-    args = command.args
-    if args:
-        await state.update_data(pending_ref_args=args)
-
     is_subscribed = await check_user_subscription(u_id)
     if not is_subscribed:
         await message.answer(
@@ -560,13 +632,10 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
         )
         return
 
-    await process_referral_logic(message.from_user, args, state)
-    await state.clear()
-
     await message.answer(
         f"🔥 <b>به Void Giveaway خوش اومدی!</b> آماده‌ای جایزه جمع کنی؟\n"
-        f"🧩 <b>نسخه فعال:</b> <code>v4.6.0</code> 💎\n\n"
-        f"🎁 <b>هر دعوت موفق = {referral_reward} TON جایزه مستقیم داخل کیف‌پولت!</b>\n\n"
+        f"🧩 <b>نسخه فعال:</b> <code>v5.0.0</code> 💎\n\n"
+
         f"از منوی زیر استفاده کن و موجودی، برداشت و دعوت‌هات رو مدیریت کن 👇",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
@@ -646,8 +715,6 @@ async def reserve_user_balance(user_id: int, amount: float) -> bool:
         {"user_id": user_id},
         {"$setOnInsert": {
             "user_id": user_id, "balance": round(float(prof.get("balance", 0.0)), 4),
-            "referrals_count": prof.get("referrals_count", 0),
-            "referred_by": prof.get("referred_by"),
             "username": prof.get("username", ""), "first_name": prof.get("first_name", "User")
         }},
         upsert=True
@@ -720,13 +787,15 @@ async def show_wallet(message: types.Message):
     text = (
         f"💎 <b>داشبورد کیف‌پول تو</b> 🔥\n━━━━━━━━━━━━━━━━━━\n"
         f"💰 <b>موجودی آماده برداشت:</b> <code>{prof['balance']:.4f} TON</code>\n"
-        f"🎯 <b>دعوت‌های موفق:</b> <code>{prof['referrals_count']}</code> نفر\n"
         f"⚡️ <b>کارمزد شبکه:</b> <code>{ton_gas_fee} TON</code>\n"
         f"🔻 <b>حداقل برداشت:</b> <code>{min_withdraw_amount} TON</code>\n"
         f"🔝 <b>حداکثر برداشت:</b> <code>{max_withdraw_amount} TON</code>\n━━━━━━━━━━━━━━━━━━"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🚀 ثبت درخواست برداشت", callback_data="start_withdraw")]]
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ واریز TON", callback_data="start_deposit")],
+            [InlineKeyboardButton(text="🚀 ثبت درخواست برداشت", callback_data="start_withdraw")]
+        ]
     ))
 
 
@@ -1086,65 +1155,62 @@ async def reject_withdraw_no_refund(call: types.CallbackQuery):
 
 
 # ==========================================
-# گزینه‌های پروفایل و راهنما
+# رابط واریز TON
 # ==========================================
-@dp.message(F.text == "🔗 دریافت لینک رفرال 🚀")
-async def send_referral_link_menu(message: types.Message):
-    u_id = message.from_user.id
-
+@dp.callback_query(F.data == "start_deposit")
+async def start_deposit_callback(call: types.CallbackQuery, state: FSMContext):
+    u_id = call.from_user.id
     if is_banned(u_id):
-        await message.answer("🚫 <b>دسترسی این حساب متوقف شده است.</b>\nاگر فکر می‌کنی اشتباهی رخ داده، با پشتیبانی تماس بگیر.", parse_mode="HTML")
+        await call.answer("🚫 این حساب دسترسی فعال ندارد.", show_alert=True)
         return
-
     if not bot_active and not is_admin(u_id):
-        await message.answer("🛠️ <b>ربات موقتاً در حالت تعمیر و ارتقاست.</b>\nخیلی زود برمی‌گردیم؛ موجودی شما کاملاً محفوظ است.", parse_mode="HTML")
+        await call.answer("🛠️ ربات موقتاً در حال ارتقاست.", show_alert=True)
         return
-
-    is_subscribed = await check_user_subscription(u_id)
-    if not is_subscribed:
-        await message.answer("🔐 <b>برای ورود به بخش جایزه‌ها، اول در کانال‌های رسمی عضو شو.</b>", parse_mode="HTML", reply_markup=get_join_channel_keyboard())
+    if not await check_user_subscription(u_id):
+        await call.answer("🔐 برای واریز، عضویت در همه کانال‌ها الزامی است!", show_alert=True)
         return
-
-    prof = get_user_profile(u_id, message.from_user)
-    bot_info = await bot.get_me()
-    
-    general_ref_link = f"https://t.me/{bot_info.username}?start=ref_{u_id}"
-    
-    text = (
-        f"🚀 <b>لینک دعوت اختصاصی تو</b> 🎁\n\n"
-        f"🔗 <code>{general_ref_link}</code>\n\n"
-        f"💎 <b>پاداش هر دعوت موفق:</b> <b>{referral_reward} TON</b> مستقیم داخل کیف‌پولت\n"
-        f"🎯 <b>دعوت‌های موفق تو:</b> {prof['referrals_count']} از {max_referrals} نفر\n\n"
-            )
-    await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
-
-@dp.message(F.text == "👤 پروفایل من")
-async def show_profile(message: types.Message):
-    u_id = message.from_user.id
-
-    if is_banned(u_id):
-        await message.answer("🚫 <b>دسترسی این حساب متوقف شده است.</b>\nاگر فکر می‌کنی اشتباهی رخ داده، با پشتیبانی تماس بگیر.", parse_mode="HTML")
-        return
-
-    if not bot_active and not is_admin(u_id):
-        await message.answer("🛠️ <b>ربات موقتاً در حالت تعمیر و ارتقاست.</b>\nخیلی زود برمی‌گردیم؛ موجودی شما کاملاً محفوظ است.", parse_mode="HTML")
-        return
-
-    is_subscribed = await check_user_subscription(u_id)
-    if not is_subscribed:
-        await message.answer("🔐 <b>برای ورود به بخش جایزه‌ها، اول در کانال‌های رسمی عضو شو.</b>", parse_mode="HTML", reply_markup=get_join_channel_keyboard())
-        return
-
-    prof = get_user_profile(u_id, message.from_user)
-    text = (
-        f"👤 <b>پروفایل اختصاصی تو</b> ✨\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 <b>آیدی عددی:</b> <code>{u_id}</code>\n"
-        f"💎 <b>موجودی کیف‌پول:</b> <code>{prof['balance']:.4f} TON</code>\n"
-        f"🎯 <b>دعوت‌های موفق:</b> {prof['referrals_count']} از {max_referrals} نفر\n"
-        f"━━━━━━━━━━━━━━━━━━"
+    await call.answer()
+    await state.set_state(DepositForm.amount)
+    await call.message.answer(
+        f"💎 مقدار TON موردنظرت برای واریز را وارد کن.\nحداقل واریز: <code>{min_deposit_amount:.4f} TON</code>",
+        parse_mode="HTML"
     )
-    await message.answer(text, parse_mode="HTML")
+
+
+@dp.message(DepositForm.amount)
+async def process_deposit_amount(message: types.Message, state: FSMContext):
+    try:
+        amount = round(float((message.text or "").strip()), 4)
+    except (ValueError, AttributeError):
+        await message.answer("⚠️ لطفاً مقدار معتبر TON وارد کن.")
+        return
+    if not math.isfinite(amount) or amount < min_deposit_amount:
+        await message.answer(f"⚠️ حداقل واریز <code>{min_deposit_amount:.4f} TON</code> است.", parse_mode="HTML")
+        return
+
+    wallet_address = await get_system_wallet_address()
+    if not wallet_address:
+        await state.clear()
+        await message.answer("⚠️ آدرس ولت مرکزی فعلاً قابل دریافت نیست؛ بعداً دوباره تلاش کن.")
+        return
+
+    memo = get_deposit_memo(message.from_user.id)
+    amount_nano = int(round(amount * 10**9))
+    ton_link = f"ton://transfer/{wallet_address}?amount={amount_nano}&text={quote(memo)}"
+    await state.clear()
+    await message.answer(
+        "💳 <b>واریز TON آماده است</b>\n\n"
+        f"💎 مبلغ: <code>{amount:.4f} TON</code>\n"
+        f"📬 آدرس مرکزی: <code>{html.escape(wallet_address)}</code>\n"
+        f"🧾 کد شناسایی واریز: <code>{memo}</code>\n\n"
+        "با دکمه زیر کیف‌پولت را باز کن و تراکنش را تأیید کن. حتماً memo را تغییر نده؛ ربات بعد از ثبت تراکنش آن را خودکار به موجودی تو اضافه می‌کند.",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 بازکردن کیف‌پول و تأیید واریز", url=ton_link)]
+        ])
+    )
+
 
 # ==========================================
 # پنل مدیریت پیشرفته ادمین
@@ -1168,7 +1234,7 @@ async def open_admin_panel(message: types.Message):
     ch_list_str = ", ".join(required_channels) if required_channels else "هیچ کانالی تنظیم نشده است."
 
     admin_text = (
-        "👑 <b>مرکز فرماندهی Void Giveaway</b> 🚀\n<code>v4.6.0</code>\n"
+        "👑 <b>مرکز فرماندهی Void Giveaway</b> 🚀\n<code>v5.0.0</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💎 <b>موجودی واقعی ولت اصلی ربات:</b> {wallet_str}\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1179,8 +1245,6 @@ async def open_admin_panel(message: types.Message):
         f"📜 <b>کل کاربران تاریخی:</b> <code>{total_all_time}</code> نفر\n"
         f"🚫 <b>کاربران بن شده:</b> <code>{banned_count}</code> نفر\n"
         f"💰 <b>مجموع موجودی ولت کاربران:</b> <code>{total_balance:.4f} TON</code>\n"
-        f"🎁 <b>پاداش هر رفرال:</b> <code>{referral_reward} TON</code>\n"
-        f"👥 <b>سقف تعداد رفرال مجاز:</b> <code>{max_referrals}</code> نفر\n"
         f"⛽️ <b>گس‌فی شبکه TON:</b> <code>{ton_gas_fee} TON</code>\n"
         f"🔻 <b>حداقل برداشت:</b> <code>{min_withdraw_amount} TON</code>\n"
         f"🔝 <b>حداکثر برداشت:</b> <code>{max_withdraw_amount} TON</code>\n"
@@ -1401,18 +1465,6 @@ async def process_search_user(message: types.Message, state: FSMContext):
     target_prof = user_data[target_id]
     ban_status = "بله 🚫" if is_banned(target_id) else "خیر 🟢"
     
-    referrals_list = []
-    for u_id, u_info in user_data.items():
-        if u_info.get("referred_by") == target_id:
-            u_name = f"@{u_info['username']}" if u_info.get("username") else html.escape(u_info.get("first_name", "User"))
-            referrals_list.append(f"• {u_name} (ID: <code>{u_id}</code>) - رفرال‌ها: {u_info.get('referrals_count', 0)}")
-
-    ref_by_str = f"<code>{target_prof['referred_by']}</code>" if target_prof.get("referred_by") else "مستقیم (بدون دعوت‌کننده)"
-    
-    ref_list_str = "\n".join(referrals_list[:20]) if referrals_list else "<i>هیچ زیرمجموعه‌ای ندارد.</i>"
-    if len(referrals_list) > 20:
-        ref_list_str += f"\n<i>... و {len(referrals_list) - 20} کاربر دیگر</i>"
-
     user_info_text = (
         f"👤 <b>اطلاعات کاربر <code>{target_id}</code>:</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1420,14 +1472,48 @@ async def process_search_user(message: types.Message, state: FSMContext):
         f"🆔 <b>یوزرنیم:</b> @{target_prof.get('username', 'ندارد')}\n"
         f"🚫 <b>وضعیت بن:</b> {ban_status}\n"
         f"💰 <b>موجودی TON:</b> <code>{target_prof.get('balance', 0.0):.4f} TON</code>\n"
-        f"🎯 <b>دعوت‌های موفق:</b> <code>{target_prof.get('referrals_count', 0)}</code>/{max_referrals} نفر\n"
-        f"🔗 <b>دعوت‌شده توسط:</b> {ref_by_str}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📋 <b>لیست زیرمجموعه‌های این کاربر:</b>\n"
-        f"{ref_list_str}"
+        f"💳 <b>کد واریز:</b> <code>{get_deposit_memo(target_id)}</code>"
     )
 
     await message.answer(user_info_text, parse_mode="HTML")
+
+# ==========================================
+# مدیریت صفر کردن موجودی کاربران
+# ==========================================
+@dp.callback_query(F.data == "admin_reset_balances")
+async def start_reset_balances(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("🛑 شما ادمین نیستید!", show_alert=True)
+        return
+    await call.answer("⚠️ این عملیات برگشت‌پذیر نیست.", show_alert=True)
+    await call.message.edit_text(
+        f"⚠️ <b>صفر کردن موجودی همه کاربران</b>\n\nتعداد کاربران فعلی: <code>{len(user_data)}</code>\nاین کار فقط موجودی‌ها را صفر می‌کند و قابل بازگشت خودکار نیست. ادامه می‌دهی؟",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚠️ بله، همه را صفر کن", callback_data="admin_reset_balances_confirm")],
+            [InlineKeyboardButton(text="لغو", callback_data="admin_back_panel")]
+        ])
+    )
+
+
+@dp.callback_query(F.data == "admin_reset_balances_confirm")
+async def confirm_reset_balances(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("🛑 شما ادمین نیستید!", show_alert=True)
+        return
+    result = await users_col.update_many({}, {"$set": {"balance": 0.0}})
+    for profile in user_data.values():
+        profile["balance"] = 0.0
+    await call.answer("✅ موجودی همه کاربران صفر شد.", show_alert=True)
+    await call.message.edit_text(
+        f"✅ <b>عملیات انجام شد.</b>\nموجودی <code>{result.modified_count}</code> کاربر صفر شد.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 بازگشت به پنل ادمین", callback_data="admin_back_panel")]
+        ])
+    )
+
 
 # --- تغییر کانفیگ‌ها ---
 @dp.callback_query(F.data == "admin_set_min_wd")
@@ -1443,6 +1529,8 @@ async def process_set_min_wd(message: types.Message, state: FSMContext):
     global min_withdraw_amount
     try:
         amount = float(message.text.strip())
+        if not math.isfinite(amount) or amount <= 0 or amount > max_withdraw_amount:
+            raise ValueError
         min_withdraw_amount = amount
         await save_data()
         await state.clear()
@@ -1463,51 +1551,14 @@ async def process_set_max_wd(message: types.Message, state: FSMContext):
     global max_withdraw_amount
     try:
         amount = float(message.text.strip())
+        if not math.isfinite(amount) or amount < min_withdraw_amount:
+            raise ValueError
         max_withdraw_amount = amount
         await save_data()
         await state.clear()
         await message.answer(f"✅ سقف برداشت با موفقیت روی <code>{max_withdraw_amount} TON</code> تنظیم شد 🚀", parse_mode="HTML")
     except ValueError:
         await message.answer("⚠️ لطفاً یک عدد معتبر و قابل قبول وارد کن!")
-
-@dp.callback_query(F.data == "admin_set_ref_reward")
-async def start_set_ref_reward(call: types.CallbackQuery, state: FSMContext):
-    await call.answer()
-    if not is_admin(call.from_user.id):
-        return
-    await state.set_state(AdminSetRefRewardForm.amount)
-    await call.message.edit_text(f"💎 <b>مقدار پاداش جدید برای هر رفرال به TON را وارد کنید (فعلی: {referral_reward} TON):</b>", parse_mode="HTML")
-
-@dp.message(AdminSetRefRewardForm.amount)
-async def process_set_ref_reward(message: types.Message, state: FSMContext):
-    global referral_reward
-    try:
-        amount = float(message.text.strip())
-        referral_reward = amount
-        await save_data()
-        await state.clear()
-        await message.answer(f"🎁 پاداش هر دعوت با موفقیت روی <code>{referral_reward} TON</code> تنظیم شد 🚀", parse_mode="HTML")
-    except ValueError:
-        await message.answer("⚠️ لطفاً یک عدد معتبر و قابل قبول وارد کن!")
-
-@dp.callback_query(F.data == "admin_set_max_ref")
-async def start_set_max_ref(call: types.CallbackQuery, state: FSMContext):
-    await call.answer()
-    if not is_admin(call.from_user.id):
-        return
-    await state.set_state(AdminSetMaxRefForm.amount)
-    await call.message.edit_text(f"👥 <b>سقف مجاز تعداد رفرال برای هر کاربر را وارد کنید (فعلی: {max_referrals}):</b>", parse_mode="HTML")
-
-@dp.message(AdminSetMaxRefForm.amount)
-async def process_set_max_ref(message: types.Message, state: FSMContext):
-    global max_referrals
-    if not message.text.strip().isdigit():
-        await message.answer("⚠️ لطفاً یک عدد صحیح معتبر وارد کنید!")
-        return
-    max_referrals = int(message.text.strip())
-    await save_data()
-    await state.clear()
-    await message.answer(f"✅ سقف تعداد رفرال با موفقیت به <code>{max_referrals}</code> نفر تغییر یافت!", parse_mode="HTML")
 
 @dp.callback_query(F.data == "admin_set_gas_fee")
 async def start_set_gas_fee(call: types.CallbackQuery, state: FSMContext):
@@ -1522,6 +1573,8 @@ async def process_set_gas_fee(message: types.Message, state: FSMContext):
     global ton_gas_fee
     try:
         amount = float(message.text.strip())
+        if not math.isfinite(amount) or amount < 0:
+            raise ValueError
         ton_gas_fee = amount
         await save_data()
         await state.clear()
@@ -1554,11 +1607,18 @@ async def process_edit_balance_amount(message: types.Message, state: FSMContext)
         await message.answer("⚠️ مقدار عددی معتبر وارد کنید!")
         return
 
+    if not math.isfinite(amount):
+        await message.answer("⚠️ مقدار باید یک عدد محدود و معتبر باشد!")
+        return
     data = await state.get_data()
     target_id = data.get("target_u_id")
     
     prof = get_user_profile(target_id)
-    prof["balance"] = round(prof["balance"] + amount, 4)
+    new_balance = round(prof["balance"] + amount, 4)
+    if new_balance < 0:
+        await message.answer("⚠️ موجودی کاربر نمی‌تواند منفی شود!")
+        return
+    prof["balance"] = new_balance
     await save_data()
     await state.clear()
 
@@ -1603,6 +1663,7 @@ async def main():
     await load_data()
     keep_alive()
     asyncio.create_task(wallet_balance_tracker_loop())
+    asyncio.create_task(deposit_tracker_loop())
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
