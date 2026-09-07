@@ -659,15 +659,21 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
     profile = get_user_profile(u_id, message.from_user)
     profile["started_at"] = profile.get("started_at") or datetime.utcnow().isoformat()
     all_time_users.add(u_id)
-    await save_data()
+
+    # پاسخ اولیه را قبل از عملیات کند دیتابیس و شبکه بفرست تا /start معطل نماند.
+    loading_message = await message.answer("⏳ <b>در حال آماده‌سازی ربات...</b>", parse_mode="HTML")
+    asyncio.create_task(save_data())
 
     if not bot_active and not is_admin(u_id):
-        await message.answer("🛠️ <b>ربات موقتاً در حالت تعمیر و ارتقاست.</b>\nخیلی زود برمی‌گردیم؛ موجودی شما کاملاً محفوظ است.", parse_mode="HTML")
+        await loading_message.edit_text(
+            "🛠️ <b>ربات موقتاً در حالت تعمیر و ارتقاست.</b>\nخیلی زود برمی‌گردیم؛ موجودی شما کاملاً محفوظ است.",
+            parse_mode="HTML"
+        )
         return
 
     is_subscribed = await check_user_subscription(u_id)
     if not is_subscribed:
-        await message.answer(
+        await loading_message.edit_text(
             f"🌟 <b>برای ورود به دنیای جایزه‌ها، ابتدا در کانال‌های رسمی ما عضو شو.</b>\n\n"
             f"✅ بعد از عضویت در همه کانال‌ها، روی «✅ بررسی عضویت / ورود» بزن تا جایزه‌ها برات فعال بشه!",
             parse_mode="HTML",
@@ -675,7 +681,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
         )
         return
 
-    await message.answer(
+    await loading_message.edit_text(
         f"🔥 <b>به Void Giveaway خوش اومدی!</b> آماده‌ای جایزه جمع کنی؟\n"
         f"🧩 <b>نسخه فعال:</b> <code>v6.1.0</code> 💎\n\n"
 
