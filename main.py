@@ -696,6 +696,7 @@ async def deposit_tracker_loop():
     while True:
         try:
             await scan_incoming_deposits()
+            await scan_incoming_dogs_deposits()
         except Exception as e:
             logging.error(f"Deposit tracker loop exception: {e}")
         await asyncio.sleep(30)
