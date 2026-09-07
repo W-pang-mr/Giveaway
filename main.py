@@ -95,6 +95,8 @@ system_dogs_wallet_address = None
 payout_lock = asyncio.Lock()
 # کل مسیر رزرو/بازگشت موجودی و برداشت در یک پردازش سریالی انجام می‌شود.
 withdrawal_flow_lock = asyncio.Lock()
+# DOGS deposit scans are serialized to avoid overlapping chain reads and credits.
+dogs_deposit_scan_lock = asyncio.Lock()
 
 # ==========================================
 # استعلام موجودی ولت سیستم
@@ -296,7 +298,7 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
 
 def build_dogs_transfer_body(amount_units: int, destination_address: str,
                              response_address: str, comment: str):
-    """بدنه استاندارد jetton::transfer برای ارسال DOGS."""
+    """Build a standards-compliant Jetton transfer body."""
     forward_payload = (
         begin_cell()
         .store_uint(0, 32)
@@ -305,21 +307,20 @@ def build_dogs_transfer_body(amount_units: int, destination_address: str,
     )
     return (
         begin_cell()
-        .store_uint(0x0f8a7ea5, 32)
+        .store_uint(0x0f8a7ea5, 32)  # jetton::transfer
         .store_uint(uuid.uuid4().int & ((1 << 64) - 1), 64)
         .store_coins(amount_units)
         .store_address(destination_address)
         .store_address(response_address)
-        .store_uint(0, 1)
-        .store_coins(1)
-        .store_uint(1, 1)
+        .store_uint(0, 1)  # no custom payload
+        .store_coins(1)    # forward TON amount
+        .store_uint(1, 1)  # forward payload is a reference
         .store_ref(forward_payload)
         .end_cell()
     )
 
-
 async def send_dogs_payout(destination_address: str, amount_dogs: float):
-    """ارسال DOGS از Jetton Wallet مرکزی؛ نتیجه sent/failed/uncertain است."""
+    """Send DOGS and distinguish failed, sent and network-uncertain outcomes."""
     if not TON_MNEMONIC:
         return "failed", "کلید امنیتی ولت (TON_MNEMONIC) تنظیم نشده است!"
     if not is_valid_ton_address(destination_address):
@@ -335,17 +336,26 @@ async def send_dogs_payout(destination_address: str, amount_dogs: float):
         system_balance, balance_info = await get_system_wallet_balance()
         required_balance = max(float(dogs_gas_fee_ton), 0.0)
         if system_balance is None:
-            return "failed", f"موجودی ولت ربات قابل بررسی نیست: {balance_info}"
+            return "failed", f"موجودی TON ولت ربات قابل بررسی نیست: {balance_info}"
         if system_balance < required_balance:
             return "failed", (
                 f"موجودی TON ولت ربات برای گس DOGS کافی نیست. موجودی فعلی: {system_balance:.4f} TON؛ "
                 f"مبلغ موردنیاز: {required_balance:.4f} TON"
             )
 
+        real_dogs_balance, dogs_wallet_info = await get_system_dogs_balance()
+        if real_dogs_balance is None:
+            return "failed", f"موجودی واقعی DOGS قابل بررسی نیست: {dogs_wallet_info}"
+        if real_dogs_balance + 1e-9 < amount_dogs:
+            return "failed", (
+                f"موجودی DOGS ولت مرکزی کافی نیست. موجودی فعلی: {real_dogs_balance:.4f} DOGS؛ "
+                f"مبلغ موردنیاز: {amount_dogs:.4f} DOGS"
+            )
+
         system_dogs_wallet = await get_system_dogs_wallet_address()
         system_wallet = await get_system_wallet_address()
         if not system_dogs_wallet or not system_wallet:
-            return "failed", "آدرس Jetton Wallet مرکزی قابل دریافت نیست."
+            return "failed", "آدرس ولت مرکزی DOGS یا ولت TON قابل دریافت نیست."
 
         client = None
         transfer_started = False
@@ -367,14 +377,14 @@ async def send_dogs_payout(destination_address: str, amount_dogs: float):
                 body=body
             )
 
-            for _ in range(6):
+            for _ in range(8):
                 await asyncio.sleep(2)
                 try:
                     if await wallet.get_seqno() > seqno_before:
                         await close_lite_client(client)
                         client = None
                         return "sent", (
-                            f"ارسال {amount_dogs:.4f} DOGS از Jetton Wallet مرکزی تأیید شد؛ "
+                            f"ارسال {amount_dogs:.4f} DOGS از Jetton Wallet مرکزی ثبت شد؛ "
                             "نمایش تراکنش ممکن است چند ثانیه زمان ببرد."
                         )
                 except Exception as confirm_error:
@@ -382,14 +392,13 @@ async def send_dogs_payout(destination_address: str, amount_dogs: float):
 
             await close_lite_client(client)
             client = None
-            return "uncertain", "پیام DOGS ارسال شد اما تأیید نهایی دریافت نشده است؛ برای جلوگیری از پرداخت دوباره، مبلغ رزرو می‌ماند."
+            return "uncertain", "پیام DOGS ارسال شد اما تأیید نهایی دریافت نشده است؛ مبلغ رزرو می‌ماند."
         except Exception as e:
             logging.error(f"DOGS payout error: {e}")
             await close_lite_client(client)
             if transfer_started:
-                return "uncertain", "نتیجه ارسال DOGS به شبکه قطعی نیست؛ مبلغ برای بررسی بیشتر رزرو می‌ماند."
+                return "uncertain", "نتیجه ارسال DOGS به شبکه قطعی نیست؛ مبلغ رزرو می‌ماند."
             return "failed", str(e)
-
 
 async def notify_wallet_issue(amount: float, reason: str, withdrawal_id: str = None, asset: str = "TON"):
     """هشدار قابل پیگیری برای ادمین هنگام توقف یا شکست برداشت."""
@@ -434,12 +443,12 @@ async def get_system_wallet_address():
 
 
 async def get_system_dogs_wallet_address():
-    """آدرس Jetton Wallet مربوط به ولت مرکزی را از قرارداد DOGS می‌گیرد."""
+    """Return the DOGS Jetton Wallet owned by the configured central TON wallet."""
     global system_dogs_wallet_address
     if system_dogs_wallet_address:
         return system_dogs_wallet_address
 
-    owner_address = DOGS_OWNER_WALLET_ADDRESS or await get_system_wallet_address()
+    owner_address = (DOGS_OWNER_WALLET_ADDRESS or "").strip()
     if not owner_address:
         return None
 
@@ -457,7 +466,9 @@ async def get_system_dogs_wallet_address():
         jetton_address = result[0].load_address()
         if not jetton_address:
             return None
-        system_dogs_wallet_address = jetton_address.to_str(is_user_friendly=True, is_bounceable=False)
+        system_dogs_wallet_address = jetton_address.to_str(
+            is_user_friendly=True, is_bounceable=False
+        )
         return system_dogs_wallet_address
     except Exception as e:
         logging.error(f"DOGS Jetton wallet address lookup failed: {e}")
@@ -465,9 +476,8 @@ async def get_system_dogs_wallet_address():
     finally:
         await close_lite_client(client)
 
-
 async def get_system_dogs_balance():
-    """موجودی واقعی DOGS در Jetton Wallet مرکزی را برمی‌گرداند."""
+    """Read the real DOGS balance from the central Jetton Wallet."""
     jetton_wallet_address = await get_system_dogs_wallet_address()
     if not jetton_wallet_address:
         return None, "آدرس Jetton Wallet مرکزی DOGS قابل دریافت نیست."
@@ -598,9 +608,11 @@ async def scan_incoming_deposits():
 
 
 async def credit_dogs_deposit_transaction(tx_id: str, user_id: int, amount_units: int,
-                                          memo: str, lt):
+                                           memo: str, lt):
+    """Credit one DOGS transfer exactly once using the transaction id as an idempotency key."""
+    amount_units = int(amount_units)
     amount_dogs = round(amount_units / 10 ** DOGS_DECIMALS, 4)
-    if amount_dogs <= 0:
+    if amount_units <= 0 or amount_dogs <= 0:
         return False
 
     now = datetime.utcnow().isoformat()
@@ -608,28 +620,34 @@ async def credit_dogs_deposit_transaction(tx_id: str, user_id: int, amount_units
     try:
         session = await mongo_client.start_session()
         async with session.start_transaction():
-            existing = await deposits_col.find_one({"tx_id": tx_id}, session=session)
-            if existing:
+            if await deposits_col.find_one({"tx_id": tx_id}, session=session):
                 return False
             await deposits_col.insert_one({
                 "tx_id": tx_id,
                 "asset": "DOGS",
                 "user_id": user_id,
                 "memo": memo,
-                "amount_units": int(amount_units),
+                "amount_units": amount_units,
                 "amount_dogs": amount_dogs,
                 "lt": lt,
                 "status": "credited",
                 "created_at": now,
                 "credited_at": now
             }, session=session)
+            # Do not update dogs_balance through both $inc and $setOnInsert.
             await users_col.update_one(
                 {"user_id": user_id},
-                {"$inc": {"dogs_balance": amount_dogs}, "$setOnInsert": {
-                    "user_id": user_id, "balance": 0.0, "dogs_balance": amount_dogs,
-                    "username": "", "first_name": "User"
-                }},
-                upsert=True, session=session
+                {
+                    "$inc": {"dogs_balance": amount_dogs},
+                    "$setOnInsert": {
+                        "user_id": user_id,
+                        "balance": 0.0,
+                        "username": "",
+                        "first_name": "User"
+                    }
+                },
+                upsert=True,
+                session=session
             )
     except Exception as e:
         logging.error(f"DOGS deposit credit failed for {tx_id}: {e}")
@@ -651,14 +669,18 @@ async def credit_dogs_deposit_transaction(tx_id: str, user_id: int, amount_units
         pass
     return True
 
-
 def extract_forward_payload_comment(parser) -> str:
-    """خواندن comment از Either Cell/Ref در پیام Jetton."""
+    """Read a Jetton forward_payload comment from inline or referenced payloads."""
     try:
         if parser.remaining_bits < 1:
             return ""
         is_ref = parser.load_uint(1)
-        payload = parser.load_ref().begin_parse() if is_ref else parser
+        if is_ref:
+            if getattr(parser, "remaining_refs", 0) < 1:
+                return ""
+            payload = parser.load_ref().begin_parse()
+        else:
+            payload = parser
         if payload.remaining_bits < 32 or payload.load_uint(32) != 0:
             return ""
         return payload.load_snake_string().strip()
@@ -667,61 +689,81 @@ def extract_forward_payload_comment(parser) -> str:
         return ""
 
 
+def parse_dogs_incoming_transfer(tx):
+    """Parse standard Jetton internal_transfer and transfer_notification messages."""
+    try:
+        in_msg = get_object_field(tx, "in_msg")
+        info = get_object_field(in_msg, "info")
+        if get_object_field(info, "bounced", False):
+            return None
+        description = get_object_field(tx, "description")
+        if get_object_field(description, "aborted", False):
+            return None
+        body = get_object_field(in_msg, "body")
+        if not body:
+            return None
+
+        parser = body.begin_parse()
+        if parser.remaining_bits < 32:
+            return None
+        opcode = parser.load_uint(32)
+        if opcode not in (0x178d4519, 0x7362d09c):
+            return None
+        if parser.remaining_bits < 64:
+            return None
+        parser.load_uint(64)  # query_id
+        amount_units = int(parser.load_coins())
+        if amount_units <= 0:
+            return None
+
+        if opcode == 0x178d4519:  # internal_transfer
+            parser.load_address()  # sender jetton wallet
+            parser.load_address()  # response destination
+            parser.load_coins()    # forward_ton_amount
+        else:  # transfer_notification
+            parser.load_address()  # sender owner
+
+        memo = extract_forward_payload_comment(parser)
+        match = re.fullmatch(r"VG-(\d+)", memo)
+        if not match:
+            return None
+        return amount_units, memo, int(match.group(1))
+    except Exception as e:
+        logging.debug(f"DOGS transfer parse skipped: {e}")
+        return None
+
+
 async def scan_incoming_dogs_deposits():
+    """Scan the central DOGS Jetton Wallet and credit memo-tagged deposits once."""
     jetton_wallet_address = await get_system_dogs_wallet_address()
     if not jetton_wallet_address:
         return
 
-    client = None
-    try:
-        client = LiteClient.from_mainnet_config(ls_i=0, trust_level=2)
-        await client.connect()
-        transactions = await client.get_transactions(address=jetton_wallet_address, count=50)
-        for tx in transactions:
-            in_msg = get_object_field(tx, "in_msg")
-            info = get_object_field(in_msg, "info")
-            if get_object_field(info, "bounced", False):
-                continue
-            description = get_object_field(tx, "description")
-            if get_object_field(description, "aborted", False):
-                continue
-            body = get_object_field(in_msg, "body")
-            if not body:
-                continue
-
-            parser = body.begin_parse()
-            if parser.remaining_bits < 32:
-                continue
-            opcode = parser.load_uint(32)
-            if opcode not in (0x178d4519, 0x7362d09c):
-                continue
-            if parser.remaining_bits < 64:
-                continue
-            parser.load_uint(64)
-            amount_units = parser.load_coins()
-            if amount_units <= 0:
-                continue
-
-            if opcode == 0x178d4519:
-                parser.load_address()
-                parser.load_address()
-                parser.load_coins()
-            else:
-                parser.load_address()
-
-            memo = extract_forward_payload_comment(parser)
-            match = re.fullmatch(r"VG-(\d+)", memo)
-            if not match:
-                continue
-            tx_id = f"DOGS:{get_object_field(tx, 'account_addr', jetton_wallet_address)}:{get_object_field(tx, 'lt', '')}"
-            await credit_dogs_deposit_transaction(
-                tx_id, int(match.group(1)), int(amount_units), memo, get_object_field(tx, "lt")
+    async with dogs_deposit_scan_lock:
+        client = None
+        try:
+            client = LiteClient.from_mainnet_config(ls_i=0, trust_level=2)
+            await client.connect()
+            # Read a wider window so normal bursts do not fall through between scans.
+            transactions = await client.get_transactions(
+                address=jetton_wallet_address, count=256
             )
-    except Exception as e:
-        logging.error(f"Incoming DOGS deposit scan failed: {e}")
-    finally:
-        await close_lite_client(client)
-
+            for tx in transactions:
+                parsed = parse_dogs_incoming_transfer(tx)
+                if not parsed:
+                    continue
+                amount_units, memo, user_id = parsed
+                lt = get_object_field(tx, "lt")
+                if lt in (None, ""):
+                    continue
+                tx_id = f"DOGS:{jetton_wallet_address}:{lt}"
+                await credit_dogs_deposit_transaction(
+                    tx_id, user_id, amount_units, memo, lt
+                )
+        except Exception as e:
+            logging.error(f"Incoming DOGS deposit scan failed: {e}")
+        finally:
+            await close_lite_client(client)
 
 async def deposit_tracker_loop():
     await asyncio.sleep(12)
@@ -1485,23 +1527,26 @@ async def start_dogs_withdraw_callback(call: types.CallbackQuery, state: FSMCont
     if not await check_user_subscription(u_id):
         await call.answer("🔐 برای برداشت، عضویت در همه کانال‌ها الزامی است!", show_alert=True)
         return
+
     prof = get_user_profile(u_id, call.from_user)
     dogs_balance = float(prof.get("dogs_balance", 0.0))
+    fee_ton = max(float(dogs_gas_fee_ton), 0.0)
     if dogs_balance < dogs_min_withdraw_amount:
         await call.answer(f"🐶 حداقل موجودی لازم {dogs_min_withdraw_amount:.4f} DOGS است.", show_alert=True)
         return
-    if float(prof.get("balance", 0.0)) < max(dogs_gas_fee_ton, 0.0):
-        await call.answer(f"⛽️ برای کارمزد برداشت DOGS حداقل {dogs_gas_fee_ton:.4f} TON لازم داری.", show_alert=True)
+    if float(prof.get("balance", 0.0)) < fee_ton:
+        await call.answer(f"⛽️ برای کارمزد برداشت حداقل {fee_ton:.4f} TON لازم داری.", show_alert=True)
         return
+
     await call.answer()
     await state.set_state(DogsWithdrawForm.amount)
     await call.message.answer(
         f"🐶 <b>موجودی DOGS:</b> <code>{dogs_balance:.4f}</code>\n"
         f"🔻 حداقل: <code>{dogs_min_withdraw_amount:.4f}</code> | 🔝 حداکثر: <code>{dogs_max_withdraw_amount:.4f}</code>\n"
-        f"⛽️ کارمزد شبکه از موجودی TON: <code>{dogs_gas_fee_ton:.4f} TON</code>\n\n"
-        "مقدار DOGS برای برداشت را وارد کن:", parse_mode="HTML"
+        f"⛽️ کارمزد از موجودی TON: <code>{fee_ton:.4f} TON</code>\n\n"
+        "مقدار DOGS برای برداشت را وارد کن:",
+        parse_mode="HTML"
     )
-
 
 @dp.message(DogsWithdrawForm.amount)
 async def process_dogs_withdraw_amount(message: types.Message, state: FSMContext):
@@ -1522,33 +1567,47 @@ async def process_dogs_withdraw_amount(message: types.Message, state: FSMContext
     if req_amount > dogs_max_withdraw_amount:
         await message.answer(f"🔝 سقف برداشت <code>{dogs_max_withdraw_amount:.4f} DOGS</code> است.", parse_mode="HTML")
         return
+
     prof = get_user_profile(message.from_user.id, message.from_user)
     if req_amount > float(prof.get("dogs_balance", 0.0)):
         await message.answer("🐶 مبلغ درخواستی از موجودی DOGS فعلی‌ات بیشتر است.")
         return
-    if float(prof.get("balance", 0.0)) < max(dogs_gas_fee_ton, 0.0):
-        await message.answer(f"⛽️ برای کارمزد این برداشت حداقل <code>{dogs_gas_fee_ton:.4f} TON</code> لازم داری.", parse_mode="HTML")
+    fee_ton = max(float(dogs_gas_fee_ton), 0.0)
+    if float(prof.get("balance", 0.0)) < fee_ton:
+        await message.answer(f"⛽️ برای این برداشت حداقل <code>{fee_ton:.4f} TON</code> لازم داری.", parse_mode="HTML")
         return
-    await state.update_data(requested_amount=req_amount, amount_to_send=req_amount,
-                            deducted_amount=req_amount, fee_ton=max(dogs_gas_fee_ton, 0.0))
-    await state.set_state(DogsWithdrawForm.wallet_address)
-    await message.answer("📬 آدرس کیف‌پول TON مقصد را بفرست. این آدرس باید ولت مالک DOGS باشد و با EQ یا UQ شروع شود:")
 
+    await state.update_data(
+        requested_amount=req_amount,
+        amount_to_send=req_amount,
+        deducted_amount=req_amount,
+        fee_ton=fee_ton
+    )
+    await state.set_state(DogsWithdrawForm.wallet_address)
+    await message.answer("📬 آدرس کیف‌پول TON مقصد را بفرست؛ آدرس باید با EQ یا UQ شروع شود:")
 
 async def reserve_dogs_withdrawal(user_id: int, dogs_amount: float, fee_ton: float) -> bool:
+    """Atomically reserve DOGS plus the TON gas fee from one user."""
     dogs_amount = round(float(dogs_amount), 4)
     fee_ton = round(max(float(fee_ton), 0.0), 4)
     prof = get_user_profile(user_id)
     await users_col.update_one(
         {"user_id": user_id},
         {"$setOnInsert": {
-            "user_id": user_id, "balance": round(float(prof.get("balance", 0.0)), 4),
+            "user_id": user_id,
+            "balance": round(float(prof.get("balance", 0.0)), 4),
             "dogs_balance": round(float(prof.get("dogs_balance", 0.0)), 4),
-            "username": prof.get("username", ""), "first_name": prof.get("first_name", "User")
-        }}, upsert=True
+            "username": prof.get("username", ""),
+            "first_name": prof.get("first_name", "User")
+        }},
+        upsert=True
     )
     result = await users_col.update_one(
-        {"user_id": user_id, "dogs_balance": {"$gte": dogs_amount}, "balance": {"$gte": fee_ton}},
+        {
+            "user_id": user_id,
+            "dogs_balance": {"$gte": dogs_amount},
+            "balance": {"$gte": fee_ton}
+        },
         {"$inc": {"dogs_balance": -dogs_amount, "balance": -fee_ton}}
     )
     if result.matched_count != 1:
@@ -1557,25 +1616,33 @@ async def reserve_dogs_withdrawal(user_id: int, dogs_amount: float, fee_ton: flo
     prof["balance"] = round(float(prof.get("balance", 0.0)) - fee_ton, 4)
     return True
 
-
 async def refund_dogs_withdrawal(withdrawal_id: str, reason: str, allowed_statuses=("failed",)) -> bool:
+    """Refund a DOGS withdrawal only once, based on its previous status."""
     status_filter = allowed_statuses[0] if len(allowed_statuses) == 1 else {"$in": list(allowed_statuses)}
     withdrawal = await withdrawals_col.find_one_and_update(
         {"withdrawal_id": withdrawal_id, "status": status_filter, "asset": "DOGS"},
-        {"$set": {"status": "refunded", "refund_reason": reason,
-                  "updated_at": datetime.utcnow().isoformat()}}, return_document=ReturnDocument.BEFORE
+        {"$set": {
+            "status": "refunded",
+            "refund_reason": reason,
+            "updated_at": datetime.utcnow().isoformat()
+        }},
+        return_document=ReturnDocument.BEFORE
     )
     if not withdrawal:
         return False
+
     user_id = int(withdrawal["user_id"])
     dogs_amount = round(float(withdrawal.get("deducted_amount", 0.0)), 4)
     fee_ton = round(float(withdrawal.get("fee_ton", 0.0)), 4)
-    await users_col.update_one({"user_id": user_id}, {"$inc": {"dogs_balance": dogs_amount, "balance": fee_ton}}, upsert=True)
+    await users_col.update_one(
+        {"user_id": user_id},
+        {"$inc": {"dogs_balance": dogs_amount, "balance": fee_ton}},
+        upsert=True
+    )
     prof = get_user_profile(user_id)
     prof["dogs_balance"] = round(float(prof.get("dogs_balance", 0.0)) + dogs_amount, 4)
     prof["balance"] = round(float(prof.get("balance", 0.0)) + fee_ton, 4)
     return True
-
 
 @dp.message(DogsWithdrawForm.wallet_address)
 async def process_dogs_withdraw_address(message: types.Message, state: FSMContext):
@@ -1587,10 +1654,12 @@ async def process_dogs_withdraw_address(message: types.Message, state: FSMContex
         await state.clear()
         await message.answer("🛑 برداشت DOGS موقتاً خاموش است؛ موجودی شما محفوظ است.", reply_markup=get_main_keyboard(user.id))
         return
+
     wallet_addr = (message.text or "").strip()
     if not is_valid_ton_address(wallet_addr):
-        await message.answer("⚠️ این آدرس TON معتبر نیست؛ یک آدرس کامل EQ یا UQ با checksum صحیح بفرست.")
+        await message.answer("⚠️ این آدرس TON معتبر نیست؛ آدرس کامل EQ یا UQ با checksum صحیح بفرست.")
         return
+
     data = await state.get_data()
     requested_amount = data.get("requested_amount")
     amount_to_send = data.get("amount_to_send")
@@ -1604,51 +1673,126 @@ async def process_dogs_withdraw_address(message: types.Message, state: FSMContex
     try:
         async with withdrawal_flow_lock:
             withdrawal_id = await create_withdrawal_record(
-                user.id, wallet_addr, float(requested_amount), float(amount_to_send), float(requested_amount),
-                asset="DOGS", fee_ton=float(fee_ton)
+                user.id,
+                wallet_addr,
+                float(requested_amount),
+                float(amount_to_send),
+                float(requested_amount),
+                asset="DOGS",
+                fee_ton=float(fee_ton)
             )
-            reserved = await reserve_dogs_withdrawal(user.id, float(requested_amount), float(fee_ton))
+            reserved = await reserve_dogs_withdrawal(
+                user.id, float(requested_amount), float(fee_ton)
+            )
             if not reserved:
-                await set_withdrawal_status(withdrawal_id, "failed", last_error="موجودی DOGS یا TON کافی نبود")
+                await set_withdrawal_status(
+                    withdrawal_id, "failed",
+                    last_error="موجودی DOGS یا TON کافی نبود"
+                )
                 await state.clear()
-                await message.answer("💰 موجودی DOGS یا TON برای ثبت این برداشت کافی نیست؛ مبلغی کم نشد.", reply_markup=get_main_keyboard(user.id))
+                await message.answer(
+                    "💰 موجودی DOGS یا TON برای ثبت این برداشت کافی نیست؛ مبلغی کم نشد.",
+                    reply_markup=get_main_keyboard(user.id)
+                )
                 return
-            await set_withdrawal_status(withdrawal_id, "processing", reserved_at=datetime.utcnow().isoformat())
+            await set_withdrawal_status(
+                withdrawal_id,
+                "processing",
+                reserved_at=datetime.utcnow().isoformat()
+            )
     except Exception as e:
         logging.error(f"DOGS withdrawal reservation error: {e}")
         if withdrawal_id:
             try:
-                await set_withdrawal_status(withdrawal_id, "failed", last_error="خطا هنگام رزرو برداشت")
-                await refund_dogs_withdrawal(withdrawal_id, "خطا هنگام رزرو برداشت", allowed_statuses=("failed",))
+                await set_withdrawal_status(
+                    withdrawal_id, "failed", last_error="خطا هنگام رزرو برداشت"
+                )
+                await refund_dogs_withdrawal(
+                    withdrawal_id,
+                    "خطا هنگام رزرو برداشت",
+                    allowed_statuses=("failed",)
+                )
             except Exception as refund_error:
                 logging.error(f"DOGS withdrawal reservation refund error: {refund_error}")
         await state.clear()
-        await message.answer("⚠️ ثبت برداشت DOGS کامل نشد؛ اگر مبلغی رزرو شده بود، خودکار بررسی می‌شود.", reply_markup=get_main_keyboard(user.id))
+        await message.answer(
+            "⚠️ ثبت برداشت DOGS کامل نشد؛ اگر مبلغی رزرو شده بود، بررسی می‌شود.",
+            reply_markup=get_main_keyboard(user.id)
+        )
         return
 
     await state.clear()
     await message.answer(
         f"🚀 <b>برداشت DOGS ثبت شد.</b>\nشناسه: <code>{withdrawal_id}</code>\n"
-        f"مبلغ: <code>{float(amount_to_send):.4f} DOGS</code>\nدر حال ارسال امن به شبکه TON...", parse_mode="HTML"
+        f"مبلغ: <code>{float(amount_to_send):.4f} DOGS</code>\n"
+        "در حال ارسال امن به شبکه TON...",
+        parse_mode="HTML"
     )
-    payout_status, result_msg = await send_dogs_payout(wallet_addr, float(amount_to_send))
-    if payout_status == "sent":
-        await set_withdrawal_status(withdrawal_id, "sent", sent_at=datetime.utcnow().isoformat(), result_message=result_msg)
-        await notify_withdrawal_result(withdrawal_id, user.id, float(amount_to_send), "✅ برداشت DOGS ارسال شد.", result_msg, asset="DOGS")
-        await message.answer(f"🎉 <b>برداشت DOGS با موفقیت ارسال شد!</b>\nشناسه: <code>{withdrawal_id}</code>\nمبلغ: <code>{float(amount_to_send):.4f} DOGS</code>", parse_mode="HTML", reply_markup=get_main_keyboard(user.id))
-    elif payout_status == "uncertain":
-        await set_withdrawal_status(withdrawal_id, "pending_verification", last_error=result_msg, verification_required_at=datetime.utcnow().isoformat())
-        await notify_wallet_issue(float(amount_to_send), result_msg, withdrawal_id, asset="DOGS")
-        await notify_withdrawal_result(withdrawal_id, user.id, float(amount_to_send), "⏳ نتیجه برداشت DOGS نیاز به بررسی شبکه دارد.", result_msg, asset="DOGS")
-        await message.answer(f"⏳ <b>برداشت DOGS در حال بررسی شبکه است.</b>\nشناسه: <code>{withdrawal_id}</code>\nبرای جلوگیری از پرداخت دوباره، DOGS و کارمزد TON فعلاً رزرو می‌مانند.", parse_mode="HTML", reply_markup=get_main_keyboard(user.id))
-    else:
-        await set_withdrawal_status(withdrawal_id, "failed", last_error=result_msg)
-        refunded = await refund_dogs_withdrawal(withdrawal_id, result_msg, allowed_statuses=("failed",))
-        refund_text = "موجودی DOGS و کارمزد TON خودکار برگشت داده شد." if refunded else "وضعیت برای بررسی ایمن ثبت شده است."
-        await notify_wallet_issue(float(amount_to_send), result_msg, withdrawal_id, asset="DOGS")
-        await notify_withdrawal_result(withdrawal_id, user.id, float(amount_to_send), "⚠️ برداشت DOGS ارسال نشد و refund انجام شد.", result_msg, asset="DOGS")
-        await message.answer(f"⚠️ <b>برداشت DOGS ارسال نشد.</b>\nشناسه: <code>{withdrawal_id}</code>\nعلت: {html.escape(str(result_msg))}\n{refund_text}", parse_mode="HTML", reply_markup=get_main_keyboard(user.id))
 
+    payout_status, result_msg = await send_dogs_payout(
+        wallet_addr, float(amount_to_send)
+    )
+    if payout_status == "sent":
+        await set_withdrawal_status(
+            withdrawal_id,
+            "sent",
+            sent_at=datetime.utcnow().isoformat(),
+            result_message=result_msg
+        )
+        await notify_withdrawal_result(
+            withdrawal_id, user.id, float(amount_to_send),
+            "✅ برداشت DOGS ارسال شد.", result_msg, asset="DOGS"
+        )
+        await message.answer(
+            f"🎉 <b>برداشت DOGS با موفقیت ارسال شد!</b>\nشناسه: <code>{withdrawal_id}</code>\n"
+            f"مبلغ: <code>{float(amount_to_send):.4f} DOGS</code>",
+            parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
+        )
+    elif payout_status == "uncertain":
+        await set_withdrawal_status(
+            withdrawal_id,
+            "pending_verification",
+            last_error=result_msg,
+            verification_required_at=datetime.utcnow().isoformat()
+        )
+        await notify_wallet_issue(
+            float(amount_to_send), result_msg, withdrawal_id, asset="DOGS"
+        )
+        await notify_withdrawal_result(
+            withdrawal_id, user.id, float(amount_to_send),
+            "⏳ نتیجه برداشت DOGS نیاز به بررسی شبکه دارد.",
+            result_msg, asset="DOGS"
+        )
+        await message.answer(
+            f"⏳ <b>برداشت DOGS در حال بررسی شبکه است.</b>\nشناسه: <code>{withdrawal_id}</code>\n"
+            "برای جلوگیری از پرداخت دوباره، DOGS و کارمزد TON فعلاً رزرو می‌مانند.",
+            parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
+        )
+    else:
+        await set_withdrawal_status(
+            withdrawal_id, "failed", last_error=result_msg
+        )
+        refunded = await refund_dogs_withdrawal(
+            withdrawal_id, result_msg, allowed_statuses=("failed",)
+        )
+        refund_text = (
+            "موجودی DOGS و کارمزد TON خودکار برگشت داده شد."
+            if refunded else
+            "وضعیت برای بررسی ایمن ثبت شده است."
+        )
+        await notify_wallet_issue(
+            float(amount_to_send), result_msg, withdrawal_id, asset="DOGS"
+        )
+        await notify_withdrawal_result(
+            withdrawal_id, user.id, float(amount_to_send),
+            "⚠️ برداشت DOGS ارسال نشد و refund انجام شد.",
+            result_msg, asset="DOGS"
+        )
+        await message.answer(
+            f"⚠️ <b>برداشت DOGS ارسال نشد.</b>\nشناسه: <code>{withdrawal_id}</code>\n"
+            f"علت: {html.escape(str(result_msg))}\n{refund_text}",
+            parse_mode="HTML", reply_markup=get_main_keyboard(user.id)
+        )
 
 async def notify_withdrawal_result(withdrawal_id: str, user_id: int, amount: float,
                                       status_text: str, detail: str = "", asset: str = "TON"):
@@ -1741,18 +1885,18 @@ async def start_dogs_deposit_callback(call: types.CallbackQuery, state: FSMConte
         await call.answer("🔐 برای واریز، عضویت در همه کانال‌ها الزامی است!", show_alert=True)
         return
     if not DOGS_OWNER_WALLET_ADDRESS:
-        await call.answer("⚠️ آدرس ولت DOGS تنظیم نشده است.", show_alert=True)
+        await call.answer("⚠️ آدرس ولت مرکزی DOGS تنظیم نشده است.", show_alert=True)
         return
     if not await get_system_dogs_wallet_address():
-        await call.answer("⚠️ آدرس Jetton Wallet DOGS فعلاً قابل دریافت نیست؛ بعداً دوباره تلاش کن.", show_alert=True)
+        await call.answer("⚠️ Jetton Wallet مرکزی DOGS فعلاً قابل دریافت نیست؛ بعداً دوباره تلاش کن.", show_alert=True)
         return
     await call.answer()
     await state.set_state(DogsDepositForm.amount)
     await call.message.answer(
         "🐶 <b>مقدار DOGS برای واریز را وارد کن.</b>\n"
-        "لینک مستقیم کیف‌پول با مبلغ و memo اختصاصی تو ساخته می‌شود.", parse_mode="HTML"
+        "لینک امن واریز با memo اختصاصی تو ساخته می‌شود.",
+        parse_mode="HTML"
     )
-
 
 @dp.message(DogsDepositForm.amount)
 async def process_dogs_deposit_amount(message: types.Message, state: FSMContext):
@@ -1765,34 +1909,37 @@ async def process_dogs_deposit_amount(message: types.Message, state: FSMContext)
         await message.answer("⚠️ مقدار DOGS باید بیشتر از صفر باشد.")
         return
 
+    amount_units = int(round(amount * 10 ** DOGS_DECIMALS))
+    if amount_units <= 0:
+        await message.answer("⚠️ مقدار DOGS برای انتقال خیلی کوچک است.")
+        return
+    memo = get_deposit_memo(message.from_user.id)
+    owner = quote(DOGS_OWNER_WALLET_ADDRESS.strip(), safe="")
+    jetton = quote(DOGS_JETTON_MASTER, safe="")
+    text = quote(memo, safe="")
+    ton_uri = f"ton://transfer/{owner}?jetton={jetton}&amount={amount_units}&text={text}"
+    tonkeeper_link = f"https://app.tonkeeper.com/transfer/{owner}?jetton={jetton}&amount={amount_units}&text={text}"
     dogs_wallet = await get_system_dogs_wallet_address()
     if not dogs_wallet:
         await state.clear()
-        await message.answer("⚠️ آدرس Jetton Wallet DOGS فعلاً قابل دریافت نیست؛ بعداً دوباره تلاش کن.")
+        await message.answer("⚠️ Jetton Wallet مرکزی DOGS فعلاً قابل دریافت نیست؛ بعداً دوباره تلاش کن.")
         return
 
-    amount_units = int(round(amount * 10 ** DOGS_DECIMALS))
-    memo = get_deposit_memo(message.from_user.id)
-    tonkeeper_link = (
-        f"https://app.tonkeeper.com/transfer/{quote(DOGS_OWNER_WALLET_ADDRESS, safe='')}"
-        f"?jetton={quote(DOGS_JETTON_MASTER, safe='')}&amount={amount_units}"
-        f"&text={quote(memo, safe='')}"
-    )
     await state.clear()
     await message.answer(
         "🐶 <b>واریز DOGS آماده است</b>\n\n"
         f"🐶 مبلغ: <code>{amount:.4f} DOGS</code>\n"
         f"🧾 Memo: <code>{memo}</code>\n"
-        f"📬 Jetton Wallet مرکزی:\n<code>{html.escape(dogs_wallet)}</code>\n\n"
-        "با دکمهٔ زیر Tonkeeper باز می‌شود و مقدار DOGS و memo را از قبل پر می‌کند. "
-        "اگر از کیف‌پول دیگری استفاده می‌کنی، همین memo را حتماً حفظ کن.",
+        f"📬 ولت مالک مرکزی: <code>{html.escape(DOGS_OWNER_WALLET_ADDRESS)}</code>\n"
+        f"🧩 Jetton Wallet دریافت‌کننده: <code>{html.escape(dogs_wallet)}</code>\n\n"
+        "memo را تغییر نده؛ بعد از ثبت تراکنش، واریز خودکار به موجودی اضافه می‌شود.",
         parse_mode="HTML", disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🐶 بازکردن Tonkeeper و واریز DOGS", url=tonkeeper_link)],
+            [InlineKeyboardButton(text="🐶 بازکردن Tonkeeper", url=tonkeeper_link)],
+            [InlineKeyboardButton(text="📲 بازکردن کیف‌پول TON", url=ton_uri)],
             [InlineKeyboardButton(text="🔙 بازگشت به کیف‌پول", callback_data="back_to_wallet")]
         ])
     )
-
 
 @dp.callback_query(F.data == "back_to_wallet")
 async def back_to_wallet_callback(call: types.CallbackQuery):
