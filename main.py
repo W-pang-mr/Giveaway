@@ -200,15 +200,23 @@ async def wallet_balance_tracker_loop():
 async def check_user_subscription(user_id: int) -> bool:
     if is_admin(user_id):
         return True
-    for ch in required_channels:
+
+    async def check_channel(ch):
         try:
-            member = await bot.get_chat_member(chat_id=ch, user_id=user_id)
-            if member.status not in ["creator", "administrator", "member"]:
-                return False
+            member = await asyncio.wait_for(
+                bot.get_chat_member(chat_id=ch, user_id=user_id),
+                timeout=1.2
+            )
+            return member.status in ["creator", "administrator", "member"]
+        except asyncio.TimeoutError:
+            logging.warning(f"Subscription check timed out for {ch}")
+            return False
         except Exception as e:
             logging.error(f"Subscription Check Error for {ch}: {e}")
             return False
-    return True
+
+    results = await asyncio.gather(*(check_channel(ch) for ch in required_channels))
+    return all(results)
 
 def get_join_channel_keyboard():
     buttons = []
@@ -844,6 +852,33 @@ async def save_data():
     except Exception as e:
         logging.error(f"Error saving data to MongoDB: {e}")
 
+async def save_user_data(user_id: int):
+    """Persist only the user touched by /start instead of rewriting every user."""
+    try:
+        info = user_data.get(user_id)
+        if info is None:
+            return
+        user_doc = {
+            "user_id": user_id,
+            "balance": info.get("balance", 0.0),
+            "dogs_balance": info.get("dogs_balance", 0.0),
+            "username": info.get("username", ""),
+            "first_name": info.get("first_name", "User")
+        }
+        if info.get("started_at"):
+            user_doc["started_at"] = info["started_at"]
+        await users_col.update_one({"user_id": user_id}, {"$set": user_doc}, upsert=True)
+        await settings_col.update_one(
+            {"setting_id": "global_config"},
+            {"$set": {
+                "all_time_users": list(all_time_users),
+                "banned_users": list(banned_users)
+            }},
+            upsert=True
+        )
+    except Exception as e:
+        logging.error(f"Error saving /start data to MongoDB: {e}")
+
 async def load_data():
     global user_data, all_time_users, banned_users, required_channels, bot_active, withdrawals_enabled, min_withdraw_amount, max_withdraw_amount, ton_gas_fee, dogs_gas_fee_ton, dogs_min_withdraw_amount, dogs_max_withdraw_amount, dogs_withdrawals_enabled, tracker_message_id
     try:
@@ -1037,7 +1072,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
 
     # پاسخ اولیه را قبل از عملیات کند دیتابیس و شبکه بفرست تا /start معطل نماند.
     loading_message = await message.answer("⏳ <b>در حال آماده‌سازی ربات...</b>", parse_mode="HTML")
-    asyncio.create_task(save_data())
+    asyncio.create_task(save_user_data(u_id))
 
     if not bot_active and not is_admin(u_id):
         await loading_message.edit_text(
