@@ -1058,6 +1058,48 @@ async def check_join_btn_callback(call: types.CallbackQuery, state: FSMContext):
     else:
         await call.answer("⏳ هنوز عضویتت در همه کانال‌ها تأیید نشده؛ یک بار دیگه بررسی کن!", show_alert=True)
 
+async def complete_start_response(message: types.Message, loading_message: types.Message, u_id: int):
+    """Finish /start after the immediate acknowledgement has already been sent."""
+    try:
+        if not bot_active and not is_admin(u_id):
+            await loading_message.edit_text(
+                "🛠️ <b>ربات موقتاً در حالت تعمیر و ارتقاست.</b>\nخیلی زود برمی‌گردیم؛ موجودی شما کاملاً محفوظ است.",
+                parse_mode="HTML"
+            )
+            return
+
+        is_subscribed = await check_user_subscription(u_id)
+        if not is_subscribed:
+            await loading_message.edit_text(
+                f"🌟 <b>برای ورود به دنیای جایزه‌ها، ابتدا در کانال‌های رسمی ما عضو شو.</b>\n\n"
+                f"✅ بعد از عضویت در همه کانال‌ها، روی «✅ بررسی عضویت / ورود» بزن تا جایزه‌ها برات فعال بشه!",
+                parse_mode="HTML",
+                reply_markup=get_join_channel_keyboard()
+            )
+            return
+
+        await message.answer(
+            f"🔥 <b>به Void Giveaway خوش اومدی!</b> آماده‌ای جایزه جمع کنی؟\n"
+            f"🧩 <b>نسخه فعال:</b> <code>v6.1.0</code> 💎\n\n"
+            f"از منوی زیر استفاده کن و موجودی، برداشت و دعوت‌هات رو مدیریت کن 👇",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(u_id)
+        )
+        try:
+            await loading_message.delete()
+        except Exception as e:
+            logging.warning(f"Could not delete /start loading message: {e}")
+    except Exception as e:
+        logging.exception(f"/start background response failed for {u_id}: {e}")
+        try:
+            await loading_message.edit_text(
+                "⚠️ پاسخ نهایی دیر شد؛ لطفاً دوباره /start را بفرست.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+
 @dp.message(CommandStart())
 async def start_handler(message: types.Message, command: CommandObject, state: FSMContext):
     u_id = message.from_user.id
@@ -1070,39 +1112,11 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
     profile["started_at"] = profile.get("started_at") or datetime.utcnow().isoformat()
     all_time_users.add(u_id)
 
-    # پاسخ اولیه را قبل از عملیات کند دیتابیس و شبکه بفرست تا /start معطل نماند.
+    # Send the acknowledgement before any database or network check.
     loading_message = await message.answer("⏳ <b>در حال آماده‌سازی ربات...</b>", parse_mode="HTML")
     asyncio.create_task(save_user_data(u_id))
+    asyncio.create_task(complete_start_response(message, loading_message, u_id))
 
-    if not bot_active and not is_admin(u_id):
-        await loading_message.edit_text(
-            "🛠️ <b>ربات موقتاً در حالت تعمیر و ارتقاست.</b>\nخیلی زود برمی‌گردیم؛ موجودی شما کاملاً محفوظ است.",
-            parse_mode="HTML"
-        )
-        return
-
-    is_subscribed = await check_user_subscription(u_id)
-    if not is_subscribed:
-        await loading_message.edit_text(
-            f"🌟 <b>برای ورود به دنیای جایزه‌ها، ابتدا در کانال‌های رسمی ما عضو شو.</b>\n\n"
-            f"✅ بعد از عضویت در همه کانال‌ها، روی «✅ بررسی عضویت / ورود» بزن تا جایزه‌ها برات فعال بشه!",
-            parse_mode="HTML",
-            reply_markup=get_join_channel_keyboard()
-        )
-        return
-
-    await message.answer(
-        f"🔥 <b>به Void Giveaway خوش اومدی!</b> آماده‌ای جایزه جمع کنی؟\n"
-        f"🧩 <b>نسخه فعال:</b> <code>v6.1.0</code> 💎\n\n"
-
-        f"از منوی زیر استفاده کن و موجودی، برداشت و دعوت‌هات رو مدیریت کن 👇",
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard(u_id)
-    )
-    try:
-        await loading_message.delete()
-    except Exception as e:
-        logging.warning(f"Could not delete /start loading message: {e}")
 
 # ==========================================
 # انتقال موجودی بین کاربران در گروه
