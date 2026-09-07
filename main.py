@@ -1091,7 +1091,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
         )
         return
 
-    await loading_message.edit_text(
+    await message.answer(
         f"🔥 <b>به Void Giveaway خوش اومدی!</b> آماده‌ای جایزه جمع کنی؟\n"
         f"🧩 <b>نسخه فعال:</b> <code>v6.1.0</code> 💎\n\n"
 
@@ -1099,6 +1099,10 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
         parse_mode="HTML",
         reply_markup=get_main_keyboard(u_id)
     )
+    try:
+        await loading_message.delete()
+    except Exception as e:
+        logging.warning(f"Could not delete /start loading message: {e}")
 
 # ==========================================
 # انتقال موجودی بین کاربران در گروه
