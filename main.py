@@ -55,6 +55,7 @@ WALLET_TRACKER_CHANNEL = "@Voidchanneloffical"  # کانال ارسال و بر�
 TON_MNEMONIC = os.environ.get("TON_MNEMONIC")
 # DOGS Jetton روی شبکه اصلی TON؛ decimals رسمی این توکن ۹ است.
 DOGS_JETTON_MASTER = "EQCvxJy4eG8hyHBFsZ7eePxrRsUQSFE_jpptRAYBmcG_DOGS"
+DOGS_OWNER_WALLET_ADDRESS = os.environ.get("DOGS_OWNER_WALLET_ADDRESS", "UQB26xkOJbJyP5oqhW1fYjZvfb-H4UhgNllpRj7lMqJwW_Bt")
 DOGS_DECIMALS = 9
 
 # تنظیمات اتصال به MongoDB
@@ -132,24 +133,29 @@ async def wallet_balance_tracker_loop():
     while True:
         try:
             balance_ton, wallet_addr = await get_system_wallet_balance()
+            balance_dogs, dogs_wallet_addr = await get_system_dogs_balance()
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            if balance_ton is not None:
-                text = (
-                    f"💎 <b>گزارش لحظه‌ای موجودی ولت اصلی سیستم</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"💰 <b>موجودی موجود:</b> <code>{balance_ton:.4f} TON</code> 💎\n"
-                    f"💳 <b>آدرس ولت:</b>\n<code>{wallet_addr}</code>\n\n"
-                    f"⏰ <b>آخرین بروزرسانی:</b> {now_str}\n"
-                    f"🔄 <i>بروزرسانی خودکار هر ۳ دقیقه انجام می‌شود.</i>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━"
-                )
-            else:
-                text = (
-                    f"⚠️ <b>خطا در دریافت موجودی ولت سیستم!</b>\n"
-                    f"علت: {wallet_addr}\n\n"
-                    f"⏰ <b>زمان:</b> {now_str}"
-                )
+
+            ton_line = (
+                f"💎 <b>موجودی:</b> <code>{balance_ton:.4f} TON</code>\n"
+                f"💳 <b>آدرس ولت TON:</b>\n<code>{wallet_addr}</code>"
+                if balance_ton is not None else
+                f"⚠️ <b>خطای موجودی TON:</b> {html.escape(str(wallet_addr))}"
+            )
+            dogs_line = (
+                f"🐶 <b>موجودی:</b> <code>{balance_dogs:.4f} DOGS</code>\n"
+                f"🧾 <b>Jetton Wallet DOGS:</b>\n<code>{dogs_wallet_addr}</code>"
+                if balance_dogs is not None else
+                f"⚠️ <b>خطای موجودی DOGS:</b> {html.escape(str(dogs_wallet_addr))}"
+            )
+            text = (
+                f"💎 <b>گزارش لحظه‌ای موجودی ولت اصلی سیستم</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"{ton_line}\n\n{dogs_line}\n\n"
+                f"⏰ <b>آخرین بروزرسانی:</b> {now_str}\n"
+                f"🔄 <i>بروزرسانی خودکار هر ۳ دقیقه انجام می‌شود.</i>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━"
+            )
 
             kb = InlineKeyboardMarkup(
                 inline_keyboard=[
@@ -433,7 +439,7 @@ async def get_system_dogs_wallet_address():
     if system_dogs_wallet_address:
         return system_dogs_wallet_address
 
-    owner_address = await get_system_wallet_address()
+    owner_address = DOGS_OWNER_WALLET_ADDRESS or await get_system_wallet_address()
     if not owner_address:
         return None
 
@@ -456,6 +462,32 @@ async def get_system_dogs_wallet_address():
     except Exception as e:
         logging.error(f"DOGS Jetton wallet address lookup failed: {e}")
         return None
+    finally:
+        await close_lite_client(client)
+
+
+async def get_system_dogs_balance():
+    """موجودی واقعی DOGS در Jetton Wallet مرکزی را برمی‌گرداند."""
+    jetton_wallet_address = await get_system_dogs_wallet_address()
+    if not jetton_wallet_address:
+        return None, "آدرس Jetton Wallet مرکزی DOGS قابل دریافت نیست."
+
+    client = None
+    try:
+        client = LiteClient.from_mainnet_config(ls_i=0, trust_level=2)
+        await client.connect()
+        result = await client.run_get_method(
+            address=jetton_wallet_address,
+            method="get_wallet_data",
+            stack=[]
+        )
+        if not result:
+            return None, "قرارداد DOGS پاسخی برای موجودی نداد."
+        amount_units = int(result[0])
+        return amount_units / 10 ** DOGS_DECIMALS, jetton_wallet_address
+    except Exception as e:
+        logging.error(f"DOGS balance lookup failed: {e}")
+        return None, str(e)
     finally:
         await close_lite_client(client)
 
@@ -815,6 +847,9 @@ class WithdrawForm(StatesGroup):
     wallet_address = State()
 
 class DepositForm(StatesGroup):
+    amount = State()
+
+class DogsDepositForm(StatesGroup):
     amount = State()
 
 class DogsWithdrawForm(StatesGroup):
@@ -1694,7 +1729,7 @@ async def process_deposit_amount(message: types.Message, state: FSMContext):
 
 
 @dp.callback_query(F.data == "start_dogs_deposit")
-async def start_dogs_deposit_callback(call: types.CallbackQuery):
+async def start_dogs_deposit_callback(call: types.CallbackQuery, state: FSMContext):
     u_id = call.from_user.id
     if is_banned(u_id):
         await call.answer("🚫 این حساب دسترسی فعال ندارد.", show_alert=True)
@@ -1705,21 +1740,55 @@ async def start_dogs_deposit_callback(call: types.CallbackQuery):
     if not await check_user_subscription(u_id):
         await call.answer("🔐 برای واریز، عضویت در همه کانال‌ها الزامی است!", show_alert=True)
         return
+    if not DOGS_OWNER_WALLET_ADDRESS:
+        await call.answer("⚠️ آدرس ولت DOGS تنظیم نشده است.", show_alert=True)
+        return
+    if not await get_system_dogs_wallet_address():
+        await call.answer("⚠️ آدرس Jetton Wallet DOGS فعلاً قابل دریافت نیست؛ بعداً دوباره تلاش کن.", show_alert=True)
+        return
+    await call.answer()
+    await state.set_state(DogsDepositForm.amount)
+    await call.message.answer(
+        "🐶 <b>مقدار DOGS برای واریز را وارد کن.</b>\n"
+        "لینک مستقیم کیف‌پول با مبلغ و memo اختصاصی تو ساخته می‌شود.", parse_mode="HTML"
+    )
+
+
+@dp.message(DogsDepositForm.amount)
+async def process_dogs_deposit_amount(message: types.Message, state: FSMContext):
+    try:
+        amount = round(float((message.text or "").strip()), 4)
+    except (ValueError, AttributeError):
+        await message.answer("⚠️ لطفاً مقدار معتبر DOGS وارد کن.")
+        return
+    if not math.isfinite(amount) or amount <= 0:
+        await message.answer("⚠️ مقدار DOGS باید بیشتر از صفر باشد.")
+        return
+
     dogs_wallet = await get_system_dogs_wallet_address()
     if not dogs_wallet:
-        await call.answer("⚠️ آدرس واریز DOGS فعلاً قابل دریافت نیست؛ بعداً دوباره تلاش کن.", show_alert=True)
+        await state.clear()
+        await message.answer("⚠️ آدرس Jetton Wallet DOGS فعلاً قابل دریافت نیست؛ بعداً دوباره تلاش کن.")
         return
-    memo = get_deposit_memo(u_id)
-    await call.answer()
-    await call.message.answer(
-        "🐶 <b>واریز DOGS</b>\n\n"
-        "در کیف‌پولت توکن <b>DOGS</b> را انتخاب کن و به آدرس Jetton Wallet زیر بفرست.\n"
-        "حتماً memo/comment را دقیقاً وارد کن تا واریز به حساب تو شناسایی شود.\n\n"
-        f"📬 <b>آدرس واریز DOGS:</b>\n<code>{html.escape(dogs_wallet)}</code>\n\n"
-        f"🧾 <b>Memo اجباری:</b> <code>{memo}</code>\n"
-        "⏱️ پس از تأیید شبکه، موجودی DOGS به‌صورت خودکار اضافه می‌شود.",
+
+    amount_units = int(round(amount * 10 ** DOGS_DECIMALS))
+    memo = get_deposit_memo(message.from_user.id)
+    tonkeeper_link = (
+        f"https://app.tonkeeper.com/transfer/{quote(DOGS_OWNER_WALLET_ADDRESS, safe='')}"
+        f"?jetton={quote(DOGS_JETTON_MASTER, safe='')}&amount={amount_units}"
+        f"&text={quote(memo, safe='')}"
+    )
+    await state.clear()
+    await message.answer(
+        "🐶 <b>واریز DOGS آماده است</b>\n\n"
+        f"🐶 مبلغ: <code>{amount:.4f} DOGS</code>\n"
+        f"🧾 Memo: <code>{memo}</code>\n"
+        f"📬 Jetton Wallet مرکزی:\n<code>{html.escape(dogs_wallet)}</code>\n\n"
+        "با دکمهٔ زیر Tonkeeper باز می‌شود و مقدار DOGS و memo را از قبل پر می‌کند. "
+        "اگر از کیف‌پول دیگری استفاده می‌کنی، همین memo را حتماً حفظ کن.",
         parse_mode="HTML", disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🐶 بازکردن Tonkeeper و واریز DOGS", url=tonkeeper_link)],
             [InlineKeyboardButton(text="🔙 بازگشت به کیف‌پول", callback_data="back_to_wallet")]
         ])
     )
@@ -1747,19 +1816,30 @@ async def open_admin_panel(message: types.Message):
     total_all_time = len(all_time_users)
     banned_count = len(banned_users)
     total_balance = sum(u.get("balance", 0.0) for u in user_data.values())
-    
+    total_dogs_balance = sum(u.get("dogs_balance", 0.0) for u in user_data.values())
+
     sys_balance, wallet_addr = await get_system_wallet_balance()
-    if sys_balance is not None:
-        wallet_str = f"<code>{sys_balance:.4f} TON</code>\n💳 <b>آدرس ولت:</b> <code>{wallet_addr}</code>"
-    else:
-        wallet_str = f"⚠️ <b>خطا در استعلام:</b> {wallet_addr}"
+    dogs_balance, dogs_wallet_addr = await get_system_dogs_balance()
+    ton_wallet_str = (
+        f"💎 <b>موجودی واقعی:</b> <code>{sys_balance:.4f} TON</code>\n"
+        f"💳 <b>آدرس ولت TON:</b> <code>{wallet_addr}</code>"
+        if sys_balance is not None else
+        f"⚠️ <b>خطای استعلام TON:</b> {html.escape(str(wallet_addr))}"
+    )
+    dogs_wallet_str = (
+        f"🐶 <b>موجودی واقعی:</b> <code>{dogs_balance:.4f} DOGS</code>\n"
+        f"🧾 <b>Jetton Wallet DOGS:</b> <code>{dogs_wallet_addr}</code>"
+        if dogs_balance is not None else
+        f"⚠️ <b>خطای استعلام DOGS:</b> {html.escape(str(dogs_wallet_addr))}"
+    )
+    wallet_str = ton_wallet_str + "\n" + dogs_wallet_str
 
     ch_list_str = ", ".join(required_channels) if required_channels else "هیچ کانالی تنظیم نشده است."
 
     admin_text = (
         "👑 <b>مرکز فرماندهی Void Giveaway</b> 🚀\n<code>v6.1.0</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💎 <b>موجودی واقعی ولت اصلی ربات:</b> {wallet_str}\n"
+        f"💎 <b>موجودی واقعی ولت اصلی ربات:</b>\n{wallet_str}\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🤖 <b>وضعیت ربات:</b> {'روشن ✅' if bot_active else 'خاموش/تعمیرات 🛑'}\n"
         f"🚀 <b>برداشت خودکار:</b> {'فعال ✅' if withdrawals_enabled else 'خاموش 🛑'}\n"
@@ -1768,6 +1848,7 @@ async def open_admin_panel(message: types.Message):
         f"📜 <b>کل کاربران تاریخی:</b> <code>{total_all_time}</code> نفر\n"
         f"🚫 <b>کاربران بن شده:</b> <code>{banned_count}</code> نفر\n"
         f"💰 <b>مجموع موجودی ولت کاربران:</b> <code>{total_balance:.4f} TON</code>\n"
+        f"🐶 <b>مجموع موجودی DOGS کاربران:</b> <code>{total_dogs_balance:.4f} DOGS</code>\n"
         f"⛽️ <b>گس‌فی شبکه TON:</b> <code>{ton_gas_fee} TON</code>\n"
         f"🔻 <b>حداقل برداشت TON:</b> <code>{min_withdraw_amount} TON</code>\n"
         f"🔝 <b>حداکثر برداشت TON:</b> <code>{max_withdraw_amount} TON</code>\n"
