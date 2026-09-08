@@ -83,8 +83,10 @@ min_withdraw_amount = 0.1
 max_withdraw_amount = 10.0
 min_deposit_amount = 0.01
 ton_gas_fee = 0.005
-# تنظیمات مستقل DOGS؛ کارمزد شبکه برای برداشت DOGS با TON پرداخت می‌شود.
+# کارمزدی که از کاربر DOGS کسر می‌شود؛ صفر مجاز است.
 dogs_gas_fee_ton = 0.05
+# حتی وقتی کاربر گس‌فی صفر دارد، تراکنش Jetton باید حداقل TON شبکه را از ولت سیستم بگیرد.
+DOGS_NETWORK_GAS_TON = 0.05
 dogs_min_withdraw_amount = 1000.0
 dogs_max_withdraw_amount = 1000000.0
 dogs_withdrawals_enabled = True
@@ -362,13 +364,14 @@ async def send_dogs_payout(destination_address: str, amount_dogs: float):
             return "failed", "آدرس ولت مرکزی DOGS یا ولت TON قابل دریافت نیست."
 
         system_balance, balance_info = await get_system_wallet_balance()
-        required_balance = max(float(dogs_gas_fee_ton), 0.0)
+        user_fee_ton = max(float(dogs_gas_fee_ton), 0.0)
+        network_value_ton = max(user_fee_ton, DOGS_NETWORK_GAS_TON)
         if system_balance is None:
             return "failed", f"موجودی TON ولت ربات قابل بررسی نیست: {balance_info}"
-        if system_balance < required_balance:
+        if system_balance < network_value_ton:
             return "failed", (
                 f"موجودی TON ولت ربات برای گس DOGS کافی نیست. موجودی فعلی: {system_balance:.4f} TON؛ "
-                f"مبلغ موردنیاز: {required_balance:.4f} TON"
+                f"مبلغ موردنیاز شبکه: {network_value_ton:.4f} TON"
             )
 
         real_dogs_balance, dogs_wallet_info = await get_system_dogs_balance()
@@ -396,7 +399,7 @@ async def send_dogs_payout(destination_address: str, amount_dogs: float):
             )
             await wallet.transfer(
                 destination=system_dogs_wallet,
-                amount=int(round(required_balance * 10 ** 9)),
+                amount=int(round(network_value_ton * 10 ** 9)),
                 body=body
             )
             transfer_submitted = True
@@ -2471,14 +2474,14 @@ async def process_set_dogs_gas_fee(message: types.Message, state: FSMContext):
     global dogs_gas_fee_ton
     try:
         amount = float(message.text.strip())
-        if not math.isfinite(amount) or amount <= 0:
+        if not math.isfinite(amount) or amount < 0:
             raise ValueError
         dogs_gas_fee_ton = amount
         await save_data()
         await state.clear()
-        await message.answer(f"✅ گس‌فی برداشت DOGS روی <code>{dogs_gas_fee_ton} TON</code> تنظیم شد.", parse_mode="HTML")
+        await message.answer(f"✅ گس‌فی کسرشده از کاربر روی <code>{dogs_gas_fee_ton} TON</code> تنظیم شد. حداقل هزینه شبکه از ولت سیستم پرداخت می‌شود.", parse_mode="HTML")
     except (ValueError, AttributeError):
-        await message.answer("⚠️ یک مقدار مثبت و معتبر به TON وارد کن.")
+        await message.answer("⚠️ مقدار معتبر به TON وارد کن؛ صفر هم مجاز است.")
 
 @dp.callback_query(F.data == "admin_set_min_dogs_wd")
 async def start_set_min_dogs_wd(call: types.CallbackQuery, state: FSMContext):
