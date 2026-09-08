@@ -967,6 +967,7 @@ class AdminBroadcastForm(StatesGroup):
 
 class AdminManageUserForm(StatesGroup):
     user_id = State()
+    asset = State()
     amount = State()
 
 class AdminSearchUserForm(StatesGroup):
@@ -2559,15 +2560,46 @@ async def process_edit_balance_user(message: types.Message, state: FSMContext):
     if not message.text.isdigit():
         await message.answer("⚠️ لطفاً یک آیدی عددی معتبر وارد کن!")
         return
-    await state.update_data(target_u_id=int(message.text))
+    target_id = int(message.text)
+    await state.update_data(target_u_id=target_id)
+    await state.set_state(AdminManageUserForm.asset)
+    prof = get_user_profile(target_id)
+    await message.answer(
+        f"👤 کاربر <code>{target_id}</code>\n"
+        f"💰 موجودی TON: <code>{prof.get('balance', 0.0):.4f}</code>\n"
+        f"🐶 موجودی DOGS: <code>{prof.get('dogs_balance', 0.0):.4f}</code>\n\n"
+        "دارایی موردنظر برای تغییر را انتخاب کن:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💎 تغییر TON", callback_data="admin_edit_asset_TON")],
+            [InlineKeyboardButton(text="🐶 تغییر DOGS", callback_data="admin_edit_asset_DOGS")]
+        ])
+    )
+
+@dp.callback_query(F.data.startswith("admin_edit_asset_"))
+async def process_edit_balance_asset(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("🚫 دسترسی ندارید.", show_alert=True)
+        return
+    asset = call.data.removeprefix("admin_edit_asset_").upper()
+    if asset not in ("TON", "DOGS"):
+        await call.answer("دارایی نامعتبر است.", show_alert=True)
+        return
+    await state.update_data(asset=asset)
     await state.set_state(AdminManageUserForm.amount)
-    await message.answer("💎 مقدار تغییر موجودی را وارد کن؛ مثال: <code>0.5</code> برای افزایش یا <code>-0.5</code> برای کاهش:", parse_mode="HTML")
+    await call.answer()
+    unit = "TON" if asset == "TON" else "DOGS"
+    await call.message.edit_text(
+        f"مقدار تغییر موجودی {unit} را وارد کن؛ برای کاهش عدد منفی بفرست.\n"
+        "مثال افزایش: <code>0.5</code> | مثال کاهش: <code>-0.5</code>",
+        parse_mode="HTML"
+    )
 
 @dp.message(AdminManageUserForm.amount)
 async def process_edit_balance_amount(message: types.Message, state: FSMContext):
     try:
         amount = float(message.text.strip())
-    except ValueError:
+    except (ValueError, AttributeError):
         await message.answer("⚠️ مقدار عددی معتبر وارد کنید!")
         return
 
@@ -2576,18 +2608,27 @@ async def process_edit_balance_amount(message: types.Message, state: FSMContext)
         return
     data = await state.get_data()
     target_id = data.get("target_u_id")
-    
-    prof = get_user_profile(target_id)
-    new_balance = round(prof["balance"] + amount, 4)
-    if new_balance < 0:
-        await message.answer("⚠️ موجودی کاربر نمی‌تواند منفی شود!")
+    asset = data.get("asset", "TON")
+    if asset not in ("TON", "DOGS"):
+        await state.clear()
+        await message.answer("⚠️ نوع دارایی نامعتبر است؛ دوباره از پنل ادمین شروع کن.")
         return
-    prof["balance"] = new_balance
+
+    prof = get_user_profile(target_id)
+    field = "dogs_balance" if asset == "DOGS" else "balance"
+    unit = "DOGS" if asset == "DOGS" else "TON"
+    current_balance = float(prof.get(field, 0.0))
+    new_balance = round(current_balance + amount, 4)
+    if new_balance < 0:
+        await message.answer(f"⚠️ موجودی {unit} کاربر نمی‌تواند منفی شود!")
+        return
+    prof[field] = new_balance
     await save_data()
     await state.clear()
 
     await message.answer(
-        f"✅ موجودی کاربر <code>{target_id}</code> به‌روزرسانی شد.\n💰 موجودی جدید: <code>{prof['balance']} TON</code>",
+        f"✅ موجودی {unit} کاربر <code>{target_id}</code> به‌روزرسانی شد.\n"
+        f"موجودی جدید: <code>{new_balance:.4f} {unit}</code>",
         parse_mode="HTML"
     )
 
