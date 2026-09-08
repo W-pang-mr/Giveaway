@@ -55,7 +55,7 @@ WALLET_TRACKER_CHANNEL = "@Voidchanneloffical"  # کانال ارسال و بر�
 TON_MNEMONIC = os.environ.get("TON_MNEMONIC")
 # DOGS Jetton روی شبکه اصلی TON؛ decimals رسمی این توکن ۹ است.
 DOGS_JETTON_MASTER = "EQCvxJy4eG8hyHBFsZ7eePxrRsUQSFE_jpptRAYBmcG_DOGS"
-DOGS_OWNER_WALLET_ADDRESS = os.environ.get("DOGS_OWNER_WALLET_ADDRESS", "UQB26xkOJbJyP5oqhW1fYjZvfb-H4UhgNllpRj7lMqJwW_Bt")
+DOGS_OWNER_WALLET_ADDRESS = os.environ.get("DOGS_OWNER_WALLET_ADDRESS", "")
 DOGS_DECIMALS = 9
 
 # تنظیمات اتصال به MongoDB
@@ -262,7 +262,7 @@ async def wait_for_wallet_seqno(previous_seqno: int, attempts: int = 20, interva
 
 
 async def send_ton_payout(destination_address: str, amount_ton: float):
-    """Send TON and confirm the wallet message through a fresh network query."""
+    """Send TON and distinguish a rejected transfer from an ambiguous broadcast."""
     if not TON_MNEMONIC:
         return "failed", "کلید امنیتی ولت (TON_MNEMONIC) تنظیم نشده است!"
     if not is_valid_ton_address(destination_address):
@@ -282,7 +282,8 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
             )
 
         client = None
-        transfer_started = False
+        seqno_before = None
+        transfer_submitted = False
         try:
             client = LiteClient.from_mainnet_config(ls_i=0, trust_level=2)
             await client.connect()
@@ -290,27 +291,33 @@ async def send_ton_payout(destination_address: str, amount_ton: float):
                 client, TON_MNEMONIC.strip().split(), network_global_id=-239
             )
             seqno_before = await wallet.get_seqno()
-            transfer_started = True
             await wallet.transfer(
                 destination=destination_address.strip(),
                 amount=int(round(amount_ton * 10**9)),
                 body="Payout from Void Giveaway Bot 🎉"
             )
+            transfer_submitted = True
             await close_lite_client(client)
             client = None
 
-            if await wait_for_wallet_seqno(seqno_before):
+            if await wait_for_wallet_seqno(seqno_before, attempts=12, interval=2):
                 return "sent", (
                     f"ارسال {amount_ton:.4f} TON روی شبکه ثبت و تأیید شد؛ "
                     "نمایش تراکنش در کیف‌پول مقصد ممکن است کمی زمان ببرد."
                 )
             return "uncertain", "پیام TON ارسال شده اما تأیید شبکه هنوز دریافت نشده است؛ مبلغ رزرو می‌ماند."
         except Exception as e:
-            logging.error(f"pytoniq W5 Payout Error: {e}")
+            logging.error(f"pytoniq W5 TON payout error: {e}")
             await close_lite_client(client)
-            if transfer_started:
+            if transfer_submitted:
                 return "uncertain", "نتیجه ارسال TON قطعی نیست؛ مبلغ برای بررسی بیشتر رزرو می‌ماند."
-            return "failed", str(e)
+            if seqno_before is not None:
+                try:
+                    if await wait_for_wallet_seqno(seqno_before, attempts=2, interval=1):
+                        return "uncertain", "ارسال TON احتمالاً انجام شده اما نتیجه قطعی نیست؛ مبلغ رزرو می‌ماند."
+                except Exception as confirm_error:
+                    logging.warning(f"TON post-error confirmation failed: {confirm_error}")
+            return "failed", f"ارسال TON قبل از ثبت تراکنش شکست خورد: {e}"
 
 def build_dogs_transfer_body(amount_units: int, destination_address: str,
                              response_address: str, comment: str):
@@ -336,7 +343,7 @@ def build_dogs_transfer_body(amount_units: int, destination_address: str,
     )
 
 async def send_dogs_payout(destination_address: str, amount_dogs: float):
-    """Send DOGS and confirm the central wallet seqno through a fresh connection."""
+    """Send DOGS from the Jetton Wallet owned by the TON mnemonic wallet."""
     if not TON_MNEMONIC:
         return "failed", "کلید امنیتی ولت (TON_MNEMONIC) تنظیم نشده است!"
     if not is_valid_ton_address(destination_address):
@@ -349,6 +356,11 @@ async def send_dogs_payout(destination_address: str, amount_dogs: float):
         return "failed", "مبلغ DOGS برای ارسال خیلی کوچک است."
 
     async with payout_lock:
+        system_wallet = await get_system_wallet_address()
+        system_dogs_wallet = await get_system_dogs_wallet_address()
+        if not system_wallet or not system_dogs_wallet:
+            return "failed", "آدرس ولت مرکزی DOGS یا ولت TON قابل دریافت نیست."
+
         system_balance, balance_info = await get_system_wallet_balance()
         required_balance = max(float(dogs_gas_fee_ton), 0.0)
         if system_balance is None:
@@ -368,13 +380,9 @@ async def send_dogs_payout(destination_address: str, amount_dogs: float):
                 f"مبلغ موردنیاز: {amount_dogs:.4f} DOGS"
             )
 
-        system_dogs_wallet = await get_system_dogs_wallet_address()
-        system_wallet = await get_system_wallet_address()
-        if not system_dogs_wallet or not system_wallet:
-            return "failed", "آدرس ولت مرکزی DOGS یا ولت TON قابل دریافت نیست."
-
         client = None
-        transfer_started = False
+        seqno_before = None
+        transfer_submitted = False
         try:
             client = LiteClient.from_mainnet_config(ls_i=0, trust_level=2)
             await client.connect()
@@ -386,16 +394,16 @@ async def send_dogs_payout(destination_address: str, amount_dogs: float):
                 amount_units, destination_address.strip(), system_wallet,
                 f"DOGS payout {uuid.uuid4().hex[:12]}"
             )
-            transfer_started = True
             await wallet.transfer(
                 destination=system_dogs_wallet,
                 amount=int(round(required_balance * 10 ** 9)),
                 body=body
             )
+            transfer_submitted = True
             await close_lite_client(client)
             client = None
 
-            if await wait_for_wallet_seqno(seqno_before):
+            if await wait_for_wallet_seqno(seqno_before, attempts=12, interval=2):
                 return "sent", (
                     f"ارسال {amount_dogs:.4f} DOGS روی شبکه ثبت و تأیید شد؛ "
                     "نمایش تراکنش ممکن است چند ثانیه زمان ببرد."
@@ -404,9 +412,15 @@ async def send_dogs_payout(destination_address: str, amount_dogs: float):
         except Exception as e:
             logging.error(f"DOGS payout error: {e}")
             await close_lite_client(client)
-            if transfer_started:
+            if transfer_submitted:
                 return "uncertain", "نتیجه ارسال DOGS قطعی نیست؛ مبلغ برای بررسی بیشتر رزرو می‌ماند."
-            return "failed", str(e)
+            if seqno_before is not None:
+                try:
+                    if await wait_for_wallet_seqno(seqno_before, attempts=2, interval=1):
+                        return "uncertain", "ارسال DOGS احتمالاً انجام شده اما نتیجه قطعی نیست؛ مبلغ رزرو می‌ماند."
+                except Exception as confirm_error:
+                    logging.warning(f"DOGS post-error confirmation failed: {confirm_error}")
+            return "failed", f"ارسال DOGS قبل از ثبت تراکنش شکست خورد: {e}"
 
 async def notify_wallet_issue(amount: float, reason: str, withdrawal_id: str = None, asset: str = "TON"):
     """هشدار قابل پیگیری برای ادمین هنگام توقف یا شکست برداشت."""
@@ -450,13 +464,25 @@ async def get_system_wallet_address():
 
 
 
+async def get_dogs_owner_wallet_address():
+    """Use the TON wallet derived from TON_MNEMONIC as the DOGS Jetton owner."""
+    actual_owner = await get_system_wallet_address()
+    if actual_owner and is_valid_ton_address(actual_owner):
+        configured_owner = (DOGS_OWNER_WALLET_ADDRESS or "").strip()
+        if configured_owner and configured_owner != actual_owner:
+            logging.warning(
+                "DOGS_OWNER_WALLET_ADDRESS does not match TON_MNEMONIC wallet; using derived wallet"
+            )
+        return actual_owner
+    return None
+
 async def get_system_dogs_wallet_address():
     """Return the DOGS Jetton Wallet owned by the configured central TON wallet."""
     global system_dogs_wallet_address
     if system_dogs_wallet_address:
         return system_dogs_wallet_address
 
-    owner_address = (DOGS_OWNER_WALLET_ADDRESS or "").strip()
+    owner_address = await get_dogs_owner_wallet_address()
     if not owner_address:
         return None
 
@@ -1968,8 +1994,9 @@ async def start_dogs_deposit_callback(call: types.CallbackQuery, state: FSMConte
     if not await check_user_subscription(u_id):
         await call.answer("🔐 برای واریز، عضویت در همه کانال‌ها الزامی است!", show_alert=True)
         return
-    if not DOGS_OWNER_WALLET_ADDRESS:
-        await call.answer("⚠️ آدرس ولت مرکزی DOGS تنظیم نشده است.", show_alert=True)
+    owner_address = await get_dogs_owner_wallet_address()
+    if not owner_address:
+        await call.answer("⚠️ آدرس ولت مرکزی DOGS از TON_MNEMONIC قابل دریافت نیست.", show_alert=True)
         return
     if not await get_system_dogs_wallet_address():
         await call.answer("⚠️ Jetton Wallet مرکزی DOGS فعلاً قابل دریافت نیست؛ بعداً دوباره تلاش کن.", show_alert=True)
@@ -1998,7 +2025,12 @@ async def process_dogs_deposit_amount(message: types.Message, state: FSMContext)
         await message.answer("⚠️ مقدار DOGS برای انتقال خیلی کوچک است.")
         return
     memo = get_deposit_memo(message.from_user.id)
-    owner = quote(DOGS_OWNER_WALLET_ADDRESS.strip(), safe="")
+    owner_address = await get_dogs_owner_wallet_address()
+    if not owner_address:
+        await state.clear()
+        await message.answer("⚠️ آدرس ولت مرکزی DOGS از TON_MNEMONIC قابل دریافت نیست.")
+        return
+    owner = quote(owner_address, safe="")
     jetton = quote(DOGS_JETTON_MASTER, safe="")
     text = quote(memo, safe="")
     ton_uri = f"ton://transfer/{owner}?jetton={jetton}&amount={amount_units}&text={text}"
@@ -2014,7 +2046,7 @@ async def process_dogs_deposit_amount(message: types.Message, state: FSMContext)
         "🐶 <b>واریز DOGS آماده است</b>\n\n"
         f"🐶 مبلغ: <code>{amount:.4f} DOGS</code>\n"
         f"🧾 Memo: <code>{memo}</code>\n"
-        f"📬 ولت مالک مرکزی: <code>{html.escape(DOGS_OWNER_WALLET_ADDRESS)}</code>\n"
+        f"📬 ولت مالک مرکزی: <code>{html.escape(owner_address)}</code>\n"
         f"🧩 Jetton Wallet دریافت‌کننده: <code>{html.escape(dogs_wallet)}</code>\n\n"
         "memo را تغییر نده؛ بعد از ثبت تراکنش، واریز خودکار به موجودی اضافه می‌شود.",
         parse_mode="HTML", disable_web_page_preview=True,
