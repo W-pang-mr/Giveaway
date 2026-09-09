@@ -1196,6 +1196,16 @@ async def check_join_btn_callback(call: types.CallbackQuery, state: FSMContext):
         await call.answer("🎉 عضویتت با موفقیت تأیید شد! حالا آماده دریافت جایزه‌ای 🚀", show_alert=True)
         
         await call.message.delete()
+        pending_profile = get_user_profile(u_id)
+        if pending_profile.get("pending_referrer_id") and not pending_profile.get("referral_rewarded"):
+            await call.message.answer(
+                "🤝 <b>عضویت تأیید شد و لینک رفرال شناسایی شد.</b>\n\n"
+                "برای ثبت نهایی دعوت، شماره تلگرامت را با دکمه زیر ارسال کن.\n"
+                "فقط شماره‌های ایران با پیش‌شماره <code>+98</code> تأیید می‌شوند.",
+                parse_mode="HTML",
+                reply_markup=get_referral_contact_keyboard()
+            )
+            return
         await call.message.answer(
             f"🔥 <b>به Void Giveaway خوش اومدی!</b> آماده‌ای جایزه جمع کنی؟\n"
             f"🧩 <b>نسخه فعال:</b> <code>{BOT_VERSION}</code> 💎\n\n"
@@ -1233,7 +1243,10 @@ async def complete_start_response(message: types.Message, loading_message: types
             profile["pending_referrer_id"] = int(pending_referrer_id)
             await save_user_data(u_id)
             await loading_message.edit_text(
-                "🤝 <b>لینک رفرال شناسایی شد.</b>\n\n"
+                "🤝 <b>لینک رفرال شناسایی شد.</b>",
+                parse_mode="HTML"
+            )
+            await message.answer(
                 "برای ثبت نهایی دعوت و جلوگیری از سوءاستفاده، شماره تلگرامت را با دکمه زیر ارسال کن.\n"
                 "فقط شماره‌های ایران با پیش‌شماره <code>+98</code> تأیید می‌شوند.",
                 parse_mode="HTML",
