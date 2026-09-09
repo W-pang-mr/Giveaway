@@ -1129,7 +1129,7 @@ async def fetch_crypto_price(symbol: str):
 
     endpoint = (
         "https://api.coingecko.com/api/v3/simple/price"
-        f"?ids={quote(coin_id, safe='')}&vs_currencies=usd&include_24hr_change=true"
+        f"?ids={quote(coin_id, safe='')}&vs_currencies=usd,irr&include_24hr_change=true"
     )
 
     def request_price():
@@ -1150,6 +1150,7 @@ async def fetch_crypto_price(symbol: str):
             "symbol": display_symbol,
             "price": float(usd_price),
             "change_24h": coin_data.get("usd_24h_change"),
+            "toman": (float(coin_data["irr"]) / 10 if coin_data.get("irr") is not None else None),
         }
         crypto_price_cache[normalized] = {"fetched_at": time.monotonic(), "data": data}
         return data
@@ -1408,6 +1409,145 @@ async def crypto_price_handler(message: types.Message, command: CommandObject):
         f"{change_text}\n\n"
         "🕒 داده‌ها هر ۶۰ ثانیه تازه می‌شوند.\n"
         "🔗 منبع: CoinGecko",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+
+PERSIAN_PRICE_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
+PRICE_TEXT_ALIASES = {
+    "TON": ("ton", "تون", "gram", "گرام", "toncoin", "تون‌کوین"),
+    "DOGS": ("dogs", "داگز", "داگس"),
+}
+
+
+def normalize_price_query(value: str) -> str:
+    normalized = (value or "").translate(PERSIAN_PRICE_DIGITS).lower()
+    normalized = normalized.replace("ي", "ی").replace("ك", "ک")
+    normalized = normalized.replace("تومن", "تومان").replace("مليون", "میلیون")
+    normalized = re.sub(r"[\u200c\u200f]", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def price_alias_position(query: str, alias: str):
+    if re.fullmatch(r"[a-z0-9]+", alias):
+        match = re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", query)
+        return match.start() if match else None
+    position = query.find(alias)
+    return position if position >= 0 else None
+
+
+def find_price_coins(query: str):
+    found = []
+    for symbol, aliases in PRICE_TEXT_ALIASES.items():
+        positions = [price_alias_position(query, alias) for alias in aliases]
+        positions = [position for position in positions if position is not None]
+        if positions:
+            found.append((min(positions), symbol))
+    return [symbol for _, symbol in sorted(found)]
+
+
+def parse_natural_price_query(value: str):
+    query = normalize_price_query(value)
+    coins = find_price_coins(query)
+    if not coins:
+        return None
+
+    number_match = re.search(
+        r"(?<![a-z0-9])(\d+(?:[.,]\d+)?)\s*(میلیون|هزار|k|m)?",
+        query,
+        re.IGNORECASE
+    )
+    amount = 1.0
+    multiplier = 1.0
+    if number_match:
+        amount = float(number_match.group(1).replace(",", ""))
+        unit = (number_match.group(2) or "").lower()
+        multiplier = {"میلیون": 1_000_000, "هزار": 1_000, "k": 1_000, "m": 1_000_000}.get(unit, 1.0)
+        amount *= multiplier
+
+    is_toman = bool(re.search(r"تومان|irr", query))
+    return {"query": query, "coins": coins, "amount": amount, "is_toman": is_toman}
+
+
+def format_quantity(value: float) -> str:
+    if abs(value - round(value)) < 1e-9:
+        return f"{int(round(value)):,}"
+    return f"{value:,.6f}".rstrip("0").rstrip(".")
+
+
+def format_change(change) -> str:
+    if change is None:
+        return "تغییر ۲۴ساعته نامشخص"
+    return f"{'📈' if change >= 0 else '📉'} {change:+.2f}% در ۲۴ ساعت"
+
+
+@dp.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.regexp(r"(?i)(ton|تون|gram|گرام|toncoin|dogs|داگز|داگس|تومان|تومن)")
+)
+async def natural_crypto_price_handler(message: types.Message):
+    parsed = parse_natural_price_query(message.text or "")
+    if not parsed:
+        return
+
+    rate_key = (message.chat.id, message.from_user.id)
+    now = time.monotonic()
+    if now - crypto_price_rate_limit.get(rate_key, 0) < 3:
+        await message.answer("⏳ یک لحظه صبر کن؛ قیمت‌ها هر چند ثانیه یک‌بار تازه می‌شوند.")
+        return
+    crypto_price_rate_limit[rate_key] = now
+
+    symbols = parsed["coins"]
+    data = await asyncio.gather(*(fetch_crypto_price(symbol) for symbol in symbols))
+    if any(item is None for item in data):
+        await message.answer("⚠️ قیمت این ارز فعلاً از سرویس بازار دریافت نشد؛ کمی بعد دوباره امتحان کن.")
+        return
+
+    amount = parsed["amount"]
+    if parsed["is_toman"]:
+        if len(data) != 1 or data[0].get("toman") is None:
+            await message.answer("⚠️ تبدیل تومانی این درخواست فعلاً در دسترس نیست؛ قیمت دلاری را امتحان کن.")
+            return
+        coin = data[0]
+        coin_amount = amount / coin["toman"]
+        reply = (
+            "💱 <b>محاسبه تقریبی بازار</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"💵 <b>{format_quantity(amount)} تومان</b> ≈ "
+            f"<b>{format_quantity(coin_amount)} {coin['symbol']}</b>\n"
+            f"📌 قیمت هر {coin['symbol']}: حدود <code>{format_quantity(coin['toman'])} تومان</code>\n"
+            f"{format_change(coin.get('change_24h'))}\n\n"
+            "⚠️ نرخ تومان تقریبی است و برای قیمت دقیق خرید/فروش استفاده نشود."
+        )
+    elif len(data) == 2:
+        source, target = data
+        target_amount = amount * source["price"] / target["price"]
+        reply = (
+            "🔄 <b>تبدیل تقریبی ارزها</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"💎 <b>{format_quantity(amount)} {source['symbol']}</b> ≈ "
+            f"<b>{format_quantity(target_amount)} {target['symbol']}</b>\n"
+            f"💵 ارزش مبنا: حدود <code>USD {format_crypto_price(amount * source['price'])}</code>\n"
+            f"📈 {source['symbol']}: {format_change(source.get('change_24h'))}\n"
+            f"📉 {target['symbol']}: {format_change(target.get('change_24h'))}"
+        )
+    else:
+        coin = data[0]
+        total_usd = amount * coin["price"]
+        toman_line = ""
+        if coin.get("toman") is not None:
+            toman_line = f"\n🇮🇷 ارزش تقریبی: <code>{format_quantity(amount * coin['toman'])} تومان</code>"
+        reply = (
+            f"📊 <b>قیمت لحظه‌ای {coin['symbol']}</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"💎 {format_quantity(amount)} {coin['symbol']} ≈ "
+            f"<b>USD {format_crypto_price(total_usd)}</b>{toman_line}\n"
+            f"{format_change(coin.get('change_24h'))}"
+        )
+
+    await message.answer(
+        reply + "\n\n🕒 داده‌ها حداکثر هر ۶۰ ثانیه تازه می‌شوند.\n🔗 منبع: CoinGecko",
         parse_mode="HTML",
         disable_web_page_preview=True
     )
