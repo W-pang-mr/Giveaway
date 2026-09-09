@@ -90,6 +90,9 @@ DOGS_NETWORK_GAS_TON = 0.05
 dogs_min_withdraw_amount = 1000.0
 dogs_max_withdraw_amount = 1000000.0
 dogs_withdrawals_enabled = True
+# سیستم رفرال: پاداش به‌صورت اعتبار داخلی TON در کیف‌پول ربات ثبت می‌شود.
+referrals_enabled = True
+referral_reward_ton = 0.01
 tracker_message_id = None
 system_wallet_address = None
 system_dogs_wallet_address = None
@@ -99,6 +102,8 @@ payout_lock = asyncio.Lock()
 withdrawal_flow_lock = asyncio.Lock()
 # DOGS deposit scans are serialized to avoid overlapping chain reads and credits.
 dogs_deposit_scan_lock = asyncio.Lock()
+# از ثبت پاداش تکراری در شروع هم‌زمان جلوگیری می‌کند.
+referral_lock = asyncio.Lock()
 
 # ==========================================
 # استعلام موجودی ولت سیستم
@@ -854,10 +859,14 @@ async def save_data():
                 "balance": info.get("balance", 0.0),
                 "dogs_balance": info.get("dogs_balance", 0.0),
                 "username": info.get("username", ""),
-                "first_name": info.get("first_name", "User")
+                "first_name": info.get("first_name", "User"),
+                "referral_count": int(info.get("referral_count", 0) or 0),
+                "referral_rewarded": bool(info.get("referral_rewarded", False))
             }
             if info.get("started_at"):
                 user_doc["started_at"] = info["started_at"]
+            if info.get("referred_by") is not None:
+                user_doc["referred_by"] = int(info["referred_by"])
             await users_col.update_one({"user_id": u_id}, {"$set": user_doc}, upsert=True)
 
         settings_doc = {
@@ -874,6 +883,8 @@ async def save_data():
             "dogs_min_withdraw_amount": dogs_min_withdraw_amount,
             "dogs_max_withdraw_amount": dogs_max_withdraw_amount,
             "dogs_withdrawals_enabled": dogs_withdrawals_enabled,
+            "referrals_enabled": referrals_enabled,
+            "referral_reward_ton": referral_reward_ton,
             "tracker_message_id": tracker_message_id
         }
         await settings_col.update_one({"setting_id": "global_config"}, {"$set": settings_doc}, upsert=True)
@@ -892,10 +903,14 @@ async def save_user_data(user_id: int):
             "balance": info.get("balance", 0.0),
             "dogs_balance": info.get("dogs_balance", 0.0),
             "username": info.get("username", ""),
-            "first_name": info.get("first_name", "User")
+            "first_name": info.get("first_name", "User"),
+            "referral_count": int(info.get("referral_count", 0) or 0),
+            "referral_rewarded": bool(info.get("referral_rewarded", False))
         }
         if info.get("started_at"):
             user_doc["started_at"] = info["started_at"]
+        if info.get("referred_by") is not None:
+            user_doc["referred_by"] = int(info["referred_by"])
         await users_col.update_one({"user_id": user_id}, {"$set": user_doc}, upsert=True)
         await settings_col.update_one(
             {"setting_id": "global_config"},
@@ -909,7 +924,7 @@ async def save_user_data(user_id: int):
         logging.error(f"Error saving /start data to MongoDB: {e}")
 
 async def load_data():
-    global user_data, all_time_users, banned_users, required_channels, bot_active, withdrawals_enabled, min_withdraw_amount, max_withdraw_amount, ton_gas_fee, dogs_gas_fee_ton, dogs_min_withdraw_amount, dogs_max_withdraw_amount, dogs_withdrawals_enabled, tracker_message_id
+    global user_data, all_time_users, banned_users, required_channels, bot_active, withdrawals_enabled, min_withdraw_amount, max_withdraw_amount, ton_gas_fee, dogs_gas_fee_ton, dogs_min_withdraw_amount, dogs_max_withdraw_amount, dogs_withdrawals_enabled, referrals_enabled, referral_reward_ton, tracker_message_id
     try:
         for collection, field in ((users_col, "user_id"), (withdrawals_col, "withdrawal_id"), (deposits_col, "tx_id"), (transfers_col, "transfer_id")):
             try:
@@ -930,6 +945,8 @@ async def load_data():
             dogs_min_withdraw_amount = settings_doc.get("dogs_min_withdraw_amount", 1000.0)
             dogs_max_withdraw_amount = settings_doc.get("dogs_max_withdraw_amount", 1000000.0)
             dogs_withdrawals_enabled = settings_doc.get("dogs_withdrawals_enabled", True)
+            referrals_enabled = settings_doc.get("referrals_enabled", True)
+            referral_reward_ton = settings_doc.get("referral_reward_ton", 0.01)
             tracker_message_id = settings_doc.get("tracker_message_id", None)
 
         async for user_doc in users_col.find():
@@ -939,7 +956,10 @@ async def load_data():
                 "dogs_balance": round(float(user_doc.get("dogs_balance", 0.0) or 0.0), 4),
                 "username": user_doc.get("username", ""),
                 "first_name": user_doc.get("first_name", "User"),
-                "started_at": user_doc.get("started_at")
+                "started_at": user_doc.get("started_at"),
+                "referred_by": user_doc.get("referred_by"),
+                "referral_rewarded": bool(user_doc.get("referral_rewarded", False)),
+                "referral_count": int(user_doc.get("referral_count", 0) or 0)
             }
 
     except Exception as e:
@@ -1001,6 +1021,9 @@ class AdminSetMinDogsWithdrawForm(StatesGroup):
 class AdminSetMaxDogsWithdrawForm(StatesGroup):
     amount = State()
 
+class AdminSetReferralRewardForm(StatesGroup):
+    amount = State()
+
 class AdminAddChannelForm(StatesGroup):
     channel = State()
 
@@ -1022,7 +1045,9 @@ def get_user_profile(user_id: int, user_obj: types.User = None):
             "balance": 0.0,
             "dogs_balance": 0.0,
             "username": "",
-            "first_name": "User"
+            "first_name": "User",
+            "referral_count": 0,
+            "referral_rewarded": False
         }
     if user_obj:
         user_data[user_id]["username"] = user_obj.username or ""
@@ -1031,7 +1056,8 @@ def get_user_profile(user_id: int, user_obj: types.User = None):
 
 def get_main_keyboard(user_id: int):
     kb = [
-        [KeyboardButton(text="💎 کیف‌پول من (Wallet)")]
+        [KeyboardButton(text="💎 کیف‌پول من (Wallet)")],
+        [KeyboardButton(text="🤝 دعوت دوستان"), KeyboardButton(text="🏆 لیدربورد")]
     ]
     if is_admin(user_id):
         kb.insert(0, [KeyboardButton(text="⚙️ پنل مدیریت ادمین 👑")])
@@ -1051,11 +1077,83 @@ def get_admin_inline_keyboard():
             [InlineKeyboardButton(text="🐶 گس‌فی برداشت DOGS", callback_data="admin_set_dogs_gas_fee")],
             [InlineKeyboardButton(text="🐶 حداقل برداشت DOGS", callback_data="admin_set_min_dogs_wd"), InlineKeyboardButton(text="🐶 حداکثر برداشت DOGS", callback_data="admin_set_max_dogs_wd")],
             [InlineKeyboardButton(text=("🛑 خاموش‌کردن برداشت DOGS" if dogs_withdrawals_enabled else "✅ روشن‌کردن برداشت DOGS"), callback_data="admin_toggle_dogs_withdrawals")],
+            [InlineKeyboardButton(text=("🛑 خاموش کردن رفرال‌گیری" if referrals_enabled else "✅ روشن کردن رفرال‌گیری"), callback_data="admin_toggle_referrals"), InlineKeyboardButton(text="🎁 تنظیم پاداش رفرال", callback_data="admin_set_referral_reward")],
             [InlineKeyboardButton(text="🧹 صفر کردن موجودی کل کاربران", callback_data="admin_reset_balances")],
             [InlineKeyboardButton(text=withdrawals_btn, callback_data="admin_toggle_withdrawals")],
             [InlineKeyboardButton(text=status_btn, callback_data="admin_toggle_bot"), InlineKeyboardButton(text="📢 همه‌فرستی (Broadcast)", callback_data="admin_broadcast")],
         ]
     )
+
+def parse_referrer_id(command_args):
+    """Parse Telegram deep-link payloads such as /start ref_123."""
+    match = re.fullmatch(r"ref_(\d+)", (command_args or "").strip(), re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+async def process_referral_signup(referred_user_id: int, referrer_id: int) -> bool:
+    """Reward a valid new referral exactly once, atomically in MongoDB."""
+    if not referrals_enabled or not referrer_id or referrer_id == referred_user_id:
+        return False
+    if is_banned(referrer_id) or not await has_started_bot(referrer_id):
+        return False
+
+    reward = round(float(referral_reward_ton), 4)
+    if not math.isfinite(reward) or reward <= 0:
+        return False
+
+    # Make sure the referred user's document exists before the conditional update.
+    await save_user_data(referred_user_id)
+    session = None
+    try:
+        async with referral_lock:
+            session = await mongo_client.start_session()
+            async with session.start_transaction():
+                referred_after = await users_col.find_one_and_update(
+                    {
+                        "user_id": referred_user_id,
+                        "referral_rewarded": {"$ne": True},
+                        "referred_by": {"$exists": False}
+                    },
+                    {
+                        "$set": {
+                            "referred_by": referrer_id,
+                            "referral_rewarded": True
+                        }
+                    },
+                    return_document=ReturnDocument.AFTER,
+                    session=session
+                )
+                if not referred_after:
+                    return False
+
+                referrer_after = await users_col.find_one_and_update(
+                    {"user_id": referrer_id},
+                    {
+                        "$inc": {
+                            "balance": reward,
+                            "referral_count": 1
+                        }
+                    },
+                    return_document=ReturnDocument.AFTER,
+                    session=session
+                )
+                if not referrer_after:
+                    raise RuntimeError("Referrer profile no longer exists")
+
+            referred_profile = get_user_profile(referred_user_id)
+            referred_profile["referred_by"] = referrer_id
+            referred_profile["referral_rewarded"] = True
+            referrer_profile = get_user_profile(referrer_id)
+            referrer_profile["balance"] = round(float(referrer_after.get("balance", 0.0)), 4)
+            referrer_profile["referral_count"] = int(referrer_after.get("referral_count", 0) or 0)
+            return True
+    except Exception as e:
+        logging.error(f"Referral reward failed for {referred_user_id} -> {referrer_id}: {e}")
+        return False
+    finally:
+        if session:
+            await session.end_session()
+
 
 # ==========================================
 # دکمه‌های مربوط به استارت و جوین اجباری
@@ -1088,7 +1186,7 @@ async def check_join_btn_callback(call: types.CallbackQuery, state: FSMContext):
     else:
         await call.answer("⏳ هنوز عضویتت در همه کانال‌ها تأیید نشده؛ یک بار دیگه بررسی کن!", show_alert=True)
 
-async def complete_start_response(message: types.Message, loading_message: types.Message, u_id: int):
+async def complete_start_response(message: types.Message, loading_message: types.Message, u_id: int, referrer_id: int = None):
     """Finish /start after the immediate acknowledgement has already been sent."""
     try:
         if not bot_active and not is_admin(u_id):
@@ -1107,6 +1205,18 @@ async def complete_start_response(message: types.Message, loading_message: types
                 reply_markup=get_join_channel_keyboard()
             )
             return
+
+        if referrer_id:
+            try:
+                referral_added = await process_referral_signup(u_id, referrer_id)
+                if referral_added:
+                    await bot.send_message(
+                        referrer_id,
+                        f"🎉 <b>تبریک!</b> یک نفر با لینک دعوت تو وارد ربات شد و <code>{referral_reward_ton:.4f} TON</code> به کیف‌پولت اضافه شد.",
+                        parse_mode="HTML"
+                    )
+            except Exception as e:
+                logging.warning(f"Referral notification failed for {u_id}: {e}")
 
         await message.answer(
             f"🔥 <b>به Void Giveaway خوش اومدی!</b> آماده‌ای جایزه جمع کنی؟\n"
@@ -1139,13 +1249,78 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
         return
 
     profile = get_user_profile(u_id, message.from_user)
+    is_new_user = not profile.get("started_at")
     profile["started_at"] = profile.get("started_at") or datetime.utcnow().isoformat()
     all_time_users.add(u_id)
+    referrer_id = parse_referrer_id(command.args) if is_new_user else None
 
     # Send the acknowledgement before any database or network check.
     loading_message = await message.answer("⏳ <b>در حال آماده‌سازی ربات...</b>", parse_mode="HTML")
     asyncio.create_task(save_user_data(u_id))
-    asyncio.create_task(complete_start_response(message, loading_message, u_id))
+    asyncio.create_task(complete_start_response(message, loading_message, u_id, referrer_id))
+
+
+@dp.message(F.text == "🤝 دعوت دوستان")
+async def show_referral_menu(message: types.Message):
+    u_id = message.from_user.id
+    if is_banned(u_id):
+        return
+    if not await check_user_subscription(u_id):
+        await message.answer("🔐 برای استفاده از بخش دعوت دوستان، ابتدا در کانال‌های رسمی عضو شو.", reply_markup=get_join_channel_keyboard())
+        return
+
+    bot_username = (await bot.get_me()).username
+    referral_link = f"https://t.me/{bot_username}?start=ref_{u_id}"
+    profile = get_user_profile(u_id, message.from_user)
+    referral_count = int(profile.get("referral_count", 0) or 0)
+    await message.answer(
+        "🤝 <b>دعوت دوستان</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🎁 پاداش هر دعوت موفق: <code>{referral_reward_ton:.4f} TON</code>\n"
+        f"👥 دعوت‌های موفق تو: <code>{referral_count}</code> نفر\n\n"
+        "لینک اختصاصی خودت را برای دوستانت بفرست؛ بعد از ورود کاربر جدید، پاداش به کیف‌پول داخلی تو اضافه می‌شود.\n\n"
+        f"🔗 <code>{referral_link}</code>",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(F.text == "🏆 لیدربورد")
+async def show_leaderboard(message: types.Message):
+    u_id = message.from_user.id
+    if is_banned(u_id):
+        return
+    if not await check_user_subscription(u_id):
+        await message.answer("🔐 برای دیدن لیدربورد، ابتدا در کانال‌های رسمی عضو شو.", reply_markup=get_join_channel_keyboard())
+        return
+
+    ranked_users = [
+        (user_id, profile)
+        for user_id, profile in user_data.items()
+        if user_id not in banned_users
+    ]
+    ranked_users.sort(key=lambda item: float(item[1].get("balance", 0.0) or 0.0), reverse=True)
+    top_users = ranked_users[:5]
+    if not top_users:
+        await message.answer("🏆 هنوز کاربری برای نمایش در لیدربورد وجود ندارد.")
+        return
+
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    rows = []
+    for rank, (user_id, profile) in enumerate(top_users, 1):
+        username = profile.get("username") or ""
+        display_name = f"@{username}" if username else profile.get("first_name") or f"کاربر {user_id}"
+        rows.append(
+            f"{medals[rank - 1]} <b>{html.escape(str(display_name))}</b> — "
+            f"<code>{float(profile.get('balance', 0.0) or 0.0):.4f} TON</code> | "
+            f"<code>{float(profile.get('dogs_balance', 0.0) or 0.0):.2f} DOGS</code>"
+        )
+
+    await message.answer(
+        "🏆 <b>لیدربورد موجودی کاربران</b>\n"
+        "<i>رتبه‌بندی بر اساس موجودی TON است.</i>\n"
+        "━━━━━━━━━━━━━━━━━━\n" + "\n".join(rows),
+        parse_mode="HTML"
+    )
 
 
 # ==========================================
@@ -2110,6 +2285,8 @@ async def open_admin_panel(message: types.Message):
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🤖 <b>وضعیت ربات:</b> {'روشن ✅' if bot_active else 'خاموش/تعمیرات 🛑'}\n"
         f"🚀 <b>برداشت خودکار:</b> {'فعال ✅' if withdrawals_enabled else 'خاموش 🛑'}\n"
+        f"🤝 <b>رفرال‌گیری:</b> {'فعال ✅' if referrals_enabled else 'خاموش 🛑'}\n"
+        f"🎁 <b>پاداش هر رفرال:</b> <code>{referral_reward_ton:.4f} TON</code>\n"
         f"📢 <b>کانال‌های جوین اجباری ({len(required_channels)}):</b> {ch_list_str}\n"
         f"👥 <b>کاربران فعال فعلی:</b> <code>{total_users}</code> نفر\n"
         f"📜 <b>کل کاربران تاریخی:</b> <code>{total_all_time}</code> نفر\n"
@@ -2222,6 +2399,19 @@ async def toggle_withdrawals_callback(call: types.CallbackQuery):
     withdrawals_enabled = not withdrawals_enabled
     await save_data()
     status_msg = "✅ برداشت خودکار روشن شد." if withdrawals_enabled else "🛑 برداشت خودکار خاموش شد."
+    await call.answer(status_msg, show_alert=True)
+    await open_admin_panel(call.message)
+
+
+@dp.callback_query(F.data == "admin_toggle_referrals")
+async def toggle_referrals_callback(call: types.CallbackQuery):
+    global referrals_enabled
+    if not is_admin(call.from_user.id):
+        await call.answer("🛑 شما ادمین نیستید!", show_alert=True)
+        return
+    referrals_enabled = not referrals_enabled
+    await save_data()
+    status_msg = "✅ رفرال‌گیری روشن شد." if referrals_enabled else "🛑 رفرال‌گیری خاموش شد."
     await call.answer(status_msg, show_alert=True)
     await open_admin_panel(call.message)
 
@@ -2436,6 +2626,36 @@ async def process_set_max_wd(message: types.Message, state: FSMContext):
         await message.answer(f"✅ سقف برداشت با موفقیت روی <code>{max_withdraw_amount} TON</code> تنظیم شد 🚀", parse_mode="HTML")
     except ValueError:
         await message.answer("⚠️ لطفاً یک عدد معتبر و قابل قبول وارد کن!")
+
+@dp.callback_query(F.data == "admin_set_referral_reward")
+async def start_set_referral_reward(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminSetReferralRewardForm.amount)
+    await call.message.edit_text(
+        f"🎁 <b>پاداش هر رفرال موفق را به TON وارد کنید.</b>\nمقدار فعلی: <code>{referral_reward_ton} TON</code>",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(AdminSetReferralRewardForm.amount)
+async def process_set_referral_reward(message: types.Message, state: FSMContext):
+    global referral_reward_ton
+    try:
+        amount = float(message.text.strip())
+        if not math.isfinite(amount) or amount <= 0 or amount > 100:
+            raise ValueError
+        referral_reward_ton = round(amount, 4)
+        await save_data()
+        await state.clear()
+        await message.answer(
+            f"✅ پاداش رفرال با موفقیت روی <code>{referral_reward_ton:.4f} TON</code> تنظیم شد.",
+            parse_mode="HTML"
+        )
+    except ValueError:
+        await message.answer("⚠️ مقدار باید عددی معتبر، بیشتر از صفر و حداکثر ۱۰۰ TON باشد.")
+
 
 @dp.callback_query(F.data == "admin_set_gas_fee")
 async def start_set_gas_fee(call: types.CallbackQuery, state: FSMContext):
