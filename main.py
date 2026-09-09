@@ -1509,27 +1509,27 @@ async def wallet_transfer_handler(message: types.Message):
     if not sender or is_banned(sender.id):
         return
     if message.chat.type not in ("group", "supergroup"):
-        await message.answer("ℹ️ انتقال موجودی فقط با reply به یک کاربر در گروه انجام می‌شود.")
+        await message.reply("ℹ️ انتقال موجودی فقط با reply به یک کاربر در گروه انجام می‌شود.")
         return
     if not bot_active and not is_admin(sender.id):
-        await message.answer("🛠️ ربات موقتاً در حال ارتقاست؛ انتقالی انجام نشد.")
+        await message.reply("🛠️ ربات موقتاً در حال ارتقاست؛ انتقالی انجام نشد.")
         return
 
     reply = message.reply_to_message
     recipient = reply.from_user if reply else None
     if not recipient or recipient.is_bot:
-        await message.answer(
+        await message.reply(
             "⚠️ روی پیام کاربر مقصد reply کن و بنویس: <code>wallet 100 dogs</code> یا <code>wallet 0.01 ton</code>",
             parse_mode="HTML"
         )
         return
     if recipient.id == sender.id:
-        await message.answer("⚠️ انتقال موجودی به خودت امکان‌پذیر نیست.")
+        await message.reply("⚠️ انتقال موجودی به خودت امکان‌پذیر نیست.")
         return
 
     parts = re.split(r"\s+", (message.text or "").strip())
     if len(parts) not in (2, 3):
-        await message.answer(
+        await message.reply(
             "⚠️ فرمت صحیح: <code>wallet 100 dogs</code> یا <code>wallet 0.01 ton</code>",
             parse_mode="HTML"
         )
@@ -1547,16 +1547,16 @@ async def wallet_transfer_handler(message: types.Message):
         asset = "TON"
         amount = round(amount, 4)
     else:
-        await message.answer("⚠️ واحد معتبر فقط TON یا DOGS است.")
+        await message.reply("⚠️ واحد معتبر فقط TON یا DOGS است.")
         return
 
     if not math.isfinite(amount) or amount <= 0:
-        await message.answer("⚠️ مقدار انتقال باید یک عدد مثبت باشد.")
+        await message.reply("⚠️ مقدار انتقال باید یک عدد مثبت باشد.")
         return
 
     if not await has_started_bot(recipient.id):
         target_name = html.escape(recipient.full_name or "کاربر")
-        await message.answer(
+        await message.reply(
             f"⚠️ <a href=\"tg://user?id={recipient.id}\">{target_name}</a> هنوز ربات را Start نکرده است.\n"
             "ابتدا در خصوصی ربات دستور /start را بفرستد؛ هیچ مبلغی کم نشد.",
             parse_mode="HTML"
@@ -1568,10 +1568,10 @@ async def wallet_transfer_handler(message: types.Message):
     )
     unit = asset
     if result == "insufficient_balance":
-        await message.answer(f"💰 موجودی {unit} برای این انتقال کافی نیست؛ هیچ مبلغی کم نشد.")
+        await message.reply(f"💰 موجودی {unit} برای این انتقال کافی نیست؛ هیچ مبلغی کم نشد.")
         return
     if result != "ok":
-        await message.answer("⚠️ انتقال انجام نشد و موجودی‌ها تغییر نکردند. دوباره تلاش کن.")
+        await message.reply("⚠️ انتقال انجام نشد و موجودی‌ها تغییر نکردند. دوباره تلاش کن.")
         return
 
     sender_name = html.escape(sender.full_name or "کاربر")
@@ -1583,7 +1583,7 @@ async def wallet_transfer_handler(message: types.Message):
         f"🎁 گیرنده: {recipient_name}\n"
         f"💎 مبلغ: <code>{amount:.4f} {unit}</code>"
     )
-    await message.answer(group_text, parse_mode="HTML")
+    await message.reply(group_text, parse_mode="HTML")
     try:
         await bot.send_message(
             recipient.id,
