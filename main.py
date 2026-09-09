@@ -1,5 +1,5 @@
 # ==========================================
-# Void Giveaway Bot - Version 6.1.0 (Fully Automatic TON Withdrawals)
+# Void Giveaway Bot - Version 6.2.0 (Fully Automatic TON Withdrawals)
 # (Multi-Channel Forced Join, Live Wallet Tracker, Direct Admin DM, Ban System, MongoDB Integrated)
 # ==========================================
 
@@ -39,7 +39,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "⚡ Void Giveaway Bot (v6.1.0) is running smoothly!"
+    return "⚡ Void Giveaway Bot (v6.2.0) is running smoothly!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -52,7 +52,7 @@ def keep_alive():
 
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = [6879499219]
-BOT_VERSION = "6.1.0"
+BOT_VERSION = "6.2.0"
 WITHDRAW_CHANNEL = "@voidwithraw"
 WALLET_TRACKER_CHANNEL = "@Voidchanneloffical"  # کانال ارسال و بروزرسانی خودکار موجودی ولت سیستم
 TON_MNEMONIC = os.environ.get("TON_MNEMONIC")
@@ -88,17 +88,20 @@ CRYPTO_PRICE_CACHE_TTL = 60
 crypto_price_cache = {}
 crypto_price_rate_limit = {}
 CRYPTO_PRICE_COINS = {
-    "TON": ("the-open-network", "TON"),
-    "DOGS": ("dogs-2", "DOGS"),
-    "BTC": ("bitcoin", "BTC"),
-    "ETH": ("ethereum", "ETH"),
-    "USDT": ("tether", "USDT"),
-    "SOL": ("solana", "SOL"),
-    "BNB": ("binancecoin", "BNB"),
-    "NOT": ("notcoin", "NOT"),
-    "TRX": ("tron", "TRX"),
-    "XRP": ("ripple", "XRP"),
+    # نمادهای بازار عمومی؛ برای دریافت قیمت به کلید API نیاز ندارند.
+    "TON": ("TONUSDT", "TON-USDT", "TON"),
+    "DOGS": ("DOGSUSDT", "DOGS-USDT", "DOGS"),
+    "BTC": ("BTCUSDT", "BTC-USDT", "BTC"),
+    "ETH": ("ETHUSDT", "ETH-USDT", "ETH"),
+    "USDT": (None, None, "USDT"),
+    "SOL": ("SOLUSDT", "SOL-USDT", "SOL"),
+    "BNB": ("BNBUSDT", "BNB-USDT", "BNB"),
+    "NOT": ("NOTUSDT", "NOT-USDT", "NOT"),
+    "TRX": ("TRXUSDT", "TRX-USDT", "TRX"),
+    "XRP": ("XRPUSDT", "XRP-USDT", "XRP"),
 }
+USD_TO_TOMAN_CACHE_TTL = 60
+usd_to_toman_cache = {}
 
 
 bot_active = True
@@ -1126,49 +1129,135 @@ def format_crypto_price(value: float) -> str:
     return f"{value:,.8f}"
 
 
-async def fetch_crypto_price(symbol: str):
-    normalized = (symbol or "").strip().upper().lstrip("$")
-    coin_info = CRYPTO_PRICE_COINS.get(normalized)
-    if not coin_info:
+async def fetch_usd_to_toman():
+    """Read the public USDT/IRT market rate from a public exchange feed."""
+    now = time.monotonic()
+    cached = usd_to_toman_cache.get("USDTIRT")
+    if cached and now - cached["fetched_at"] < USD_TO_TOMAN_CACHE_TTL:
+        return cached["value"]
+
+    endpoint = "https://api.nobitex.ir/v2/orderbook/USDTIRT"
+
+    def request_rate():
+        request = Request(
+            endpoint,
+            headers={"Accept": "application/json", "User-Agent": "VoidGiveawayBot/6.2"}
+        )
+        with urlopen(request, timeout=8) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def level_price(level):
+        try:
+            if isinstance(level, (list, tuple)):
+                return float(level[0])
+            if isinstance(level, dict):
+                return float(level.get("price"))
+        except (TypeError, ValueError, KeyError):
+            return None
         return None
 
-    coin_id, display_symbol = coin_info
+    try:
+        payload = await asyncio.to_thread(request_rate)
+        bids = [level_price(level) for level in (payload.get("bids") or [])]
+        asks = [level_price(level) for level in (payload.get("asks") or [])]
+        bids = [value for value in bids if value and value > 0]
+        asks = [value for value in asks if value and value > 0]
+        if not bids and not asks:
+            return None
+        if bids and asks:
+            rate = (bids[0] + asks[0]) / 2
+        else:
+            rate = (bids or asks)[0]
+        usd_to_toman_cache["USDTIRT"] = {"fetched_at": time.monotonic(), "value": rate}
+        return rate
+    except Exception as e:
+        logging.warning(f"USD to toman request failed: {e}")
+        return None
+
+
+def tradingview_chart_url(symbol: str):
+    market_info = CRYPTO_PRICE_COINS.get((symbol or "").strip().upper().lstrip("$"))
+    if not market_info or not market_info[0]:
+        return None
+    return f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{quote(market_info[0], safe='')}"
+
+
+def tradingview_keyboard(data):
+    chart_url = data.get("chart_url") if data else None
+    if not chart_url:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📈 باز کردن چارت TradingView", url=chart_url)
+    ]])
+
+
+async def fetch_crypto_price(symbol: str):
+    normalized = (symbol or "").strip().upper().lstrip("$")
+    market_info = CRYPTO_PRICE_COINS.get(normalized)
+    if not market_info:
+        return None
+
+    binance_symbol, okx_symbol, display_symbol = market_info
     now = time.monotonic()
     cached = crypto_price_cache.get(normalized)
     if cached and now - cached["fetched_at"] < CRYPTO_PRICE_CACHE_TTL:
         return cached["data"]
 
-    endpoint = (
-        "https://api.coingecko.com/api/v3/simple/price"
-        f"?ids={quote(coin_id, safe='')}&vs_currencies=usd,irr&include_24hr_change=true"
-    )
+    market_price = None
+    price_source = None
 
-    def request_price():
-        request = Request(
-            endpoint,
-            headers={"Accept": "application/json", "User-Agent": "VoidGiveawayBot/6.1"}
-        )
-        with urlopen(request, timeout=8) as response:
-            return json.loads(response.read().decode("utf-8"))
+    if normalized == "USDT":
+        market_price = (1.0, 0.0)
+        price_source = "ثابت USDT"
+    else:
+        providers = [
+            ("Binance", f"https://api.binance.com/api/v3/ticker/24hr?symbol={quote(binance_symbol, safe='')}")
+        ]
+        if okx_symbol:
+            providers.append(("OKX", f"https://www.okx.com/api/v5/market/ticker?instId={quote(okx_symbol, safe='')}"))
 
-    try:
-        payload = await asyncio.to_thread(request_price)
-        coin_data = payload.get(coin_id) or {}
-        usd_price = coin_data.get("usd")
-        if usd_price is None:
-            return None
-        data = {
-            "symbol": display_symbol,
-            "price": float(usd_price),
-            "change_24h": coin_data.get("usd_24h_change"),
-            "toman": (float(coin_data["irr"]) / 10 if coin_data.get("irr") is not None else None),
-        }
-        crypto_price_cache[normalized] = {"fetched_at": time.monotonic(), "data": data}
-        return data
-    except Exception as e:
-        logging.warning(f"Crypto price request failed for {normalized}: {e}")
+        for provider_name, endpoint in providers:
+            def request_market():
+                request = Request(
+                    endpoint,
+                    headers={"Accept": "application/json", "User-Agent": "VoidGiveawayBot/6.2"}
+                )
+                with urlopen(request, timeout=8) as response:
+                    return json.loads(response.read().decode("utf-8"))
+
+            try:
+                payload = await asyncio.to_thread(request_market)
+                if provider_name == "Binance":
+                    usd_price = float(payload["lastPrice"])
+                    change_24h = float(payload.get("priceChangePercent") or 0)
+                else:
+                    row = (payload.get("data") or [])[0]
+                    usd_price = float(row["last"])
+                    open_24h = float(row.get("open24h") or 0)
+                    change_24h = ((usd_price - open_24h) / open_24h * 100) if open_24h else 0.0
+                if usd_price > 0:
+                    market_price = (usd_price, change_24h)
+                    price_source = provider_name
+                    break
+            except Exception as e:
+                logging.warning(f"{provider_name} price request failed for {normalized}: {e}")
+
+    if not market_price:
         return None
 
+    usd_price, change_24h = market_price
+    toman_rate = await fetch_usd_to_toman()
+    data = {
+        "symbol": display_symbol,
+        "price": usd_price,
+        "change_24h": change_24h,
+        "toman": (usd_price * toman_rate if toman_rate is not None else None),
+        "price_source": price_source,
+        "toman_source": "Nobitex" if toman_rate is not None else None,
+        "chart_url": tradingview_chart_url(normalized),
+    }
+    crypto_price_cache[normalized] = {"fetched_at": time.monotonic(), "data": data}
+    return data
 
 def get_admin_inline_keyboard():
     status_btn = "🛑 خاموش کردن ربات" if bot_active else "✅ روشن کردن ربات"
@@ -1421,9 +1510,10 @@ async def crypto_price_handler(message: types.Message, command: CommandObject):
         f"💵 <b>USD {format_crypto_price(data['price'])}</b>\n"
         f"{change_text}\n\n"
         "🕒 داده‌ها هر ۶۰ ثانیه تازه می‌شوند.\n"
-        "🔗 منبع: CoinGecko",
+        f"🔗 منبع قیمت: {data['price_source']} | نرخ تومان: {data.get('toman_source') or 'در دسترس نیست'}",
         parse_mode="HTML",
-        disable_web_page_preview=True
+        disable_web_page_preview=True,
+        reply_markup=tradingview_keyboard(data)
     )
 
 
@@ -1517,6 +1607,7 @@ async def natural_crypto_price_handler(message: types.Message):
         await message.answer("⚠️ قیمت این ارز فعلاً از سرویس بازار دریافت نشد؛ کمی بعد دوباره امتحان کن.")
         return
 
+    chart_data = data[0]
     amount = parsed["amount"]
     if parsed["is_toman"]:
         if len(data) != 1 or data[0].get("toman") is None:
@@ -1560,9 +1651,10 @@ async def natural_crypto_price_handler(message: types.Message):
         )
 
     await message.answer(
-        reply + "\n\n🕒 داده‌ها حداکثر هر ۶۰ ثانیه تازه می‌شوند.\n🔗 منبع: CoinGecko",
+        reply + "\n\n🕒 داده‌ها حداکثر هر ۶۰ ثانیه تازه می‌شوند.\n🔗 منبع قیمت: Binance / OKX | نرخ تومان: Nobitex",
         parse_mode="HTML",
-        disable_web_page_preview=True
+        disable_web_page_preview=True,
+        reply_markup=tradingview_keyboard(chart_data)
     )
 
 
