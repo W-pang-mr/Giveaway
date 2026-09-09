@@ -1068,18 +1068,18 @@ def get_user_profile(user_id: int, user_obj: types.User = None):
 
 def get_main_keyboard(user_id: int):
     kb = [
-        [KeyboardButton(text="💎 کیف‌پول من (Wallet)")],
-        [KeyboardButton(text="🤝 دعوت دوستان"), KeyboardButton(text="🏆 لیدربورد")]
+        [KeyboardButton(text="💎 کیف‌پول من")],
+        [KeyboardButton(text="🎁 دعوت دوستان"), KeyboardButton(text="🏆 رتبه‌بندی")]
     ]
     if is_admin(user_id):
-        kb.insert(0, [KeyboardButton(text="⚙️ پنل مدیریت ادمین 👑")])
+        kb.insert(0, [KeyboardButton(text="🛠 پنل فرماندهی 👑")])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 
 
 def get_referral_contact_keyboard():
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 ارسال شماره برای تأیید", request_contact=True)]],
+        keyboard=[[KeyboardButton(text="📱 تأیید شماره و دریافت جایزه", request_contact=True)]],
         resize_keyboard=True,
         one_time_keyboard=True
     )
@@ -1089,19 +1089,19 @@ def get_admin_inline_keyboard():
     withdrawals_btn = "🛑 خاموش کردن برداشت‌ها" if withdrawals_enabled else "✅ روشن کردن برداشت‌ها"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="➕ افزودن کانال اجباری", callback_data="admin_add_channel"), InlineKeyboardButton(text="➖ حذف کانال اجباری", callback_data="admin_remove_channel")],
-            [InlineKeyboardButton(text="👥 جستجوی کاربر", callback_data="admin_search_user"), InlineKeyboardButton(text="➕/➖ تغییر موجودی", callback_data="admin_edit_balance")],
-            [InlineKeyboardButton(text="💬 ارسال پیام مستقیم", callback_data="admin_direct_msg")],
-            [InlineKeyboardButton(text="🚫 بن کردن کاربر", callback_data="admin_ban_user"), InlineKeyboardButton(text="🟢 آن‌بن کاربر", callback_data="admin_unban_user")],
-            [InlineKeyboardButton(text="⚙️ حداقل برداشت", callback_data="admin_set_min_wd"), InlineKeyboardButton(text="🔝 حداکثر برداشت", callback_data="admin_set_max_wd")],
-            [InlineKeyboardButton(text="⛽️ تنظیم گس‌فی شبکه TON", callback_data="admin_set_gas_fee")],
-            [InlineKeyboardButton(text="🐶 گس‌فی برداشت DOGS", callback_data="admin_set_dogs_gas_fee")],
+            [InlineKeyboardButton(text="➕ افزودن کانال", callback_data="admin_add_channel"), InlineKeyboardButton(text="➖ حذف کانال", callback_data="admin_remove_channel")],
+            [InlineKeyboardButton(text="🔎 جستجوی کاربر", callback_data="admin_search_user"), InlineKeyboardButton(text="💰 ویرایش موجودی", callback_data="admin_edit_balance")],
+            [InlineKeyboardButton(text="💬 پیام مستقیم", callback_data="admin_direct_msg")],
+            [InlineKeyboardButton(text="⛔ مسدودکردن کاربر", callback_data="admin_ban_user"), InlineKeyboardButton(text="✅ رفع مسدودی", callback_data="admin_unban_user")],
+            [InlineKeyboardButton(text="⚙️ حداقل برداشت TON", callback_data="admin_set_min_wd"), InlineKeyboardButton(text="🔝 سقف برداشت TON", callback_data="admin_set_max_wd")],
+            [InlineKeyboardButton(text="⛽️ کارمزد شبکه TON", callback_data="admin_set_gas_fee")],
+            [InlineKeyboardButton(text="🐶 کارمزد برداشت DOGS", callback_data="admin_set_dogs_gas_fee")],
             [InlineKeyboardButton(text="🐶 حداقل برداشت DOGS", callback_data="admin_set_min_dogs_wd"), InlineKeyboardButton(text="🐶 حداکثر برداشت DOGS", callback_data="admin_set_max_dogs_wd")],
             [InlineKeyboardButton(text=("🛑 خاموش‌کردن برداشت DOGS" if dogs_withdrawals_enabled else "✅ روشن‌کردن برداشت DOGS"), callback_data="admin_toggle_dogs_withdrawals")],
             [InlineKeyboardButton(text=("🛑 خاموش کردن رفرال‌گیری" if referrals_enabled else "✅ روشن کردن رفرال‌گیری"), callback_data="admin_toggle_referrals"), InlineKeyboardButton(text="🎁 تنظیم پاداش رفرال", callback_data="admin_set_referral_reward")],
-            [InlineKeyboardButton(text="🧹 صفر کردن موجودی کل کاربران", callback_data="admin_reset_balances")],
+            [InlineKeyboardButton(text="🧹 صفرکردن موجودی‌ها", callback_data="admin_reset_balances")],
             [InlineKeyboardButton(text=withdrawals_btn, callback_data="admin_toggle_withdrawals")],
-            [InlineKeyboardButton(text=status_btn, callback_data="admin_toggle_bot"), InlineKeyboardButton(text="📢 همه‌فرستی (Broadcast)", callback_data="admin_broadcast")],
+            [InlineKeyboardButton(text=status_btn, callback_data="admin_toggle_bot"), InlineKeyboardButton(text="📢 ارسال همگانی", callback_data="admin_broadcast")],
         ]
     )
 
@@ -1207,10 +1207,10 @@ async def check_join_btn_callback(call: types.CallbackQuery, state: FSMContext):
             )
             return
         await call.message.answer(
-            f"🔥 <b>به Void Giveaway خوش اومدی!</b> آماده‌ای جایزه جمع کنی؟\n"
-            f"🧩 <b>نسخه فعال:</b> <code>{BOT_VERSION}</code> 💎\n\n"
+            f"🚀 <b>به Void Giveaway خوش اومدی!</b>\nاینجا هر دعوت و هر فعالیت می‌تونه موجودی واقعی TON و DOGS بسازه.\n"
+            f"⚡ <b>نسخه فعال:</b> <code>{BOT_VERSION}</code> | سریع، شفاف و آماده\n\n"
 
-            f"از منوی زیر استفاده کن و موجودی، برداشت و دعوت‌هات رو مدیریت کن 👇",
+            f"از منوی زیر شروع کن؛ موجودی، جایزه‌ها و برداشت‌هات همین‌جا مدیریت می‌شن 👇",
             parse_mode="HTML",
             reply_markup=get_main_keyboard(u_id)
         )
@@ -1230,8 +1230,8 @@ async def complete_start_response(message: types.Message, loading_message: types
         is_subscribed = await check_user_subscription(u_id)
         if not is_subscribed:
             await loading_message.edit_text(
-                f"🌟 <b>برای ورود به دنیای جایزه‌ها، ابتدا در کانال‌های رسمی ما عضو شو.</b>\n\n"
-                f"✅ بعد از عضویت در همه کانال‌ها، روی «✅ بررسی عضویت / ورود» بزن تا جایزه‌ها برات فعال بشه!",
+                f"🌟 <b>برای فعال‌شدن جایزه‌ها، اول عضو کانال‌های رسمی Void شو.</b>\n\n"
+                f"✅ بعد از عضویت، روی «✅ بررسی عضویت / ورود» بزن تا وارد ربات بشی.",
                 parse_mode="HTML",
                 reply_markup=get_join_channel_keyboard()
             )
@@ -1255,9 +1255,9 @@ async def complete_start_response(message: types.Message, loading_message: types
             return
 
         await message.answer(
-            f"🔥 <b>به Void Giveaway خوش اومدی!</b> آماده‌ای جایزه جمع کنی؟\n"
+            f"🚀 <b>به Void Giveaway خوش اومدی!</b>\nاینجا هر دعوت و هر فعالیت می‌تونه موجودی واقعی TON و DOGS بسازه.\n"
             f"🧩 <b>نسخه فعال:</b> <code>v6.1.0</code> 💎\n\n"
-            f"از منوی زیر استفاده کن و موجودی، برداشت و دعوت‌هات رو مدیریت کن 👇",
+            f"از منوی زیر شروع کن؛ موجودی، جایزه‌ها و برداشت‌هات همین‌جا مدیریت می‌شن 👇",
             parse_mode="HTML",
             reply_markup=get_main_keyboard(u_id)
         )
@@ -1303,7 +1303,7 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
     asyncio.create_task(complete_start_response(message, loading_message, u_id, referrer_id))
 
 
-@dp.message(F.text == "🤝 دعوت دوستان")
+@dp.message(F.text == "🎁 دعوت دوستان")
 async def show_referral_menu(message: types.Message):
     u_id = message.from_user.id
     if is_banned(u_id):
@@ -1317,17 +1317,17 @@ async def show_referral_menu(message: types.Message):
     profile = get_user_profile(u_id, message.from_user)
     referral_count = int(profile.get("referral_count", 0) or 0)
     await message.answer(
-        "🤝 <b>دعوت دوستان</b>\n"
+        "🎁 <b>دعوت کن، جایزه بگیر</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"🎁 پاداش هر دعوت موفق: <code>{referral_reward_ton:.4f} TON</code>\n"
-        f"👥 دعوت‌های موفق تو: <code>{referral_count}</code> نفر\n\n"
-        "لینک اختصاصی خودت را برای دوستانت بفرست؛ بعد از ورود کاربر جدید، پاداش به کیف‌پول داخلی تو اضافه می‌شود.\n\n"
+        f"💎 پاداش هر دعوت موفق: <code>{referral_reward_ton:.4f} TON</code>\n"
+        f"👥 دعوت‌های موفق: <code>{referral_count}</code> نفر\n\n"
+        "لینک اختصاصی‌ات را بفرست. وقتی دوستت وارد شود و شرایط را کامل کند، پاداش مستقیم به موجودی داخلی تو می‌آید.\n\n"
         f"🔗 <code>{referral_link}</code>",
         parse_mode="HTML"
     )
 
 
-@dp.message(F.text == "🏆 لیدربورد")
+@dp.message(F.text == "🏆 رتبه‌بندی")
 async def show_leaderboard(message: types.Message):
     u_id = message.from_user.id
     if is_banned(u_id):
@@ -1359,8 +1359,8 @@ async def show_leaderboard(message: types.Message):
         )
 
     await message.answer(
-        "🏆 <b>لیدربورد موجودی کاربران</b>\n"
-        "<i>رتبه‌بندی بر اساس موجودی TON است.</i>\n"
+        "🏆 <b>رتبه‌بندی برترین‌ها</b>\n"
+        "<i>رتبه‌ها بر اساس موجودی TON محاسبه می‌شوند.</i>\n"
         "━━━━━━━━━━━━━━━━━━\n" + "\n".join(rows),
         parse_mode="HTML"
     )
@@ -1711,7 +1711,7 @@ async def reject_withdrawal_without_refund(withdrawal_id: str, reason: str) -> b
     return bool(rejected)
 
 
-@dp.message(F.text == "💎 کیف‌پول من (Wallet)")
+@dp.message(F.text == "💎 کیف‌پول من")
 async def show_wallet(message: types.Message, user_id: int = None):
     u_id = user_id or message.from_user.id
     if is_banned(u_id):
@@ -1726,17 +1726,17 @@ async def show_wallet(message: types.Message, user_id: int = None):
 
     prof = get_user_profile(u_id, message.from_user)
     text = (
-        f"💎 <b>داشبورد کیف‌پول تو</b> 🔥\n━━━━━━━━━━━━━━━━━━\n"
+        f"💎 <b>داشبورد کیف‌پول</b>\n━━━━━━━━━━━━━━━━━━\n🔐 موجودی‌ها داخلی و قابل پیگیری هستند.\n\n"
         f"💰 <b>موجودی TON:</b> <code>{prof['balance']:.4f} TON</code>\n"
         f"🐶 <b>موجودی DOGS:</b> <code>{prof.get('dogs_balance', 0.0):.4f} DOGS</code>\n"
-        f"⚡️ <b>کارمزد برداشت TON:</b> <code>{ton_gas_fee} TON</code>\n"
-        f"🐶 <b>کارمزد برداشت DOGS:</b> <code>{dogs_gas_fee_ton} TON</code>\n"
+        f"⛽️ <b>کارمزد شبکه TON:</b> <code>{ton_gas_fee} TON</code>\n"
+        f"🐶 <b>کارمزد شبکه برداشت DOGS:</b> <code>{dogs_gas_fee_ton} TON</code>\n"
         f"🔻 <b>حداقل/حداکثر TON:</b> <code>{min_withdraw_amount} / {max_withdraw_amount}</code>\n"
         f"🔻 <b>حداقل/حداکثر DOGS:</b> <code>{dogs_min_withdraw_amount} / {dogs_max_withdraw_amount}</code>\n━━━━━━━━━━━━━━━━━━"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="➕ واریز TON", callback_data="start_deposit"), InlineKeyboardButton(text="🐶 واریز DOGS", callback_data="start_dogs_deposit")],
+            [InlineKeyboardButton(text="⚡ واریز سریع TON", callback_data="start_deposit"), InlineKeyboardButton(text="⚡ واریز سریع DOGS", callback_data="start_dogs_deposit")],
             [InlineKeyboardButton(text="🚀 برداشت TON", callback_data="start_withdraw"), InlineKeyboardButton(text="🐶 برداشت DOGS", callback_data="start_dogs_withdraw")]
         ]
     ))
@@ -2226,7 +2226,7 @@ async def start_deposit_callback(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
     await state.set_state(DepositForm.amount)
     await call.message.answer(
-        f"💎 مقدار TON موردنظرت برای واریز را وارد کن.\nحداقل واریز: <code>{min_deposit_amount:.4f} TON</code>",
+        f"⚡ <b>واریز سریع TON</b>\nمبلغی که می‌خواهی واریز کنی را بفرست.\nحداقل واریز: <code>{min_deposit_amount:.4f} TON</code>",
         parse_mode="HTML"
     )
 
@@ -2236,16 +2236,16 @@ async def process_deposit_amount(message: types.Message, state: FSMContext):
     try:
         amount = round(float((message.text or "").strip()), 4)
     except (ValueError, AttributeError):
-        await message.answer("⚠️ لطفاً مقدار معتبر TON وارد کن.")
+        await message.answer("⚠️ مقدار TON درست نیست؛ یک عدد معتبر وارد کن.")
         return
     if not math.isfinite(amount) or amount < min_deposit_amount:
-        await message.answer(f"⚠️ حداقل واریز <code>{min_deposit_amount:.4f} TON</code> است.", parse_mode="HTML")
+        await message.answer(f"⚠️ مبلغ کمتر از حداقل واریز است: <code>{min_deposit_amount:.4f} TON</code>", parse_mode="HTML")
         return
 
     wallet_address = await get_system_wallet_address()
     if not wallet_address:
         await state.clear()
-        await message.answer("⚠️ آدرس ولت مرکزی فعلاً قابل دریافت نیست؛ بعداً دوباره تلاش کن.")
+        await message.answer("⚠️ کیف‌پول اصلی موقتاً در دسترس نیست؛ چند لحظه بعد دوباره امتحان کن.")
         return
 
     memo = get_deposit_memo(message.from_user.id)
@@ -2253,15 +2253,15 @@ async def process_deposit_amount(message: types.Message, state: FSMContext):
     ton_link = f"ton://transfer/{wallet_address}?amount={amount_nano}&text={quote(memo)}"
     await state.clear()
     await message.answer(
-        "💳 <b>واریز TON آماده است</b>\n\n"
+        "✅ <b>واریز TON آماده‌ست</b>\n\n"
         f"💎 مبلغ: <code>{amount:.4f} TON</code>\n"
-        f"📬 آدرس مرکزی: <code>{html.escape(wallet_address)}</code>\n"
-        f"🧾 کد شناسایی واریز: <code>{memo}</code>\n\n"
-        "با دکمه زیر کیف‌پولت را باز کن و تراکنش را تأیید کن. حتماً memo را تغییر نده؛ ربات بعد از ثبت تراکنش آن را خودکار به موجودی تو اضافه می‌کند.",
+        f"📬 آدرس کیف‌پول اصلی: <code>{html.escape(wallet_address)}</code>\n"
+        f"🧾 Memo اختصاصی: <code>{memo}</code>\n\n"
+        "با دکمه زیر کیف‌پولت را باز کن و تراکنش را تأیید کن. Memo را تغییر نده؛ سیستم بعد از تأیید شبکه، موجودی‌ات را خودکار شارژ می‌کند.",
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💳 بازکردن کیف‌پول و تأیید واریز", url=ton_link)]
+            [InlineKeyboardButton(text="💳 بازکردن کیف‌پول و پرداخت", url=ton_link)]
         ])
     )
 
@@ -2289,8 +2289,8 @@ async def start_dogs_deposit_callback(call: types.CallbackQuery, state: FSMConte
     await call.answer()
     await state.set_state(DogsDepositForm.amount)
     await call.message.answer(
-        "🐶 <b>مقدار DOGS برای واریز را وارد کن.</b>\n"
-        "لینک امن واریز با memo اختصاصی تو ساخته می‌شود.",
+        "🐶 <b>واریز سریع DOGS</b>\nمقدار DOGS موردنظر را وارد کن.\n"
+        "لینک پرداخت با Memo اختصاصی تو ساخته می‌شود؛ Memo را دست‌کاری نکن.",
         parse_mode="HTML"
     )
 
@@ -2299,10 +2299,10 @@ async def process_dogs_deposit_amount(message: types.Message, state: FSMContext)
     try:
         amount = round(float((message.text or "").strip()), 4)
     except (ValueError, AttributeError):
-        await message.answer("⚠️ لطفاً مقدار معتبر DOGS وارد کن.")
+        await message.answer("⚠️ مقدار DOGS درست نیست؛ یک عدد معتبر وارد کن.")
         return
     if not math.isfinite(amount) or amount <= 0:
-        await message.answer("⚠️ مقدار DOGS باید بیشتر از صفر باشد.")
+        await message.answer("⚠️ مقدار DOGS باید بیشتر از صفر باشد؛ دوباره امتحان کن.")
         return
 
     amount_units = int(round(amount * 10 ** DOGS_DECIMALS))
@@ -2328,16 +2328,16 @@ async def process_dogs_deposit_amount(message: types.Message, state: FSMContext)
 
     await state.clear()
     await message.answer(
-        "🐶 <b>واریز DOGS آماده است</b>\n\n"
-        f"🐶 مبلغ: <code>{amount:.4f} DOGS</code>\n"
-        f"🧾 Memo: <code>{memo}</code>\n"
+        "✅ <b>واریز DOGS آماده‌ست</b>\n\n"
+        f"💰 مبلغ: <code>{amount:.4f} DOGS</code>\n"
+        f"🧾 Memo اختصاصی: <code>{memo}</code>\n"
         f"📬 ولت مالک مرکزی: <code>{html.escape(owner_address)}</code>\n"
         f"🧩 Jetton Wallet دریافت‌کننده: <code>{html.escape(dogs_wallet)}</code>\n\n"
-        "memo را تغییر نده؛ بعد از ثبت تراکنش، واریز خودکار به موجودی اضافه می‌شود.",
+        "Memo را تغییر نده؛ بعد از تأیید شبکه، واریز خودکار به موجودی‌ات اضافه می‌شود.",
         parse_mode="HTML", disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🐶 بازکردن Tonkeeper", url=tonkeeper_link)],
-            [InlineKeyboardButton(text="📲 بازکردن کیف‌پول TON", url=ton_uri)],
+            [InlineKeyboardButton(text="🐶 پرداخت با Tonkeeper", url=tonkeeper_link)],
+            [InlineKeyboardButton(text="📲 بازکردن کیف‌پول", url=ton_uri)],
             [InlineKeyboardButton(text="🔙 بازگشت به کیف‌پول", callback_data="back_to_wallet")]
         ])
     )
@@ -2355,7 +2355,7 @@ async def back_to_wallet_callback(call: types.CallbackQuery):
 # ==========================================
 # پنل مدیریت پیشرفته ادمین
 # ==========================================
-@dp.message(F.text == "⚙️ پنل مدیریت ادمین 👑")
+@dp.message(F.text == "🛠 پنل فرماندهی 👑")
 async def open_admin_panel(message: types.Message):
     if not is_admin(message.from_user.id):
         return
