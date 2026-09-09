@@ -861,12 +861,16 @@ async def save_data():
                 "username": info.get("username", ""),
                 "first_name": info.get("first_name", "User"),
                 "referral_count": int(info.get("referral_count", 0) or 0),
-                "referral_rewarded": bool(info.get("referral_rewarded", False))
+                "referral_rewarded": bool(info.get("referral_rewarded", False)),
+                "pending_referrer_id": info.get("pending_referrer_id"),
+                "phone_verified": bool(info.get("phone_verified", False))
             }
             if info.get("started_at"):
                 user_doc["started_at"] = info["started_at"]
             if info.get("referred_by") is not None:
                 user_doc["referred_by"] = int(info["referred_by"])
+            user_doc["pending_referrer_id"] = info.get("pending_referrer_id")
+            user_doc["phone_verified"] = bool(info.get("phone_verified", False))
             await users_col.update_one({"user_id": u_id}, {"$set": user_doc}, upsert=True)
 
         settings_doc = {
@@ -905,12 +909,16 @@ async def save_user_data(user_id: int):
             "username": info.get("username", ""),
             "first_name": info.get("first_name", "User"),
             "referral_count": int(info.get("referral_count", 0) or 0),
-            "referral_rewarded": bool(info.get("referral_rewarded", False))
+            "referral_rewarded": bool(info.get("referral_rewarded", False)),
+            "pending_referrer_id": info.get("pending_referrer_id"),
+            "phone_verified": bool(info.get("phone_verified", False))
         }
         if info.get("started_at"):
             user_doc["started_at"] = info["started_at"]
         if info.get("referred_by") is not None:
             user_doc["referred_by"] = int(info["referred_by"])
+        user_doc["pending_referrer_id"] = info.get("pending_referrer_id")
+        user_doc["phone_verified"] = bool(info.get("phone_verified", False))
         await users_col.update_one({"user_id": user_id}, {"$set": user_doc}, upsert=True)
         await settings_col.update_one(
             {"setting_id": "global_config"},
@@ -959,7 +967,9 @@ async def load_data():
                 "started_at": user_doc.get("started_at"),
                 "referred_by": user_doc.get("referred_by"),
                 "referral_rewarded": bool(user_doc.get("referral_rewarded", False)),
-                "referral_count": int(user_doc.get("referral_count", 0) or 0)
+                "referral_count": int(user_doc.get("referral_count", 0) or 0),
+                "pending_referrer_id": user_doc.get("pending_referrer_id"),
+                "phone_verified": bool(user_doc.get("phone_verified", False))
             }
 
     except Exception as e:
@@ -1047,7 +1057,9 @@ def get_user_profile(user_id: int, user_obj: types.User = None):
             "username": "",
             "first_name": "User",
             "referral_count": 0,
-            "referral_rewarded": False
+            "referral_rewarded": False,
+            "pending_referrer_id": None,
+            "phone_verified": False
         }
     if user_obj:
         user_data[user_id]["username"] = user_obj.username or ""
@@ -1062,6 +1074,15 @@ def get_main_keyboard(user_id: int):
     if is_admin(user_id):
         kb.insert(0, [KeyboardButton(text="⚙️ پنل مدیریت ادمین 👑")])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+
+
+def get_referral_contact_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 ارسال شماره برای تأیید", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
 
 def get_admin_inline_keyboard():
     status_btn = "🛑 خاموش کردن ربات" if bot_active else "✅ روشن کردن ربات"
@@ -1206,17 +1227,19 @@ async def complete_start_response(message: types.Message, loading_message: types
             )
             return
 
-        if referrer_id:
-            try:
-                referral_added = await process_referral_signup(u_id, referrer_id)
-                if referral_added:
-                    await bot.send_message(
-                        referrer_id,
-                        f"🎉 <b>تبریک!</b> یک نفر با لینک دعوت تو وارد ربات شد و <code>{referral_reward_ton:.4f} TON</code> به کیف‌پولت اضافه شد.",
-                        parse_mode="HTML"
-                    )
-            except Exception as e:
-                logging.warning(f"Referral notification failed for {u_id}: {e}")
+        profile = get_user_profile(u_id)
+        pending_referrer_id = profile.get("pending_referrer_id") or referrer_id
+        if pending_referrer_id and not profile.get("referral_rewarded"):
+            profile["pending_referrer_id"] = int(pending_referrer_id)
+            await save_user_data(u_id)
+            await loading_message.edit_text(
+                "🤝 <b>لینک رفرال شناسایی شد.</b>\n\n"
+                "برای ثبت نهایی دعوت و جلوگیری از سوءاستفاده، شماره تلگرامت را با دکمه زیر ارسال کن.\n"
+                "فقط شماره‌های ایران با پیش‌شماره <code>+98</code> تأیید می‌شوند.",
+                parse_mode="HTML",
+                reply_markup=get_referral_contact_keyboard()
+            )
+            return
 
         await message.answer(
             f"🔥 <b>به Void Giveaway خوش اومدی!</b> آماده‌ای جایزه جمع کنی؟\n"
@@ -1249,10 +1272,17 @@ async def start_handler(message: types.Message, command: CommandObject, state: F
         return
 
     profile = get_user_profile(u_id, message.from_user)
-    is_new_user = not profile.get("started_at")
     profile["started_at"] = profile.get("started_at") or datetime.utcnow().isoformat()
     all_time_users.add(u_id)
-    referrer_id = parse_referrer_id(command.args) if is_new_user else None
+    referrer_id = parse_referrer_id(command.args)
+    if (
+        referrals_enabled
+        and referrer_id
+        and referrer_id != u_id
+        and not profile.get("referral_rewarded")
+        and not profile.get("pending_referrer_id")
+    ):
+        profile["pending_referrer_id"] = referrer_id
 
     # Send the acknowledgement before any database or network check.
     loading_message = await message.answer("⏳ <b>در حال آماده‌سازی ربات...</b>", parse_mode="HTML")
@@ -1321,6 +1351,69 @@ async def show_leaderboard(message: types.Message):
         "━━━━━━━━━━━━━━━━━━\n" + "\n".join(rows),
         parse_mode="HTML"
     )
+
+
+def normalize_iranian_phone(phone: str) -> str:
+    normalized = re.sub(r"[\s().-]", "", phone or "")
+    if normalized.startswith("0098"):
+        normalized = "+98" + normalized[4:]
+    elif normalized.startswith("98"):
+        normalized = "+98" + normalized[2:]
+    return normalized
+
+
+def is_valid_iranian_phone(phone: str) -> bool:
+    return bool(re.fullmatch(r"\+989\d{9}", normalize_iranian_phone(phone)))
+
+
+@dp.message(F.contact)
+async def confirm_referral_contact(message: types.Message):
+    u_id = message.from_user.id
+    profile = get_user_profile(u_id, message.from_user)
+    pending_referrer_id = profile.get("pending_referrer_id")
+    if not pending_referrer_id:
+        return
+
+    contact = message.contact
+    if not contact or contact.user_id != u_id:
+        await message.answer(
+            "⚠️ لطفاً فقط شماره‌ی خودت را با دکمه‌ی تأیید ارسال کن؛ شماره‌ی فورواردشده پذیرفته نمی‌شود.",
+            reply_markup=get_referral_contact_keyboard()
+        )
+        return
+    if not is_valid_iranian_phone(contact.phone_number):
+        await message.answer(
+            "⚠️ فقط شماره‌های موبایل ایران با پیش‌شماره‌ی <code>+98</code> قابل تأیید هستند.",
+            parse_mode="HTML",
+            reply_markup=get_referral_contact_keyboard()
+        )
+        return
+
+    referral_added = await process_referral_signup(u_id, int(pending_referrer_id))
+    if referral_added:
+        profile["pending_referrer_id"] = None
+        profile["phone_verified"] = True
+        await save_user_data(u_id)
+        await message.answer(
+            f"✅ <b>رفرال با موفقیت ثبت شد!</b>\n\n"
+            f"شماره تأیید شد و دعوت تو ثبت گردید. دعوت‌کننده‌ات <code>{referral_reward_ton:.4f} TON</code> پاداش گرفت.",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(u_id)
+        )
+        try:
+            await bot.send_message(
+                int(pending_referrer_id),
+                f"🎉 <b>تبریک!</b> یک نفر با لینک دعوت تو وارد ربات شد و <code>{referral_reward_ton:.4f} TON</code> به کیف‌پولت اضافه شد.",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logging.warning(f"Referral notification failed for {u_id}: {e}")
+    else:
+        await save_user_data(u_id)
+        await message.answer(
+            "✅ شماره تأیید شد، اما این دعوت قابل ثبت نبود؛ ممکن است رفرال‌گیری خاموش باشد یا دعوت‌کننده معتبر نباشد.",
+            reply_markup=get_main_keyboard(u_id)
+        )
 
 
 # ==========================================
