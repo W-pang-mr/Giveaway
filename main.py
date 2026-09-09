@@ -52,7 +52,7 @@ def keep_alive():
 
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = [6879499219]
-BOT_VERSION = "6.2.0"
+BOT_VERSION = "6.3.0"
 WITHDRAW_CHANNEL = "@voidwithraw"
 WALLET_TRACKER_CHANNEL = "@Voidchanneloffical"  # کانال ارسال و بروزرسانی خودکار موجودی ولت سیستم
 TON_MNEMONIC = os.environ.get("TON_MNEMONIC")
@@ -1130,49 +1130,41 @@ def format_crypto_price(value: float) -> str:
 
 
 async def fetch_usd_to_toman():
-    """Read the public USDT/IRT market rate from a public exchange feed."""
+    """Read USD/IRR from public FX feeds and convert it to toman."""
     now = time.monotonic()
-    cached = usd_to_toman_cache.get("USDTIRT")
+    cached = usd_to_toman_cache.get("USD")
     if cached and now - cached["fetched_at"] < USD_TO_TOMAN_CACHE_TTL:
-        return cached["value"]
+        return cached["value"], cached["source"]
 
-    endpoint = "https://api.nobitex.ir/v2/orderbook/USDTIRT"
+    providers = [
+        ("Open ER API", "https://open.er-api.com/v6/latest/USD"),
+        ("ExchangeRate API", "https://api.exchangerate-api.com/v4/latest/USD"),
+    ]
 
-    def request_rate():
+    def request_rate(endpoint):
         request = Request(
             endpoint,
-            headers={"Accept": "application/json", "User-Agent": "VoidGiveawayBot/6.2"}
+            headers={"Accept": "application/json", "User-Agent": "VoidGiveawayBot/6.3"}
         )
         with urlopen(request, timeout=8) as response:
             return json.loads(response.read().decode("utf-8"))
 
-    def level_price(level):
+    for provider_name, endpoint in providers:
         try:
-            if isinstance(level, (list, tuple)):
-                return float(level[0])
-            if isinstance(level, dict):
-                return float(level.get("price"))
-        except (TypeError, ValueError, KeyError):
-            return None
-        return None
-
-    try:
-        payload = await asyncio.to_thread(request_rate)
-        bids = [level_price(level) for level in (payload.get("bids") or [])]
-        asks = [level_price(level) for level in (payload.get("asks") or [])]
-        bids = [value for value in bids if value and value > 0]
-        asks = [value for value in asks if value and value > 0]
-        if not bids and not asks:
-            return None
-        if bids and asks:
-            rate = (bids[0] + asks[0]) / 2
-        else:
-            rate = (bids or asks)[0]
-        usd_to_toman_cache["USDTIRT"] = {"fetched_at": time.monotonic(), "value": rate}
-        return rate
-    except Exception as e:
-        logging.warning(f"USD to toman request failed: {e}")
-        return None
+            payload = await asyncio.to_thread(request_rate, endpoint)
+            irr_rate = float((payload.get("rates") or {})["IRR"])
+            # نرخ API ریال است؛ خروجی ربات تومان است.
+            toman_rate = irr_rate / 10
+            if toman_rate > 0:
+                usd_to_toman_cache["USD"] = {
+                    "fetched_at": time.monotonic(),
+                    "value": toman_rate,
+                    "source": provider_name,
+                }
+                return toman_rate, provider_name
+        except Exception as e:
+            logging.warning(f"{provider_name} FX request failed: {e}")
+    return None, None
 
 
 def tradingview_chart_url(symbol: str):
@@ -1191,6 +1183,78 @@ def tradingview_keyboard(data):
     ]])
 
 
+async def build_chart_image_url(market_symbol: str):
+    """Build a shareable PNG chart URL from public OHLC data."""
+    if not market_symbol:
+        return None
+    endpoint = (
+        "https://api.binance.com/api/v3/klines"
+        f"?symbol={quote(market_symbol, safe='')}&interval=1h&limit=48"
+    )
+
+    def request_candles():
+        request = Request(
+            endpoint,
+            headers={"Accept": "application/json", "User-Agent": "VoidGiveawayBot/6.3"}
+        )
+        with urlopen(request, timeout=8) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    try:
+        candles = await asyncio.to_thread(request_candles)
+        if not isinstance(candles, list) or not candles:
+            return None
+        labels = [datetime.fromtimestamp(float(row[0]) / 1000).strftime("%m/%d %H:%M") for row in candles]
+        closes = [round(float(row[4]), 8) for row in candles]
+        chart_config = {
+            "type": "line",
+            "data": {
+                "labels": labels,
+                "datasets": [{
+                    "label": f"{market_symbol} · 1h close",
+                    "data": closes,
+                    "borderColor": "#22c55e",
+                    "backgroundColor": "rgba(34, 197, 94, 0.16)",
+                    "fill": True,
+                    "pointRadius": 0,
+                    "borderWidth": 2,
+                }],
+            },
+            "options": {
+                "plugins": {"legend": {"display": True}},
+                "scales": {"x": {"display": False}},
+            },
+        }
+        encoded_config = quote(json.dumps(chart_config, separators=(",", ":"), ensure_ascii=False), safe="")
+        return f"https://quickchart.io/chart?width=1000&height=520&format=png&c={encoded_config}"
+    except Exception as e:
+        logging.warning(f"Chart image request failed for {market_symbol}: {e}")
+        return None
+
+
+async def send_price_message(message: types.Message, text: str, data):
+    """Upload a chart image when possible, with a text fallback."""
+    keyboard = tradingview_keyboard(data)
+    chart_image_url = await build_chart_image_url(data.get("market_symbol"))
+    if chart_image_url:
+        try:
+            await message.answer_photo(
+                photo=chart_image_url,
+                caption=text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            return
+        except Exception as e:
+            logging.warning(f"Could not upload chart image: {e}")
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=keyboard,
+    )
+
+
 async def fetch_crypto_price(symbol: str):
     normalized = (symbol or "").strip().upper().lstrip("$")
     market_info = CRYPTO_PRICE_COINS.get(normalized)
@@ -1205,55 +1269,65 @@ async def fetch_crypto_price(symbol: str):
 
     market_price = None
     price_source = None
-
+    providers = []
+    if normalized == "TON":
+        # TONAPI uses the TON-native market rate; Binance remains a fallback.
+        providers.append(("TonAPI", "https://tonapi.io/v2/rates?tokens=ton&currencies=usd"))
+    if binance_symbol:
+        providers.append(("Binance", f"https://api.binance.com/api/v3/ticker/24hr?symbol={quote(binance_symbol, safe='')}"))
+    if okx_symbol:
+        providers.append(("OKX", f"https://www.okx.com/api/v5/market/ticker?instId={quote(okx_symbol, safe='')}"))
     if normalized == "USDT":
         market_price = (1.0, 0.0)
         price_source = "ثابت USDT"
-    else:
-        providers = [
-            ("Binance", f"https://api.binance.com/api/v3/ticker/24hr?symbol={quote(binance_symbol, safe='')}")
-        ]
-        if okx_symbol:
-            providers.append(("OKX", f"https://www.okx.com/api/v5/market/ticker?instId={quote(okx_symbol, safe='')}"))
 
-        for provider_name, endpoint in providers:
-            def request_market():
-                request = Request(
-                    endpoint,
-                    headers={"Accept": "application/json", "User-Agent": "VoidGiveawayBot/6.2"}
-                )
-                with urlopen(request, timeout=8) as response:
-                    return json.loads(response.read().decode("utf-8"))
+    for provider_name, endpoint in providers:
+        if market_price:
+            break
 
-            try:
-                payload = await asyncio.to_thread(request_market)
-                if provider_name == "Binance":
-                    usd_price = float(payload["lastPrice"])
-                    change_24h = float(payload.get("priceChangePercent") or 0)
-                else:
-                    row = (payload.get("data") or [])[0]
-                    usd_price = float(row["last"])
-                    open_24h = float(row.get("open24h") or 0)
-                    change_24h = ((usd_price - open_24h) / open_24h * 100) if open_24h else 0.0
-                if usd_price > 0:
-                    market_price = (usd_price, change_24h)
-                    price_source = provider_name
-                    break
-            except Exception as e:
-                logging.warning(f"{provider_name} price request failed for {normalized}: {e}")
+        def request_market():
+            request = Request(
+                endpoint,
+                headers={"Accept": "application/json", "User-Agent": "VoidGiveawayBot/6.3"}
+            )
+            with urlopen(request, timeout=8) as response:
+                return json.loads(response.read().decode("utf-8"))
+
+        try:
+            payload = await asyncio.to_thread(request_market)
+            if provider_name == "TonAPI":
+                rate = payload["rates"]["TON"]
+                usd_price = float(rate["prices"]["USD"])
+                change_raw = str((rate.get("diff_24h") or {}).get("USD", "0"))
+                change_match = re.search(r"[-+]?\d+(?:\.\d+)?", change_raw.replace("−", "-"))
+                change_24h = float(change_match.group(0)) if change_match else 0.0
+            elif provider_name == "Binance":
+                usd_price = float(payload["lastPrice"])
+                change_24h = float(payload.get("priceChangePercent") or 0)
+            else:
+                row = (payload.get("data") or [])[0]
+                usd_price = float(row["last"])
+                open_24h = float(row.get("open24h") or 0)
+                change_24h = ((usd_price - open_24h) / open_24h * 100) if open_24h else 0.0
+            if usd_price > 0:
+                market_price = (usd_price, change_24h)
+                price_source = provider_name
+        except Exception as e:
+            logging.warning(f"{provider_name} price request failed for {normalized}: {e}")
 
     if not market_price:
         return None
 
     usd_price, change_24h = market_price
-    toman_rate = await fetch_usd_to_toman()
+    toman_rate, toman_source = await fetch_usd_to_toman()
     data = {
         "symbol": display_symbol,
         "price": usd_price,
         "change_24h": change_24h,
         "toman": (usd_price * toman_rate if toman_rate is not None else None),
         "price_source": price_source,
-        "toman_source": "Nobitex" if toman_rate is not None else None,
+        "toman_source": toman_source,
+        "market_symbol": binance_symbol,
         "chart_url": tradingview_chart_url(normalized),
     }
     crypto_price_cache[normalized] = {"fetched_at": time.monotonic(), "data": data}
@@ -1433,7 +1507,7 @@ async def complete_start_response(message: types.Message, loading_message: types
 
         await message.answer(
             f"🚀 <b>به Void Giveaway خوش اومدی!</b>\nاینجا هر دعوت و هر فعالیت می‌تونه موجودی واقعی TON و DOGS بسازه.\n"
-            f"🧩 <b>نسخه فعال:</b> <code>v6.1.0</code> 💎\n\n"
+            f"🧩 <b>نسخه فعال:</b> <code>v6.3.0</code> 💎\n\n"
             f"از منوی زیر شروع کن؛ موجودی، جایزه‌ها و برداشت‌هات همین‌جا مدیریت می‌شن 👇",
             parse_mode="HTML",
             reply_markup=get_main_keyboard(u_id)
@@ -1456,71 +1530,32 @@ async def complete_start_response(message: types.Message, loading_message: types
 @dp.message(Command(commands=["price", "p"]))
 async def crypto_price_handler(message: types.Message, command: CommandObject):
     if message.chat.type not in ("group", "supergroup"):
-        await message.answer(
-            "📊 این دستور برای گروه‌ها طراحی شده است.\n"
-            "ربات را به گروه اضافه کن و آنجا <code>/price TON</code> را بفرست.",
-            parse_mode="HTML"
-        )
-        return
-
-    rate_key = (message.chat.id, message.from_user.id)
-    now = time.monotonic()
-    if now - crypto_price_rate_limit.get(rate_key, 0) < 3:
-        await message.answer("⏳ یک لحظه صبر کن؛ قیمت‌ها هر چند ثانیه یک‌بار به‌روزرسانی می‌شوند.")
-        return
-    crypto_price_rate_limit[rate_key] = now
-
-    symbol = ((command.args or "").strip().split() or [""])[0].upper().lstrip("$")
-    if not symbol:
-        supported = "، ".join(CRYPTO_PRICE_COINS.keys())
-        await message.answer(
-            "📈 <b>قیمت کدام ارز را می‌خواهی؟</b>\n\n"
-            "مثال: <code>/price TON</code> یا <code>/price BTC</code>\n"
-            f"ارزهای فعال: <code>{supported}</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    if symbol not in CRYPTO_PRICE_COINS:
-        supported = "، ".join(CRYPTO_PRICE_COINS.keys())
-        await message.answer(
-            f"🔎 نماد <code>{html.escape(symbol)}</code> هنوز در لیست قیمت نیست.\n"
-            f"نمادهای قابل دریافت: <code>{supported}</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    data = await fetch_crypto_price(symbol)
-    if not data:
-        await message.answer(
-            "⚠️ سرویس قیمت‌گذاری فعلاً پاسخ نداد. چند لحظه بعد دوباره امتحان کن.",
-            parse_mode="HTML"
-        )
-        return
-
-    change = data.get("change_24h")
-    if change is None:
-        change_text = "اطلاعات تغییر ۲۴ساعته در دسترس نیست"
-    else:
-        change_text = f"{'📈' if change >= 0 else '📉'} {change:+.2f}% در ۲۴ ساعت"
-
-    await message.answer(
+        toman_line = ""
+    if data.get("toman") is not None:
+        toman_line = f"\n🇮🇷 <b>تومان</b> {format_quantity(data['toman'])}"
+    caption = (
         f"📊 <b>قیمت لحظه‌ای {data['symbol']}</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"💵 <b>USD {format_crypto_price(data['price'])}</b>\n"
+        f"💵 <b>USD {format_crypto_price(data['price'])}</b>{toman_line}\n"
         f"{change_text}\n\n"
         "🕒 داده‌ها هر ۶۰ ثانیه تازه می‌شوند.\n"
-        f"🔗 منبع قیمت: {data['price_source']} | نرخ تومان: {data.get('toman_source') or 'در دسترس نیست'}",
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-        reply_markup=tradingview_keyboard(data)
+        f"🔗 منبع قیمت: {data['price_source']} | نرخ تومان: {data.get('toman_source') or 'در دسترس نیست'}"
     )
+    await send_price_message(message, caption, data)
 
 
 PERSIAN_PRICE_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
 PRICE_TEXT_ALIASES = {
     "TON": ("ton", "تون", "gram", "گرام", "toncoin", "تون‌کوین"),
     "DOGS": ("dogs", "داگز", "داگس"),
+    "BTC": ("btc", "bitcoin", "بیت کوین", "بیت‌کوین", "بیتکوین"),
+    "ETH": ("eth", "ethereum", "اتریوم"),
+    "USDT": ("usdt", "tether", "تتر"),
+    "SOL": ("sol", "solana", "سولانا"),
+    "BNB": ("bnb", "binance coin", "بایننس", "بی‌ان‌بی"),
+    "NOT": ("not", "notcoin", "نات کوین", "نات‌کوین", "ناتکوین"),
+    "TRX": ("trx", "tron", "ترون"),
+    "XRP": ("xrp", "ripple", "ریپل"),
 }
 
 
@@ -1650,11 +1685,10 @@ async def natural_crypto_price_handler(message: types.Message):
             f"{format_change(coin.get('change_24h'))}"
         )
 
-    await message.answer(
-        reply + "\n\n🕒 داده‌ها حداکثر هر ۶۰ ثانیه تازه می‌شوند.\n🔗 منبع قیمت: Binance / OKX | نرخ تومان: Nobitex",
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-        reply_markup=tradingview_keyboard(chart_data)
+    await send_price_message(
+        message,
+        reply + "\n\n🕒 داده‌ها حداکثر هر ۶۰ ثانیه تازه می‌شوند.\n🔗 منبع قیمت: Binance / OKX / TonAPI | نرخ تومان: Open ER API",
+        chart_data,
     )
 
 
