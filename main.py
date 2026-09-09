@@ -71,6 +71,9 @@ settings_col = db['settings']
 withdrawals_col = db['withdrawals']
 deposits_col = db['deposits']
 transfers_col = db['transfers']
+support_tickets_col = db['support_tickets']
+price_alerts_col = db['price_alerts']
+
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -1061,6 +1064,13 @@ class AdminAddChannelForm(StatesGroup):
 class AdminRemoveChannelForm(StatesGroup):
     channel = State()
 
+class SupportTicketForm(StatesGroup):
+    message = State()
+
+
+class AdminSupportReplyForm(StatesGroup):
+    message = State()
+
 # ==========================================
 # توابع کمکی
 # ==========================================
@@ -1090,6 +1100,7 @@ def get_user_profile(user_id: int, user_obj: types.User = None):
 def get_main_keyboard(user_id: int):
     kb = [
         [KeyboardButton(text="💎 کیف‌پول من")],
+        [KeyboardButton(text="❓ راهنما"), KeyboardButton(text="🆘 پشتیبانی")],
         [KeyboardButton(text="🎁 دعوت دوستان"), KeyboardButton(text="🏆 رتبه‌بندی")]
     ]
     if is_admin(user_id):
@@ -1176,6 +1187,8 @@ def get_admin_inline_keyboard():
             [InlineKeyboardButton(text=("🛑 خاموش کردن رفرال‌گیری" if referrals_enabled else "✅ روشن کردن رفرال‌گیری"), callback_data="admin_toggle_referrals"), InlineKeyboardButton(text="🎁 تنظیم پاداش رفرال", callback_data="admin_set_referral_reward")],
             [InlineKeyboardButton(text="🧹 صفرکردن موجودی‌ها", callback_data="admin_reset_balances")],
             [InlineKeyboardButton(text=withdrawals_btn, callback_data="admin_toggle_withdrawals")],
+            [InlineKeyboardButton(text="📊 گزارش مالی", callback_data="admin_financial_report"), InlineKeyboardButton(text="🩺 سلامت سیستم", callback_data="admin_system_health")],
+            [InlineKeyboardButton(text="🆘 تیکت‌های باز", callback_data="admin_open_tickets")],
             [InlineKeyboardButton(text=status_btn, callback_data="admin_toggle_bot"), InlineKeyboardButton(text="📢 ارسال همگانی", callback_data="admin_broadcast")],
         ]
     )
@@ -3265,6 +3278,466 @@ async def process_broadcast_message(message: types.Message, state: FSMContext):
     )
 
 # ==========================================
+# ==========================================
+# قابلیت‌های کاربردی: پشتیبانی، گروه، هشدار، گزارش و سلامت
+# ==========================================
+async def is_group_admin(chat_id: int, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in ("creator", "administrator")
+    except Exception:
+        return False
+
+
+async def get_group_settings(chat_id: int):
+    defaults = {
+        "setting_id": f"group:{chat_id}",
+        "chat_id": chat_id,
+        "welcome_enabled": True,
+        "antispam_enabled": True,
+        "welcome_text": "👋 به گروه خوش اومدی، {name}!\n\nبرای دیدن قوانین /rules را بفرست.",
+        "rules_text": "📌 قوانین گروه هنوز توسط ادمین تنظیم نشده است.",
+    }
+    try:
+        saved = await settings_col.find_one({"setting_id": f"group:{chat_id}"})
+        if saved:
+            defaults.update(saved)
+    except Exception as e:
+        logging.warning(f"Group settings read failed: {e}")
+    return defaults
+
+
+async def save_group_settings(chat_id: int, **updates):
+    await settings_col.update_one(
+        {"setting_id": f"group:{chat_id}"},
+        {"$set": {"chat_id": chat_id, **updates}},
+        upsert=True
+    )
+
+
+@dp.message(Command(commands=["welcome", "rules"]))
+async def group_info_command(message: types.Message):
+    if message.chat.type not in ("group", "supergroup"):
+        await message.answer("📌 این دستور را داخل گروه استفاده کن.")
+        return
+    settings = await get_group_settings(message.chat.id)
+    command_name = (message.text or "").split()[0].lower().lstrip("/").split("@")[0]
+    if command_name == "rules":
+        await message.answer(settings.get("rules_text") or "📌 قانونی برای این گروه ثبت نشده است.", parse_mode="HTML")
+    else:
+        name = html.escape(message.from_user.first_name or "دوست")
+        await message.answer((settings.get("welcome_text") or "👋 خوش اومدی، {name}!").replace("{name}", name), parse_mode="HTML")
+
+
+@dp.message(Command("setwelcome"))
+async def set_group_welcome(message: types.Message, command: CommandObject):
+    if message.chat.type not in ("group", "supergroup"):
+        return
+    if not await is_group_admin(message.chat.id, message.from_user.id):
+        await message.answer("⛔ فقط ادمین‌های گروه می‌توانند پیام خوش‌آمد را تغییر دهند.")
+        return
+    welcome = (command.args or "").strip()
+    if not welcome:
+        await message.answer("نمونه: <code>/setwelcome سلام {name}، به گروه خوش اومدی!</code>", parse_mode="HTML")
+        return
+    await save_group_settings(message.chat.id, welcome_text=welcome[:1000], welcome_enabled=True)
+    await message.answer("✅ پیام خوش‌آمد این گروه ذخیره شد.")
+
+
+@dp.message(Command("setrules"))
+async def set_group_rules(message: types.Message, command: CommandObject):
+    if message.chat.type not in ("group", "supergroup"):
+        return
+    if not await is_group_admin(message.chat.id, message.from_user.id):
+        await message.answer("⛔ فقط ادمین‌های گروه می‌توانند قوانین را تغییر دهند.")
+        return
+    rules = (command.args or "").strip()
+    if not rules:
+        await message.answer("نمونه: <code>/setrules بدون اسپم؛ بدون لینک تبلیغاتی؛ احترام به اعضا</code>", parse_mode="HTML")
+        return
+    await save_group_settings(message.chat.id, rules_text=rules[:3000])
+    await message.answer("✅ قوانین گروه ذخیره شد. اعضا با /rules می‌توانند آن را ببینند.")
+
+
+@dp.message(F.new_chat_members)
+async def group_welcome_handler(message: types.Message):
+    if message.chat.type not in ("group", "supergroup"):
+        return
+    settings = await get_group_settings(message.chat.id)
+    if not settings.get("welcome_enabled", True):
+        return
+    for member in message.new_chat_members[:5]:
+        name = html.escape(member.first_name or "دوست")
+        welcome = (settings.get("welcome_text") or "👋 خوش اومدی، {name}!").replace("{name}", name)
+        await message.answer(welcome, parse_mode="HTML")
+
+
+@dp.message(Command(commands=["faq", "help"]))
+async def faq_command(message: types.Message):
+    await message.answer(
+        "❓ <b>راهنمای سریع Void</b>\n\n"
+        "💎 <b>کیف‌پول:</b> موجودی، واریز و برداشت TON/DOGS\n"
+        "📊 <b>قیمت:</b> در گروه بنویس <code>تون</code> یا <code>۱۰۰ هزار تومان تون</code>\n"
+        "🚨 <b>هشدار:</b> در چت خصوصی <code>/alert TON above 5</code>\n"
+        "🔎 <b>تراکنش:</b> <code>/tx شناسه</code>\n"
+        "🆘 <b>پشتیبانی:</b> از دکمهٔ پشتیبانی یا <code>/support</code> استفاده کن.",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(F.text == "❓ راهنما")
+async def faq_button(message: types.Message):
+    await faq_command(message)
+
+
+@dp.message(Command("support"))
+async def start_support_ticket(message: types.Message, state: FSMContext):
+    await state.set_state(SupportTicketForm.message)
+    await message.answer("🆘 <b>تیکت پشتیبانی</b>\nمشکل یا درخواستت را در یک پیام بنویس تا برای ادمین ارسال شود.", parse_mode="HTML")
+
+
+@dp.message(F.text == "🆘 پشتیبانی")
+async def support_button(message: types.Message, state: FSMContext):
+    await start_support_ticket(message, state)
+
+
+@dp.message(SupportTicketForm.message)
+async def create_support_ticket(message: types.Message, state: FSMContext):
+    body = (message.text or "").strip()
+    if len(body) < 5:
+        await message.answer("⚠️ توضیح مشکل خیلی کوتاه است؛ کمی کامل‌تر بنویس.")
+        return
+    ticket_id = uuid.uuid4().hex[:10].upper()
+    await support_tickets_col.insert_one({
+        "ticket_id": ticket_id,
+        "user_id": message.from_user.id,
+        "username": message.from_user.username or "",
+        "body": body[:4000],
+        "status": "open",
+        "created_at": datetime.utcnow().isoformat(),
+    })
+    await state.clear()
+    await message.answer(f"✅ تیکت <code>#{ticket_id}</code> ثبت شد. ادمین به‌زودی بررسی می‌کند.", parse_mode="HTML")
+    admin_text = (
+        f"🆘 <b>تیکت جدید #{ticket_id}</b>\n"
+        f"👤 کاربر: <code>{message.from_user.id}</code>\n"
+        f"📝 {html.escape(body[:3500])}"
+    )
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✍️ پاسخ به تیکت", callback_data=f"support_reply:{ticket_id}")
+    ]])
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, admin_text, parse_mode="HTML", reply_markup=reply_markup)
+        except Exception:
+            pass
+
+
+@dp.callback_query(F.data == "admin_open_tickets")
+async def admin_open_tickets(call: types.CallbackQuery):
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+    tickets = await support_tickets_col.find({"status": "open"}).sort("created_at", -1).to_list(length=10)
+    if not tickets:
+        await call.message.edit_text("✅ تیکت بازی وجود ندارد.")
+        return
+    rows = []
+    for ticket in tickets:
+        rows.append([InlineKeyboardButton(text=f"✍️ #{ticket['ticket_id']} | کاربر {ticket['user_id']}", callback_data=f"support_reply:{ticket['ticket_id']}")])
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin_back_panel")])
+    await call.message.edit_text("🆘 <b>تیکت‌های باز</b>\nبرای پاسخ، یک مورد را انتخاب کن.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data.startswith("support_reply:"))
+async def start_support_reply(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+    ticket_id = call.data.split(":", 1)[1]
+    ticket = await support_tickets_col.find_one({"ticket_id": ticket_id, "status": "open"})
+    if not ticket:
+        await call.message.answer("⚠️ این تیکت دیگر باز نیست یا پیدا نشد.")
+        return
+    await state.update_data(ticket_id=ticket_id, target_user_id=ticket["user_id"])
+    await state.set_state(AdminSupportReplyForm.message)
+    await call.message.answer(f"✍️ پاسخ تیکت <code>#{ticket_id}</code> را بفرست:", parse_mode="HTML")
+
+
+@dp.message(AdminSupportReplyForm.message)
+async def finish_support_reply(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    ticket_id = data.get("ticket_id")
+    target_user_id = data.get("target_user_id")
+    reply = (message.text or "").strip()
+    await support_tickets_col.update_one({"ticket_id": ticket_id}, {"$set": {"status": "answered", "answer": reply[:4000], "answered_at": datetime.utcnow().isoformat()}})
+    await state.clear()
+    try:
+        await bot.send_message(target_user_id, f"📬 <b>پاسخ پشتیبانی #{ticket_id}</b>\n\n{html.escape(reply)}", parse_mode="HTML")
+        await message.answer("✅ پاسخ ارسال و تیکت بسته شد.")
+    except Exception:
+        await message.answer("⚠️ پاسخ ثبت شد، اما ارسال آن به کاربر ممکن نشد.")
+
+
+@dp.message(Command("alert"))
+async def create_price_alert(message: types.Message, command: CommandObject):
+    if message.chat.type != "private":
+        await message.answer("🚨 هشدار قیمت را در چت خصوصی با ربات تنظیم کن.")
+        return
+    parts = (command.args or "").split()
+    if len(parts) != 3 or parts[0].upper() not in CRYPTO_PRICE_COINS or parts[1].lower() not in ("above", "below", "بالا", "پایین"):
+        await message.answer("نمونه: <code>/alert TON above 5</code> یا <code>/alert DOGS below 0.0002</code>", parse_mode="HTML")
+        return
+    try:
+        threshold = float(parts[2].replace(",", ""))
+    except ValueError:
+        await message.answer("⚠️ قیمت هدف معتبر نیست.")
+        return
+    if not math.isfinite(threshold) or threshold <= 0:
+        await message.answer("⚠️ قیمت هدف باید بیشتر از صفر باشد.")
+        return
+    direction = "above" if parts[1].lower() in ("above", "بالا") else "below"
+    alert_id = uuid.uuid4().hex[:8].upper()
+    await price_alerts_col.insert_one({
+        "alert_id": alert_id,
+        "user_id": message.from_user.id,
+        "symbol": parts[0].upper(),
+        "direction": direction,
+        "threshold": threshold,
+        "active": True,
+        "created_at": datetime.utcnow().isoformat(),
+    })
+    await message.answer(f"✅ هشدار <code>#{alert_id}</code> ثبت شد.\nوقتی {parts[0].upper()} {'به بالای' if direction == 'above' else 'به زیر'} <code>{threshold}</code> دلار برسد، خبرت می‌کنم.", parse_mode="HTML")
+
+
+@dp.message(Command("alerts"))
+async def list_price_alerts(message: types.Message):
+    alerts = await price_alerts_col.find({"user_id": message.from_user.id, "active": True}).sort("created_at", -1).to_list(length=20)
+    if not alerts:
+        await message.answer("📭 هشدار فعالی نداری.")
+        return
+    lines = ["🚨 <b>هشدارهای فعال تو</b>"]
+    for item in alerts:
+        direction = "بالای" if item["direction"] == "above" else "زیر"
+        lines.append(f"• <code>#{item['alert_id']}</code> — {item['symbol']} {direction} {item['threshold']} USD")
+    lines.append("\nبرای حذف: <code>/deletealert ID</code>")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(Command("deletealert"))
+async def delete_price_alert(message: types.Message, command: CommandObject):
+    alert_id = (command.args or "").strip().upper()
+    if not alert_id:
+        await message.answer("نمونه: <code>/deletealert A1B2C3D4</code>", parse_mode="HTML")
+        return
+    result = await price_alerts_col.update_one({"alert_id": alert_id, "user_id": message.from_user.id, "active": True}, {"$set": {"active": False, "deleted_at": datetime.utcnow().isoformat()}})
+    await message.answer("✅ هشدار حذف شد." if result.modified_count else "⚠️ هشدار فعالی با این شناسه پیدا نشد.")
+
+
+async def price_alert_loop():
+    while True:
+        try:
+            alerts = await price_alerts_col.find({"active": True}).to_list(length=500)
+            for alert in alerts:
+                data = await fetch_crypto_price(alert["symbol"])
+                if not data:
+                    continue
+                price = data["price"]
+                triggered = price >= alert["threshold"] if alert["direction"] == "above" else price <= alert["threshold"]
+                if not triggered:
+                    continue
+                changed = await price_alerts_col.update_one({"alert_id": alert["alert_id"], "active": True}, {"$set": {"active": False, "triggered_at": datetime.utcnow().isoformat(), "triggered_price": price}})
+                if changed.modified_count:
+                    try:
+                        await bot.send_message(alert["user_id"], f"🚨 <b>هشدار قیمت {data['symbol']}</b>\nقیمت فعلی: <code>USD {format_crypto_price(price)}</code>\n{format_change(data.get('change_24h'))}", parse_mode="HTML")
+                    except Exception:
+                        pass
+        except Exception as e:
+            logging.warning(f"Price alert loop failed: {e}")
+        await asyncio.sleep(60)
+
+
+async def fetch_tonapi_transaction(tx_hash: str):
+    endpoint = f"https://tonapi.io/v2/blockchain/transactions/{quote(tx_hash, safe='')}"
+    def request_transaction():
+        request = Request(endpoint, headers={"Accept": "application/json", "User-Agent": "VoidGiveawayBot/6.1"})
+        with urlopen(request, timeout=8) as response:
+            return json.loads(response.read().decode("utf-8"))
+    try:
+        return await asyncio.to_thread(request_transaction)
+    except Exception:
+        return None
+
+
+@dp.message(Command(commands=["tx", "track"]))
+async def track_transaction(message: types.Message, command: CommandObject):
+    query = (command.args or "").strip()
+    if not query:
+        await message.answer("🔎 شناسه برداشت یا TX Hash را بفرست.\nمثال: <code>/tx WD123456</code>", parse_mode="HTML")
+        return
+    withdrawal = await withdrawals_col.find_one({"$or": [{"withdrawal_id": query}, {"tx_hash": query}, {"tx_id": query}]})
+    if withdrawal:
+        status = html.escape(str(withdrawal.get("status", "unknown")))
+        amount = withdrawal.get("amount_to_send", withdrawal.get("amount", "-"))
+        asset = html.escape(str(withdrawal.get("asset", "TON")))
+        tx_hash = withdrawal.get("tx_hash") or withdrawal.get("tx_id")
+        text = f"🔎 <b>وضعیت برداشت</b>\n🆔 <code>{html.escape(query)}</code>\n💎 مبلغ: <code>{amount} {asset}</code>\n📌 وضعیت: <code>{status}</code>"
+        if tx_hash:
+            text += f"\n🔗 شناسه شبکه: <code>{html.escape(str(tx_hash))}</code>"
+        await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+        return
+    deposit = await deposits_col.find_one({"$or": [{"tx_id": query}, {"memo": query}]})
+    if deposit:
+        await message.answer(
+            f"✅ <b>وضعیت واریز</b>\n💎 مبلغ: <code>{deposit.get('amount_ton', deposit.get('amount', '-'))} TON</code>\n📌 وضعیت: <code>{html.escape(str(deposit.get('status', 'unknown')))}</code>",
+            parse_mode="HTML"
+        )
+        return
+    chain_tx = await fetch_tonapi_transaction(query)
+    if chain_tx:
+        await message.answer("🔗 تراکنش روی شبکه پیدا شد؛ برای اتصال آن به حساب، Memo اختصاصی واریز لازم است.", parse_mode="HTML")
+    else:
+        await message.answer("📭 تراکنشی با این شناسه در سوابق ربات یا شبکه پیدا نشد.")
+
+
+async def build_financial_report():
+    since = (datetime.utcnow() - timedelta(days=1)).isoformat()
+    deposits = await deposits_col.find({"created_at": {"$gte": since}}).to_list(length=5000)
+    withdrawals = await withdrawals_col.find({"created_at": {"$gte": since}}).to_list(length=5000)
+    def total(items, *keys):
+        result = 0.0
+        for item in items:
+            for key in keys:
+                value = item.get(key)
+                if isinstance(value, (int, float)):
+                    result += float(value)
+                    break
+        return result
+    completed_withdrawals = [item for item in withdrawals if item.get("status") in ("sent", "completed", "success")]
+    return {
+        "deposits_count": len(deposits),
+        "deposits_ton": total(deposits, "amount_ton", "amount"),
+        "withdrawals_count": len(withdrawals),
+        "withdrawals_ton": total(completed_withdrawals, "amount_to_send", "amount"),
+        "users": len(user_data),
+        "balance_ton": sum(float(item.get("balance", 0) or 0) for item in user_data.values()),
+        "balance_dogs": sum(float(item.get("dogs_balance", 0) or 0) for item in user_data.values()),
+    }
+
+
+@dp.callback_query(F.data == "admin_financial_report")
+async def admin_financial_report(call: types.CallbackQuery):
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+    try:
+        report = await build_financial_report()
+        await call.message.edit_text(
+            "📊 <b>گزارش مالی ۲۴ ساعت اخیر</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"📥 واریزها: <code>{report['deposits_count']}</code> | <code>{report['deposits_ton']:.4f} TON</code>\n"
+            f"📤 برداشت‌های موفق: <code>{report['withdrawals_count']}</code> | <code>{report['withdrawals_ton']:.4f} TON</code>\n"
+            f"👥 کاربران ثبت‌شده: <code>{report['users']}</code>\n"
+            f"💎 موجودی داخلی TON: <code>{report['balance_ton']:.4f}</code>\n"
+            f"🐶 موجودی داخلی DOGS: <code>{report['balance_dogs']:.2f}</code>",
+            parse_mode="HTML",
+            reply_markup=get_admin_inline_keyboard()
+        )
+    except Exception as e:
+        logging.error(f"Financial report failed: {e}")
+        await call.message.answer("⚠️ گزارش مالی فعلاً قابل دریافت نیست.")
+
+
+@dp.callback_query(F.data == "admin_system_health")
+async def admin_system_health(call: types.CallbackQuery):
+    await call.answer()
+    if not is_admin(call.from_user.id):
+        return
+    mongo_status = "✅"
+    wallet_status = "✅"
+    try:
+        await asyncio.wait_for(mongo_client.admin.command("ping"), timeout=5)
+    except Exception:
+        mongo_status = "❌"
+    try:
+        wallet_balance, wallet_address = await asyncio.wait_for(get_system_wallet_balance(), timeout=8)
+        if not wallet_address:
+            wallet_status = "⚠️"
+    except Exception:
+        wallet_balance, wallet_address = None, None
+        wallet_status = "❌"
+    await call.message.edit_text(
+        "🩺 <b>سلامت سیستم</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🗄 MongoDB: {mongo_status}\n"
+        f"🌐 اتصال ولت TON: {wallet_status}\n"
+        f"💎 موجودی ولت سیستم: <code>{wallet_balance if wallet_balance is not None else 'نامشخص'}</code>\n"
+        f"👥 کاربران در حافظه: <code>{len(user_data)}</code>\n"
+        f"🤖 وضعیت ربات: {'فعال ✅' if bot_active else 'خاموش 🛑'}",
+        parse_mode="HTML",
+        reply_markup=get_admin_inline_keyboard()
+    )
+
+
+spam_tracker = {}
+spam_content_tracker = {}
+
+
+@dp.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.regexp(r"(?i)(https?://|www\.|t\.me/)")
+)
+async def group_link_moderation(message: types.Message):
+    settings = await get_group_settings(message.chat.id)
+    if not settings.get("antispam_enabled", True) or await is_group_admin(message.chat.id, message.from_user.id):
+        return
+    try:
+        await message.delete()
+        await message.answer("🛡 لینک تبلیغاتی بدون اجازهٔ ادمین حذف شد.")
+    except Exception:
+        pass
+
+
+@dp.message(F.chat.type.in_({"group", "supergroup"}), F.text)
+async def group_flood_moderation(message: types.Message):
+    if (message.text or "").startswith("/"):
+        return
+    settings = await get_group_settings(message.chat.id)
+    if not settings.get("antispam_enabled", True) or await is_group_admin(message.chat.id, message.from_user.id):
+        return
+    now = time.monotonic()
+    key = (message.chat.id, message.from_user.id)
+    timestamps = [stamp for stamp in spam_tracker.get(key, []) if now - stamp < 10]
+    timestamps.append(now)
+    spam_tracker[key] = timestamps
+    content_key = (message.chat.id, message.from_user.id, (message.text or "").strip().lower())
+    repeats = [stamp for stamp in spam_content_tracker.get(content_key, []) if now - stamp < 20]
+    repeats.append(now)
+    spam_content_tracker[content_key] = repeats
+    if len(timestamps) >= 9 or len(repeats) >= 3:
+        try:
+            await message.delete()
+            await message.answer("🛡 پیام‌های تکراری و اسپم حذف شدند؛ لطفاً کمی آهسته‌تر پیام بفرست.")
+        except Exception:
+            pass
+
+
+@dp.message(Command("antispam"))
+async def toggle_group_antispam(message: types.Message, command: CommandObject):
+    if message.chat.type not in ("group", "supergroup") or not await is_group_admin(message.chat.id, message.from_user.id):
+        return
+    value = (command.args or "").strip().lower()
+    if value not in ("on", "off"):
+        await message.answer("نمونه: <code>/antispam on</code> یا <code>/antispam off</code>", parse_mode="HTML")
+        return
+    await save_group_settings(message.chat.id, antispam_enabled=value == "on")
+    await message.answer("✅ ضداسپم روشن شد." if value == "on" else "🛑 ضداسپم خاموش شد.")
+
+
+# قابلیت‌های قیمت طبیعی قبلی حفظ شده‌اند؛ فقط منبع هشدارها و گزارش‌ها مستقل است.
+
 # اجرای اصلی برنامه
 # ==========================================
 async def main():
@@ -3273,6 +3746,7 @@ async def main():
     asyncio.create_task(wallet_balance_tracker_loop())
     asyncio.create_task(deposit_tracker_loop())
     asyncio.create_task(withdrawal_recovery_loop())
+    asyncio.create_task(price_alert_loop())
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
