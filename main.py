@@ -5,7 +5,9 @@
 
 import asyncio
 import base64
+import json
 import os
+import time
 import logging
 import html
 import math
@@ -13,10 +15,11 @@ import re
 import uuid
 from datetime import datetime, timedelta
 from urllib.parse import quote
+from urllib.request import Request, urlopen
 from flask import Flask
 from threading import Thread
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart, CommandObject
+from aiogram.filters import CommandStart, CommandObject, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -76,6 +79,24 @@ user_data = {}
 all_time_users = set()
 banned_users = set()
 required_channels = ["@Voidchanneloffical"]  # پشتیبانی از چند کانال جوین اجباری
+
+# قیمت ارزها برای استفاده در گروه‌ها
+CRYPTO_PRICE_CACHE_TTL = 60
+crypto_price_cache = {}
+crypto_price_rate_limit = {}
+CRYPTO_PRICE_COINS = {
+    "TON": ("the-open-network", "TON"),
+    "DOGS": ("dogs-2", "DOGS"),
+    "BTC": ("bitcoin", "BTC"),
+    "ETH": ("ethereum", "ETH"),
+    "USDT": ("tether", "USDT"),
+    "SOL": ("solana", "SOL"),
+    "BNB": ("binancecoin", "BNB"),
+    "NOT": ("notcoin", "NOT"),
+    "TRX": ("tron", "TRX"),
+    "XRP": ("ripple", "XRP"),
+}
+
 
 bot_active = True
 withdrawals_enabled = True
@@ -1084,6 +1105,59 @@ def get_referral_contact_keyboard():
         one_time_keyboard=True
     )
 
+def format_crypto_price(value: float) -> str:
+    if value >= 1000:
+        return f"{value:,.2f}"
+    if value >= 1:
+        return f"{value:,.4f}"
+    if value >= 0.01:
+        return f"{value:,.6f}"
+    return f"{value:,.8f}"
+
+
+async def fetch_crypto_price(symbol: str):
+    normalized = (symbol or "").strip().upper().lstrip("$")
+    coin_info = CRYPTO_PRICE_COINS.get(normalized)
+    if not coin_info:
+        return None
+
+    coin_id, display_symbol = coin_info
+    now = time.monotonic()
+    cached = crypto_price_cache.get(normalized)
+    if cached and now - cached["fetched_at"] < CRYPTO_PRICE_CACHE_TTL:
+        return cached["data"]
+
+    endpoint = (
+        "https://api.coingecko.com/api/v3/simple/price"
+        f"?ids={quote(coin_id, safe='')}&vs_currencies=usd&include_24hr_change=true"
+    )
+
+    def request_price():
+        request = Request(
+            endpoint,
+            headers={"Accept": "application/json", "User-Agent": "VoidGiveawayBot/6.1"}
+        )
+        with urlopen(request, timeout=8) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    try:
+        payload = await asyncio.to_thread(request_price)
+        coin_data = payload.get(coin_id) or {}
+        usd_price = coin_data.get("usd")
+        if usd_price is None:
+            return None
+        data = {
+            "symbol": display_symbol,
+            "price": float(usd_price),
+            "change_24h": coin_data.get("usd_24h_change"),
+        }
+        crypto_price_cache[normalized] = {"fetched_at": time.monotonic(), "data": data}
+        return data
+    except Exception as e:
+        logging.warning(f"Crypto price request failed for {normalized}: {e}")
+        return None
+
+
 def get_admin_inline_keyboard():
     status_btn = "🛑 خاموش کردن ربات" if bot_active else "✅ روشن کردن ربات"
     withdrawals_btn = "🛑 خاموش کردن برداشت‌ها" if withdrawals_enabled else "✅ روشن کردن برداشت‌ها"
@@ -1274,6 +1348,69 @@ async def complete_start_response(message: types.Message, loading_message: types
             )
         except Exception:
             pass
+
+
+@dp.message(Command(commands=["price", "p"]))
+async def crypto_price_handler(message: types.Message, command: CommandObject):
+    if message.chat.type not in ("group", "supergroup"):
+        await message.answer(
+            "📊 این دستور برای گروه‌ها طراحی شده است.\n"
+            "ربات را به گروه اضافه کن و آنجا <code>/price TON</code> را بفرست.",
+            parse_mode="HTML"
+        )
+        return
+
+    rate_key = (message.chat.id, message.from_user.id)
+    now = time.monotonic()
+    if now - crypto_price_rate_limit.get(rate_key, 0) < 3:
+        await message.answer("⏳ یک لحظه صبر کن؛ قیمت‌ها هر چند ثانیه یک‌بار به‌روزرسانی می‌شوند.")
+        return
+    crypto_price_rate_limit[rate_key] = now
+
+    symbol = ((command.args or "").strip().split() or [""])[0].upper().lstrip("$")
+    if not symbol:
+        supported = "، ".join(CRYPTO_PRICE_COINS.keys())
+        await message.answer(
+            "📈 <b>قیمت کدام ارز را می‌خواهی؟</b>\n\n"
+            "مثال: <code>/price TON</code> یا <code>/price BTC</code>\n"
+            f"ارزهای فعال: <code>{supported}</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    if symbol not in CRYPTO_PRICE_COINS:
+        supported = "، ".join(CRYPTO_PRICE_COINS.keys())
+        await message.answer(
+            f"🔎 نماد <code>{html.escape(symbol)}</code> هنوز در لیست قیمت نیست.\n"
+            f"نمادهای قابل دریافت: <code>{supported}</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    data = await fetch_crypto_price(symbol)
+    if not data:
+        await message.answer(
+            "⚠️ سرویس قیمت‌گذاری فعلاً پاسخ نداد. چند لحظه بعد دوباره امتحان کن.",
+            parse_mode="HTML"
+        )
+        return
+
+    change = data.get("change_24h")
+    if change is None:
+        change_text = "اطلاعات تغییر ۲۴ساعته در دسترس نیست"
+    else:
+        change_text = f"{'📈' if change >= 0 else '📉'} {change:+.2f}% در ۲۴ ساعت"
+
+    await message.answer(
+        f"📊 <b>قیمت لحظه‌ای {data['symbol']}</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"💵 <b>USD {format_crypto_price(data['price'])}</b>\n"
+        f"{change_text}\n\n"
+        "🕒 داده‌ها هر ۶۰ ثانیه تازه می‌شوند.\n"
+        "🔗 منبع: CoinGecko",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
 
 
 @dp.message(CommandStart())
